@@ -2165,14 +2165,28 @@ function lpStorageGet(keys, cb) {
     function resolveImageFromDrop(dt, cb) {
       if (!dt) return cb(null);
       // 1) File: an OS file, or a web-page image Chrome serialises as a file.
+      // Firefox may report a dragged web image with an empty/non-standard type
+      // (e.g. "" or "moz-file"), so we accept those too as long as dt.items
+      // says it's an image/file kind.
       if (dt.files && dt.files.length) {
         var f = dt.files[0];
-        if (f && f.type && f.type.indexOf("image/") === 0) {
-          var reader = new FileReader();
-          reader.onload = function (ev) { cb(ev.target.result); };
-          reader.onerror = function () { cb(null); };
-          reader.readAsDataURL(f);
-          return;
+        if (f) {
+          var ft = (f.type || "").toLowerCase();
+          var isImage = ft.indexOf("image/") === 0 || ft === "" || ft.indexOf("moz-file") >= 0;
+          if (!isImage) {
+            var items = dt.items || [];
+            for (var ii = 0; ii < items.length; ii++) {
+              var it = (items[ii].type || "").toLowerCase();
+              if (items[ii].kind === "file" && it.indexOf("image/") === 0) { isImage = true; break; }
+            }
+          }
+          if (isImage) {
+            var reader = new FileReader();
+            reader.onload = function (ev) { cb(ev.target.result); };
+            reader.onerror = function () { cb(null); };
+            reader.readAsDataURL(f);
+            return;
+          }
         }
       }
       // 2) Image dragged from a web page → delivered as a URL, not a file.
@@ -2181,10 +2195,11 @@ function lpStorageGet(keys, cb) {
       if (!url) {
         try {
           var html = dt.getData("text/html") || "";
-          var m = /<img[^>]+src=["']([^"']+)["']/i.exec(html);
+          var m = /<img[^>]+src=["']([^"']+)["']/i.exec(html) || /src=["']([^"']+)["']/i.exec(html);
           if (m) url = m[1];
         } catch (e2) {}
       }
+      if (!url) { try { url = dt.getData("text/plain") || ""; } catch (e1b) {} }
       url = (url || "").trim().split(/\s+/)[0];
       // Resolve relative src (from text/html <img>) against the page base URL.
       try { if (url && !/^[a-z][a-z0-9+.\-]*:/i.test(url)) { var _a2 = document.createElement("a"); _a2.href = url; if (_a2.href && /^https?:/i.test(_a2.href)) url = _a2.href; } } catch (e2b) {}
@@ -3024,20 +3039,31 @@ function lpStorageGet(keys, cb) {
         try { _ul = e.dataTransfer.getData("text/uri-list") || ""; } catch (_) { _ul = "(blocked)"; }
         try { console.log("[JARVIS drag] drop:", { files: e.dataTransfer ? e.dataTransfer.files.length : -1, types: e.dataTransfer ? e.dataTransfer.types : null, uriList: _ul }); } catch (e0) {}
         if (!e.dataTransfer) return;
-       var files = e.dataTransfer.files;
-       if (files && files.length) {
-         for (var i = 0; i < files.length; i++) {
-           if (files[i].type && files[i].type.indexOf("image/") === 0) {
-             var reader = new FileReader();
-             reader.onload = function (ev) {
-               try { pendingImage = ev.target.result; showPendingImageThumb(); } catch (e2) {}
-             };
-             reader.readAsDataURL(files[i]);
-             break;
-           }
-         }
-         return;
-       }
+        var files = e.dataTransfer.files;
+        var handledFile = false;
+        if (files && files.length) {
+          for (var i = 0; i < files.length; i++) {
+            var ft = (files[i].type || "").toLowerCase();
+            var isImage = ft.indexOf("image/") === 0 || ft === "" || ft.indexOf("moz-file") >= 0;
+            if (!isImage) {
+              var items = e.dataTransfer.items || [];
+              for (var ii2 = 0; ii2 < items.length; ii2++) {
+                var itt = (items[ii2].type || "").toLowerCase();
+                if (items[ii2].kind === "file" && itt.indexOf("image/") === 0) { isImage = true; break; }
+              }
+            }
+            if (isImage) {
+              var reader = new FileReader();
+              reader.onload = function (ev) {
+                try { pendingImage = ev.target.result; showPendingImageThumb(); } catch (e2) {}
+              };
+              reader.readAsDataURL(files[i]);
+              handledFile = true;
+              break;
+            }
+          }
+        }
+        if (handledFile) return;
         // Web-page image drag: delivered as a URL, not a file. A raw
         // (often cross-origin) URL can't be attached to Gemini's composer
         // (CORS), so fetch it in the background and use the returned
@@ -3046,10 +3072,11 @@ function lpStorageGet(keys, cb) {
         if (!url) {
           var html = e.dataTransfer.getData("text/html");
           if (html) {
-            var m = html.match(/src=["']([^"']+)["']/);
+            var m = html.match(/<img[^>]+src=["']([^"']+)["']/i) || html.match(/src=["']([^"']+)["']/i);
             if (m && m[1]) url = m[1];
           }
         }
+        if (!url) { try { url = e.dataTransfer.getData("text/plain") || ""; } catch (_p) {} }
         url = (url || "").trim().split(/\s+/)[0];
         // Resolve relative src (from text/html <img>) against the page base URL.
         try { if (url && !/^[a-z][a-z0-9+.\-]*:/i.test(url)) { var _a = document.createElement("a"); _a.href = url; if (_a.href && /^https?:/i.test(_a.href)) url = _a.href; } } catch (e) {}
