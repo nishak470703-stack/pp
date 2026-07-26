@@ -3151,23 +3151,11 @@ function lpStorageGet(keys, cb) {
     }
     function fetchImageUrlAsDataUrl(url, cb) {
       if (!url) return cb(null);
-      var xhr = new XMLHttpRequest();
-      xhr.open("GET", url, true);
-      xhr.responseType = "blob";
-      xhr.timeout = 15000;
-      xhr.onload = function () {
-        if (xhr.status >= 200 && xhr.status < 300 && xhr.response) {
-          var reader = new FileReader();
-          reader.onload = function (ev) { cb(ev.target.result); };
-          reader.onerror = function () { cb(null); };
-          reader.readAsDataURL(xhr.response);
-        } else {
-          cb(null);
-        }
-      };
-      xhr.onerror = function () { cb(null); };
-      xhr.ontimeout = function () { cb(null); };
-      try { xhr.send(); } catch (e) { cb(null); }
+      try {
+        api.runtime.sendMessage({ type: "jarvis-fetch-image", url: url }, function (res) {
+          cb(res && res.ok && res.dataUrl ? res.dataUrl : null);
+        });
+      } catch (e) { cb(null); }
     }
     function resolveImageFromDrop(dt, cb) {
       if (!dt) return cb(null);
