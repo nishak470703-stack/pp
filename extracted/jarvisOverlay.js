@@ -2155,12 +2155,26 @@ function lpStorageGet(keys, cb) {
     }
     function fetchImageUrlAsDataUrl(url, cb) {
       if (!url) return cb(null);
-      // Background fetch bypasses page CORS and returns a base64 data URL.
-      try {
-        api.runtime.sendMessage({ type: "jarvis-fetch-image", url: url }, function (res) {
-          cb(res && res.ok && res.dataUrl ? res.dataUrl : null);
-        });
-      } catch (e) { cb(null); }
+      // Direct XHR fetch from content script — content scripts are NOT subject
+      // to the manifest CSP, so this bypasses the connect-src restriction that
+      // blocks the background page from fetching arbitrary image URLs.
+      var xhr = new XMLHttpRequest();
+      xhr.open("GET", url, true);
+      xhr.responseType = "blob";
+      xhr.timeout = 15000;
+      xhr.onload = function () {
+        if (xhr.status >= 200 && xhr.status < 300 && xhr.response) {
+          var reader = new FileReader();
+          reader.onload = function (ev) { cb(ev.target.result); };
+          reader.onerror = function () { cb(null); };
+          reader.readAsDataURL(xhr.response);
+        } else {
+          cb(null);
+        }
+      };
+      xhr.onerror = function () { cb(null); };
+      xhr.ontimeout = function () { cb(null); };
+      try { xhr.send(); } catch (e) { cb(null); }
     }
     function resolveImageFromDrop(dt, cb) {
       if (!dt) return cb(null);
@@ -3090,12 +3104,10 @@ function lpStorageGet(keys, cb) {
         // Resolve relative src (from text/html <img>) against the page base URL.
         try { if (url && !/^[a-z][a-z0-9+.\-]*:/i.test(url)) { var _a = document.createElement("a"); _a.href = url; if (_a.href && /^https?:/i.test(_a.href)) url = _a.href; } } catch (e) {}
         if (url && url.indexOf("http") === 0) {
-          try {
-            api.runtime.sendMessage({ type: "jarvis-fetch-image", url: url }, function (res) {
-              if (res && res.ok && res.dataUrl) { pendingImage = res.dataUrl; showPendingImageThumb(); }
-              else { captureDroppedWebImage(url); }
-            });
-          } catch (e3) {}
+          fetchImageUrlAsDataUrl(url, function (dataUrl) {
+            if (dataUrl) { pendingImage = dataUrl; showPendingImageThumb(); }
+            else { captureDroppedWebImage(url); }
+          });
         }
      });
    }
