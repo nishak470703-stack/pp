@@ -2146,11 +2146,11 @@ function lpStorageGet(keys, cb) {
     // file — the previous handler only read files, so those drags were ignored
     // and the picture never attached. The captured picture is then sent with the
     // next question, or (if a text question was just asked) re-sent with it.
-    function setPendingImageFromDataUrl(dataUrl) {
+    function setPendingImageFromDataUrl(dataUrl, autoSearch) {
       if (!dataUrl) return false;
       pendingImage = dataUrl;
       pendingUserImage = dataUrl;
-      showPendingImageThumb();
+      showPendingImageThumb(autoSearch);
       return true;
     }
     function fetchImageUrlAsDataUrl(url, cb) {
@@ -2267,9 +2267,7 @@ function lpStorageGet(keys, cb) {
         // outside this input box.
         resolveImageFromDrop(dt, function (dataUrl) {
           if (dataUrl) {
-            setPendingImageFromDataUrl(dataUrl);
-            cancelImageAutoSend();
-            setTimeout(function () { processMessage("/cari"); }, 100);
+            setPendingImageFromDataUrl(dataUrl, true);
           } else {
             addBubble("jarvis", "Tak dapat ambil gambar itu. Cuba muat naik fail (📁) atau tangkap skrin.");
           }
@@ -3059,7 +3057,7 @@ function lpStorageGet(keys, cb) {
             if (isImage) {
               var reader = new FileReader();
               reader.onload = function (ev) {
-                try { pendingImage = ev.target.result; showPendingImageThumb(); } catch (e2) {}
+                try { pendingImage = ev.target.result; showPendingImageThumb(true); } catch (e2) {}
               };
               reader.readAsDataURL(files[i]);
               handledFile = true;
@@ -3091,7 +3089,7 @@ function lpStorageGet(keys, cb) {
         if (url && url.indexOf("http") === 0) {
           try {
             api.runtime.sendMessage({ type: "jarvis-fetch-image", url: url }, function (res) {
-              if (res && res.ok && res.dataUrl) { pendingImage = res.dataUrl; showPendingImageThumb(); }
+              if (res && res.ok && res.dataUrl) { pendingImage = res.dataUrl; showPendingImageThumb(true); }
               else { captureDroppedWebImage(url); }
             });
           } catch (e3) {}
@@ -7319,7 +7317,7 @@ return;
         });
        imgThumb.appendChild(cariImgChipBtn);
      }
-     function showPendingImageThumb() {
+     function showPendingImageThumb(autoSearch) {
        if (_pendingHostCaptureImageCallback) {
          var _cb = _pendingHostCaptureImageCallback;
          _pendingHostCaptureImageCallback = null;
@@ -7343,6 +7341,10 @@ return;
        imgThumb.appendChild(x);
        ensureCariImgChip();
        maybeAutoSendImageWithLastQuestion();
+       if (autoSearch && pendingImage) {
+         cancelImageAutoSend();
+         setTimeout(function () { processMessage("/cari"); }, 100);
+       }
      }
     function clearPendingImage() {
       pendingImage = null;
