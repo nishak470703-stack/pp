@@ -3175,16 +3175,20 @@ function lpStorageGet(keys, cb) {
       }
       // 2) Image dragged from a web page → delivered as a URL, not a file.
       var url = "";
-      try { url = dt.getData("text/uri-list") || ""; } catch (e1) {}
-      if (!url) {
-        try {
-          var html = dt.getData("text/html") || "";
-          var m = /<img[^>]+src=["']([^"']+)["']/i.exec(html) || /src=["']([^"']+)["']/i.exec(html);
-          if (m) url = m[1];
-        } catch (e2) {}
-      }
+      // Prefer <img src> from text/html (Google Images etc. wrap the picture
+      // in an overlay — text/uri-list gives the intermediary page, not the image).
+      try {
+        var html = dt.getData("text/html") || "";
+        var m = /<img[^>]+src=["']([^"']+)["']/i.exec(html) || /src=["']([^"']+)["']/i.exec(html);
+        if (m) url = m[1];
+      } catch (e2) {}
+      if (!url) { try { url = dt.getData("text/uri-list") || ""; } catch (e1) {} }
       if (!url) { try { url = dt.getData("text/plain") || ""; } catch (e1b) {} }
       url = (url || "").trim().split(/\s+/)[0];
+      // If the URL is a Google Images intermediary page, extract the actual image URL.
+      if (url && url.indexOf("google.com/imgres") >= 0) {
+        try { var _p = new URL(url); var _iu = _p.searchParams.get("imgurl"); if (_iu && _iu.indexOf("http") === 0) url = decodeURIComponent(_iu); } catch (e3) {}
+      }
       // Resolve relative src (from text/html <img>) against the page base URL.
       try { if (url && !/^[a-z][a-z0-9+.\-]*:/i.test(url)) { var _a2 = document.createElement("a"); _a2.href = url; if (_a2.href && /^https?:/i.test(_a2.href)) url = _a2.href; } } catch (e2b) {}
       if (!url || url.indexOf("http") !== 0) return cb(null);
@@ -4053,24 +4057,28 @@ function lpStorageGet(keys, cb) {
          return;
        }
        handleDroppedUrl();
-       function handleDroppedUrl() {
-        // Web-page image drag: delivered as a URL, not a file. A raw
-        // (often cross-origin) URL can't be attached to Gemini's composer
-        // (CORS), so fetch it in the background and use the returned
-        // data URL — the same form a screenshot produces.
-        var url = e.dataTransfer.getData("text/uri-list") || "";
-        if (!url) {
-          var html = e.dataTransfer.getData("text/html");
-          if (html) {
-            var m = html.match(/<img[^>]+src=["']([^"']+)["']/i) || html.match(/src=["']([^"']+)["']/i);
-            if (m && m[1]) url = m[1];
-          }
-        }
-        if (!url) { try { url = e.dataTransfer.getData("text/plain") || ""; } catch (e1) {} }
-        url = (url || "").trim().split(/\s+/)[0];
-        // Resolve relative src (from text/html <img>) against the page base URL.
-        try { if (url && !/^[a-z][a-z0-9+.\-]*:/i.test(url)) { var _a = document.createElement("a"); _a.href = url; if (_a.href && /^https?:/i.test(_a.href)) url = _a.href; } } catch (e) {}
-        if (url && url.indexOf("http") === 0) {
+        function handleDroppedUrl() {
+         // Web-page image drag: delivered as a URL, not a file. A raw
+         // (often cross-origin) URL can't be attached to Gemini's composer
+         // (CORS), so fetch it in the background and use the returned
+         // data URL — the same form a screenshot produces.
+         var url = "";
+         try {
+           var html = e.dataTransfer.getData("text/html");
+           if (html) {
+             var m = html.match(/<img[^>]+src=["']([^"']+)["']/i) || html.match(/src=["']([^"']+)["']/i);
+             if (m && m[1]) url = m[1];
+           }
+         } catch (e2) {}
+         if (!url) { try { url = e.dataTransfer.getData("text/uri-list") || ""; } catch (_u) {} }
+         if (!url) { try { url = e.dataTransfer.getData("text/plain") || ""; } catch (e1) {} }
+         url = (url || "").trim().split(/\s+/)[0];
+         if (url && url.indexOf("google.com/imgres") >= 0) {
+           try { var _p = new URL(url); var _iu = _p.searchParams.get("imgurl"); if (_iu && _iu.indexOf("http") === 0) url = decodeURIComponent(_iu); } catch (e3) {}
+         }
+         // Resolve relative src (from text/html <img>) against the page base URL.
+         try { if (url && !/^[a-z][a-z0-9+.\-]*:/i.test(url)) { var _a = document.createElement("a"); _a.href = url; if (_a.href && /^https?:/i.test(_a.href)) url = _a.href; } } catch (e) {}
+         if (url && url.indexOf("http") === 0) {
           try {
             api.runtime.sendMessage({ type: "jarvis-fetch-image", url: url }, function (res) {
               if (res && res.ok && res.dataUrl) { pendingImage = res.dataUrl; showPendingImageThumb(); }
