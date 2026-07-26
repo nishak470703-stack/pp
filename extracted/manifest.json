@@ -22,7 +22,7 @@
     "webNavigation",
     "<all_urls>"
   ],
-  "content_security_policy": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' https://cdn.jsdelivr.net https://*.supabase.co wss://*.supabase.co https://youtube.com https://*.youtube.com https://youtu.be https://*.youtu.be https://js.puter.com https://api.puter.com https://*.puter.com https://generativelanguage.googleapis.com;",
+  "content_security_policy": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' https: http: https://cdn.jsdelivr.net https://*.supabase.co wss://*.supabase.co https://youtube.com https://*.youtube.com https://youtu.be https://*.youtu.be https://js.puter.com https://api.puter.com https://*.puter.com https://generativelanguage.googleapis.com;",
   "optional_permissions": [
     "file:///*"
   ],
