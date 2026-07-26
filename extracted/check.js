@@ -1,0 +1,1 @@
+const fs = require('fs'); let c = fs.readFileSync('jarvisSidebar.js', 'utf8'); console.log(JSON.stringify(c.substring(c.indexOf('} catch (e) {}', 409500) - 20, c.indexOf('addBubble(\"jarvis\", \"Tak dapat', 409500))));

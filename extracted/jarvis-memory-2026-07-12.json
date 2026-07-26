@@ -1,0 +1,119 @@
+{
+  "version": 1,
+  "exportedAt": 1783853472003,
+  "learnedCommands": [
+    {
+      "phrase": "buka youtube di page ini",
+      "plan": [
+        {
+          "action": "navigate",
+          "target": "youtube.com"
+        }
+      ],
+      "site": "www.google.com",
+      "hits": 2,
+      "created": 1783834842350,
+      "lastUsed": 1783834869817
+    },
+    {
+      "phrase": "buka youtube",
+      "plan": [
+        {
+          "action": "navigate",
+          "target": "https://www.youtube.com"
+        }
+      ],
+      "site": "www.google.com",
+      "hits": 1,
+      "created": 1783842290195,
+      "lastUsed": 1783842290195
+    },
+    {
+      "phrase": "buka yang terkini di page ini",
+      "plan": [
+        {
+          "action": "navigate",
+          "target": "https://www.youtube.com"
+        }
+      ],
+      "site": "www.google.com",
+      "hits": 1,
+      "created": 1783843316453,
+      "lastUsed": 1783843316453
+    },
+    {
+      "phrase": "boleh buka yang terkini di halaman ini",
+      "plan": [
+        {
+          "action": "open_url",
+          "target": "http://www.youtube.com/watch?v=Jsv4f5s4wzk"
+        }
+      ],
+      "site": "www.google.com",
+      "hits": 1,
+      "created": 1783849932958,
+      "lastUsed": 1783849932958
+    },
+    {
+      "phrase": "buka tiktok",
+      "plan": [
+        {
+          "action": "open_url",
+          "target": "tiktok.com"
+        }
+      ],
+      "site": "www.google.com",
+      "hits": 1,
+      "created": 1783850644154,
+      "lastUsed": 1783850644154
+    },
+    {
+      "phrase": "cari ai",
+      "plan": [
+        {
+          "action": "fill",
+          "index": 7,
+          "value": "ai"
+        }
+      ],
+      "site": "www.google.com",
+      "hits": 1,
+      "created": 1783853444738,
+      "lastUsed": 1783853444738
+    }
+  ],
+  "elementMemory": {
+    "www.google.com": {
+      "gmail": 1,
+      "search for images": 2,
+      "google apps": 3,
+      "google account li tebu litebu123 gmail com": 4,
+      "go to google home": 5,
+      "add files tools and select a model": 6,
+      "search": 7,
+      "search by voice": 8,
+      "search by image": 9,
+      "google search": 11,
+      "i m feeling lucky": 12,
+      "bahasa melayu": 14,
+      "about": 15,
+      "advertising": 16,
+      "business": 17,
+      "how search works": 18,
+      "privacy": 19,
+      "terms": 20,
+      "settings": 21,
+      "toggle auto next": 23,
+      "toggle favorite for current page": 24,
+      "toggle delete after opening": 25,
+      "hide floating button": 26,
+      "toggle background tab for next random link": 27,
+      "toggle gesture detection": 28,
+      "toggle show hidden categories": 29,
+      "buka notepad": 30,
+      "toggle rediscover notification": 31,
+      "buka tetapan": 32,
+      "toggle save page": 33
+    }
+  }
+}

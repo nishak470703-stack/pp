@@ -1,0 +1,2102 @@
+/* Local Pocket Reader - JARVIS Overlay styles */
+
+#lp-jarvis-root {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  width: min(480px, calc(100vw - 24px));
+  height: min(640px, calc(100vh - 36px));
+  max-width: calc(100vw - 24px);
+  max-height: calc(100vh - 36px);
+  z-index: 2147483646;
+  display: none;
+  flex-direction: column;
+  border-radius: 16px;
+  overflow: hidden;
+  /* Elak "scroll chaining": tatal di dalam panel tak bocor ke halaman belakang. */
+  overscroll-behavior: contain;
+  /* Font size + family are user-configurable from the in-panel controls. */
+  font-size: var(--jarvis-font-size, 13px);
+  font-family: var(--jarvis-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif);
+  color: #e8edf7;
+  background: linear-gradient(180deg, rgba(16, 19, 30, 0.98), rgba(10, 12, 20, 0.98));
+  border: 1px solid rgba(120, 170, 255, 0.28);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(120, 170, 255, 0.06);
+  backdrop-filter: blur(8px);
+}
+
+#lp-jarvis-root.lp-jarvis-open {
+  display: flex;
+}
+
+#lp-jarvis-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: linear-gradient(90deg, rgba(40, 90, 200, 0.35), rgba(120, 80, 220, 0.25));
+  border-bottom: 1px solid rgba(120, 170, 255, 0.22);
+  cursor: grab;
+  user-select: none;
+}
+
+#lp-jarvis-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  font-size: 1em;
+  color: #cfe0ff;
+}
+
+#lp-jarvis-header-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#lp-jarvis-provider {
+  border: none;
+  background: rgba(255, 255, 255, 0.08);
+  color: #cfe0ff;
+  height: 24px;
+  padding: 0 4px;
+  border-radius: 7px;
+  font-size: 0.846em;
+  font-weight: 700;
+  cursor: pointer;
+  max-width: 96px;
+}
+
+#lp-jarvis-provider:focus {
+  outline: none;
+  border-color: rgba(120, 170, 255, 0.6);
+}
+
+/* Output preferences row (summary mode + tone) copied from LP Sidebar AI. */
+#lp-jarvis-prefs-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: rgba(20, 30, 60, 0.35);
+  border-bottom: 1px solid rgba(120, 170, 255, 0.14);
+  flex-wrap: wrap;
+}
+
+#lp-jarvis-summary-mode,
+#lp-jarvis-tone {
+  border: none;
+  background: rgba(255, 255, 255, 0.08);
+  color: #cfe0ff;
+  height: 24px;
+  padding: 0 4px;
+  border-radius: 7px;
+  font-size: 0.77em;
+  font-weight: 700;
+  cursor: pointer;
+  max-width: 130px;
+}
+
+#lp-jarvis-summary-mode:focus,
+#lp-jarvis-tone:focus {
+  outline: none;
+  border-color: rgba(120, 170, 255, 0.6);
+}
+
+#lp-jarvis-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: #5fd0ff;
+  box-shadow: 0 0 10px #5fd0ff;
+}
+
+#lp-jarvis-close {
+  border: none;
+  background: rgba(255, 255, 255, 0.06);
+  color: #cfe0ff;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 1.077em;
+  line-height: 1;
+}
+
+#lp-jarvis-close:hover {
+  background: rgba(255, 90, 90, 0.25);
+}
+
+#lp-jarvis-ai-toggle {
+  border: none;
+  background: rgba(255, 255, 255, 0.06);
+  color: #cfe0ff;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 0.846em;
+  font-weight: 700;
+  margin-right: 6px;
+}
+
+#lp-jarvis-ai-toggle:hover {
+  background: rgba(120, 170, 255, 0.25);
+}
+
+#lp-jarvis-pin {
+  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.06);
+  color: #cfe0ff;
+  height: 24px;
+  width: 28px;
+  padding: 0;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 1em;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 6px;
+  opacity: 0.55;
+  transition: opacity 0.15s ease, background 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+}
+
+#lp-jarvis-pin:hover {
+  background: rgba(120, 170, 255, 0.25);
+  opacity: 0.9;
+}
+
+#lp-jarvis-pin.lp-jarvis-pin-active {
+  background: rgba(120, 170, 255, 0.45);
+  color: #fff;
+  opacity: 1;
+  border-color: rgba(150, 200, 255, 0.7);
+  box-shadow: 0 0 10px rgba(120, 170, 255, 0.6), inset 0 0 0 1px rgba(150, 200, 255, 0.6);
+}
+
+#lp-jarvis-pin.lp-jarvis-pin-pop {
+  animation: lp-jarvis-pin-pop 0.28s ease;
+}
+
+@keyframes lp-jarvis-pin-pop {
+  0% { transform: scale(1); }
+  45% { transform: scale(1.35); }
+  100% { transform: scale(1); }
+}
+
+#lp-jarvis-clear {
+  border: none;
+  background: rgba(255, 255, 255, 0.06);
+  color: #cfe0ff;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 0.846em;
+  font-weight: 700;
+  margin-right: 6px;
+}
+
+#lp-jarvis-clear:hover {
+  background: rgba(255, 120, 120, 0.28);
+  color: #ffe2e2;
+}
+
+.lp-jarvis-memory-row {
+  display: flex;
+  gap: 6px;
+  padding: 6px 10px 0;
+}
+
+.lp-jarvis-memory-row button {
+  flex: 1;
+  border: none;
+  background: rgba(255, 255, 255, 0.06);
+  color: #cfe0ff;
+  height: 26px;
+  padding: 0 9px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 0.846em;
+  font-weight: 700;
+}
+
+.lp-jarvis-memory-row button:hover {
+  background: rgba(120, 170, 255, 0.28);
+  color: #fff;
+}
+
+#lp-jarvis-root.lp-jarvis-show-provider #lp-jarvis-ai-toggle {
+  background: rgba(120, 170, 255, 0.35);
+}
+
+/* Embedded provider surface — rendered (painted) but invisible by default so the
+   Gemini composer initialises reliably "in the background". The "Lihat AI" toggle
+   reveals the live provider chat on demand. */
+#lp-jarvis-provider-iframe {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 1;
+  background: #0a0c14;
+}
+
+#lp-jarvis-root.lp-jarvis-show-provider #lp-jarvis-provider-iframe {
+  opacity: 1;
+  pointer-events: auto;
+  z-index: 5;
+}
+
+/* Floating "back to JARVIS" control: painted ABOVE the provider iframe
+   (z-index higher than the iframe's 5) so it stays clickable while the
+   embedded AI surface covers the rest of the panel. Only shown when the
+   provider view is active. */
+#lp-jarvis-provider-back {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 6;
+  display: none;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(150, 200, 255, 0.55);
+  background: rgba(20, 28, 48, 0.92);
+  color: #eaf1ff;
+  font-size: 0.846em;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+}
+
+#lp-jarvis-root.lp-jarvis-show-provider #lp-jarvis-provider-back {
+  display: inline-flex;
+}
+
+#lp-jarvis-provider-back:hover {
+  background: rgba(40, 60, 110, 0.95);
+  border-color: rgba(180, 215, 255, 0.85);
+}
+
+#lp-jarvis-transcript {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  /* Elak scroll bocor ke halaman bila transkrip sampai ke hujung. */
+  overscroll-behavior: contain;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 1em;
+  line-height: 1.5;
+  -webkit-user-select: text;
+  -moz-user-select: text;
+  user-select: text;
+}
+
+.lp-jarvis-bubble {
+  max-width: 88%;
+  padding: 9px 12px;
+  border-radius: 12px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.lp-jarvis-bubble a {
+  color: #8ab4ff;
+  text-decoration: underline;
+  cursor: pointer;
+  word-break: break-all;
+}
+ .lp-jarvis-bubble a:hover {
+   color: #b9d2ff;
+ }
+
+/* Rich HTML responses (e.g. Gemini) render real block elements (p, ul, img,
+   table…) inside the bubble content. Reset pre-wrap so the markup flows
+   normally, and style the common elements so they read like the source UI. */
+ .lp-jarvis-bubble-content {
+   white-space: normal;
+   word-break: break-word;
+ }
+ .lp-jarvis-bubble-content p {
+   margin: 0 0 8px;
+ }
+ .lp-jarvis-bubble-content p:last-child {
+   margin-bottom: 0;
+ }
+ .lp-jarvis-bubble-content ul,
+ .lp-jarvis-bubble-content ol {
+   margin: 6px 0;
+   padding-left: 20px;
+ }
+ .lp-jarvis-bubble-content li {
+   margin: 2px 0;
+ }
+ .lp-jarvis-bubble-content h1,
+ .lp-jarvis-bubble-content h2,
+ .lp-jarvis-bubble-content h3,
+ .lp-jarvis-bubble-content h4,
+ .lp-jarvis-bubble-content h5,
+ .lp-jarvis-bubble-content h6 {
+   margin: 10px 0 6px;
+   line-height: 1.3;
+   font-weight: 700;
+ }
+ .lp-jarvis-bubble-content h1 { font-size: 1.25em; }
+ .lp-jarvis-bubble-content h2 { font-size: 1.15em; }
+ .lp-jarvis-bubble-content h3 { font-size: 1.08em; }
+ .lp-jarvis-bubble-content h4,
+ .lp-jarvis-bubble-content h5,
+ .lp-jarvis-bubble-content h6 { font-size: 1em; }
+ .lp-jarvis-bubble-content img {
+   max-width: 100%;
+   height: auto;
+   border-radius: 8px;
+   margin: 6px 0;
+   display: block;
+ }
+ .lp-jarvis-bubble-content figure {
+   margin: 8px 0;
+ }
+ .lp-jarvis-bubble-content figcaption {
+   font-size: 0.85em;
+   color: rgba(207, 224, 255, 0.55);
+ }
+ .lp-jarvis-bubble-content table {
+   border-collapse: collapse;
+   width: 100%;
+   margin: 8px 0;
+   font-size: 0.92em;
+ }
+ .lp-jarvis-bubble-content th,
+ .lp-jarvis-bubble-content td {
+   border: 1px solid rgba(120, 170, 255, 0.25);
+   padding: 5px 8px;
+   text-align: left;
+ }
+ .lp-jarvis-bubble-content th {
+   background: rgba(120, 170, 255, 0.12);
+   font-weight: 700;
+ }
+ .lp-jarvis-bubble-content blockquote {
+   border-left: 3px solid rgba(120, 170, 255, 0.4);
+   margin: 8px 0;
+   padding: 2px 10px;
+   color: rgba(232, 237, 247, 0.8);
+ }
+ .lp-jarvis-bubble-content code {
+   background: rgba(8, 10, 18, 0.6);
+   border-radius: 4px;
+   padding: 1px 5px;
+   font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+   font-size: 0.9em;
+ }
+.lp-jarvis-bubble-content pre {
+  background: rgba(8, 10, 18, 0.6);
+  border: 1px solid rgba(120, 170, 255, 0.18);
+   border-radius: 8px;
+   padding: 10px 12px;
+   overflow-x: auto;
+   overscroll-behavior: contain;
+   margin: 8px 0;
+ }
+ .lp-jarvis-bubble-content pre code {
+   background: none;
+   padding: 0;
+ }
+ .lp-jarvis-bubble-content hr {
+   border: none;
+   border-top: 1px solid rgba(120, 170, 255, 0.2);
+   margin: 10px 0;
+ }
+ .lp-jarvis-bubble-content mark {
+   background: rgba(255, 220, 120, 0.3);
+   color: inherit;
+   border-radius: 3px;
+   padding: 0 2px;
+ }
+
+ .lp-jarvis-bubble-user {
+  align-self: flex-end;
+  background: rgba(80, 130, 255, 0.25);
+  border: 1px solid rgba(120, 170, 255, 0.3);
+}
+
+.lp-jarvis-bubble-jarvis {
+  align-self: flex-start;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(120, 170, 255, 0.16);
+  position: relative;
+  padding-right: 60px;
+}
+
+.lp-jarvis-copy-btn {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid rgba(120, 170, 255, 0.25);
+  background: rgba(8, 10, 18, 0.7);
+  color: #cdd6e6;
+  font-size: 0.923em;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.4;
+  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+
+/* Stay visible (not hidden-on-hover) so touch devices without hover can still
+   discover and tap the copy button; brighten to full on hover or focus. */
+.lp-jarvis-bubble-jarvis:hover .lp-jarvis-copy-btn,
+.lp-jarvis-copy-btn:focus {
+  opacity: 1;
+}
+
+.lp-jarvis-copy-btn:hover {
+  background: rgba(40, 60, 110, 0.9);
+}
+
+/* "Save answer to note" button on JARVIS (assistant) bubbles. Sits just left
+   of the copy button; revealed on hover like the copy button. */
+.lp-jarvis-note-btn {
+  position: absolute;
+  top: 5px;
+  right: 33px;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid rgba(120, 170, 255, 0.25);
+  background: rgba(8, 10, 18, 0.7);
+  color: #cdd6e6;
+  font-size: 0.923em;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.4;
+  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+.lp-jarvis-bubble-jarvis:hover .lp-jarvis-note-btn,
+.lp-jarvis-note-btn:focus {
+  opacity: 1;
+}
+.lp-jarvis-note-btn:hover {
+  background: rgba(40, 60, 110, 0.9);
+}
+
+/* "Bacakan semula" (replay speech) button on JARVIS (assistant) bubbles. Sits
+   to the left of the note button; revealed on hover like the others. */
+.lp-jarvis-speak-btn {
+  position: absolute;
+  top: 5px;
+  right: 61px;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid rgba(120, 170, 255, 0.25);
+  background: rgba(8, 10, 18, 0.7);
+  color: #cdd6e6;
+  font-size: 0.923em;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.4;
+  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+.lp-jarvis-bubble-jarvis:hover .lp-jarvis-speak-btn,
+.lp-jarvis-speak-btn:focus {
+  opacity: 1;
+}
+.lp-jarvis-speak-btn:hover {
+  background: rgba(40, 60, 110, 0.9);
+}
+
+/* Resend button on user (sent) bubbles — a small row BELOW the bubble,
+   revealed on hover. The user bubble becomes a vertical flex so the button
+   sits under the text, right-aligned like the bubble itself. */
+.lp-jarvis-bubble-user {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.lp-jarvis-resend-btn {
+  align-self: flex-end;
+  margin-top: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(120, 170, 255, 0.25);
+  background: rgba(8, 10, 18, 0.7);
+  color: #cdd6e6;
+  font-size: 0.846em;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+
+.lp-jarvis-bubble-user:hover .lp-jarvis-resend-btn {
+  opacity: 1;
+}
+
+.lp-jarvis-resend-btn:hover {
+  background: rgba(40, 60, 110, 0.9);
+  color: #fff;
+}
+
+.lp-jarvis-bubble-system {
+  align-self: center;
+  background: transparent;
+  color: rgba(207, 224, 255, 0.6);
+  font-size: 0.923em;
+  font-style: italic;
+}
+
+#lp-jarvis-input-row {
+  display: flex;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid rgba(120, 170, 255, 0.18);
+  background: rgba(255, 255, 255, 0.02);
+  align-items: flex-end;
+}
+
+/* Gemini-style composer: one bordered "pill" that wraps the image chips (top)
+   and the action row (attach / upload / textarea / send) at the bottom. */
+.lp-jarvis-input-box {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border-radius: 24px;
+  border: 1px solid rgba(120, 170, 255, 0.3);
+  background: rgba(8, 10, 18, 0.9);
+  overflow: hidden;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.lp-jarvis-input-box:focus-within {
+  border-color: rgba(120, 170, 255, 0.6);
+  box-shadow: 0 0 0 3px rgba(120, 170, 255, 0.12);
+}
+
+.lp-jarvis-input-bottom {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  padding: 6px 8px;
+}
+
+#lp-jarvis-img-chips {
+  display: none;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 8px 0;
+}
+
+.lp-jarvis-img-chip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: rgba(120, 170, 255, 0.15);
+  border: 1px solid rgba(120, 170, 255, 0.3);
+  border-radius: 8px;
+  padding: 3px 6px;
+}
+
+.lp-jarvis-img-chip-img {
+  height: 36px;
+  width: auto;
+  max-width: 80px;
+  border-radius: 5px;
+  object-fit: cover;
+  cursor: pointer;
+}
+
+.lp-jarvis-img-chip-x {
+  color: #ffd4d4;
+  cursor: pointer;
+  font-weight: 700;
+  font-size: 14px;
+  padding: 0 2px;
+  line-height: 1;
+}
+
+ .lp-jarvis-img-chip-x:hover {
+   color: #ff9090;
+ }
+
+ .lp-jarvis-img-cari-chip {
+   margin-left: 6px;
+   align-self: center;
+   border: 1px solid #3b82f6;
+   background: rgba(59, 130, 246, 0.15);
+   color: #cfe3ff;
+   border-radius: 999px;
+   padding: 3px 10px;
+   font-size: 12px;
+   font-family: inherit;
+   cursor: pointer;
+   white-space: nowrap;
+ }
+
+  .lp-jarvis-img-cari-chip:hover {
+    background: rgba(59, 130, 246, 0.3);
+  }
+
+  /* Preview beratur text susulan: ditunjukkan di dalam kotak input semasa
+     JARVIS sedang menjawab supaya pengguna nampak apa yang akan dihantar
+     bila giliran semasa selesai. */
+  .lp-jarvis-followup {
+    display: none;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px 8px 0;
+    border-bottom: 1px dashed rgba(120, 170, 255, 0.25);
+    max-height: 132px;
+    overflow-y: auto;
+  }
+
+  .lp-jarvis-followup.lp-jarvis-followup-show {
+    display: flex;
+  }
+
+  .lp-jarvis-followup-head {
+    font-size: 11px;
+    color: #9fc4ff;
+    opacity: 0.85;
+  }
+
+  .lp-jarvis-followup-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    background: rgba(120, 170, 255, 0.1);
+    border: 1px solid rgba(120, 170, 255, 0.25);
+    border-radius: 8px;
+    padding: 4px 6px;
+  }
+
+  .lp-jarvis-followup-idx {
+    color: #9fc4ff;
+    font-size: 12px;
+    font-weight: 700;
+    flex: 0 0 auto;
+    line-height: 1.4;
+  }
+
+  .lp-jarvis-followup-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-size: 12px;
+    color: #e6efff;
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.4;
+  }
+
+  .lp-jarvis-followup-x {
+    flex: 0 0 auto;
+    background: transparent;
+    border: none;
+    color: #ffd4d4;
+    cursor: pointer;
+    font-weight: 700;
+    font-size: 13px;
+    line-height: 1.2;
+    padding: 0 2px;
+  }
+
+  .lp-jarvis-followup-x:hover {
+    color: #ff9090;
+  }
+
+  /* Bubble "status barisan" dalam transcript: senarai susulan yang beratur
+     supaya kemajuan (progress) jelas kelihatan semasa JARVIS menjawab. */
+  .lp-jarvis-queue-status {
+    border: 1px dashed rgba(120, 170, 255, 0.4);
+    background: rgba(120, 170, 255, 0.06);
+    color: #cfe0ff;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  #lp-jarvis-input.lp-jarvis-followup-input {
+    opacity: 0.92;
+  }
+
+
+#lp-jarvis-input {
+  flex: 1 1 auto;
+  resize: none;
+  height: 38px;
+  max-height: 110px;
+  border: none;
+  background: transparent;
+  color: #e8edf7;
+  padding: 8px 6px;
+  font-size: 1em;
+  font-family: inherit;
+  line-height: 1.4;
+  outline: none;
+}
+
+#lp-jarvis-input:focus {
+  outline: none;
+}
+
+#lp-jarvis-send {
+  flex: 0 0 auto;
+  width: 42px;
+  border-radius: 10px;
+  border: 1px solid rgba(120, 170, 255, 0.35);
+  background: linear-gradient(180deg, rgba(60, 120, 255, 0.5), rgba(90, 70, 220, 0.4));
+  color: #fff;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+#lp-jarvis-send:hover {
+  background: linear-gradient(180deg, rgba(80, 140, 255, 0.65), rgba(110, 90, 240, 0.55));
+}
+
+#lp-jarvis-send.lp-jarvis-cancel-mode {
+  border-color: rgba(255, 120, 120, 0.55);
+  background: linear-gradient(180deg, rgba(220, 70, 70, 0.55), rgba(180, 50, 60, 0.45));
+}
+
+#lp-jarvis-send.lp-jarvis-cancel-mode:hover {
+  background: linear-gradient(180deg, rgba(240, 90, 90, 0.7), rgba(200, 60, 70, 0.6));
+}
+
+/* "Stuck" state: when JARVIS has been busy past STUCK_MS with no progress, the
+   cancel (■) button blinks orange to signal the user can force-cancel it. */
+#lp-jarvis-send.lp-jarvis-busy-stuck {
+  border-color: rgba(255, 165, 0, 0.85);
+  background: linear-gradient(180deg, rgba(255, 170, 0, 0.7), rgba(220, 120, 0, 0.6));
+  animation: lp-jarvis-stuck-blink 0.9s ease-in-out infinite;
+}
+
+#lp-jarvis-send.lp-jarvis-busy-stuck:hover {
+  background: linear-gradient(180deg, rgba(255, 190, 40, 0.85), rgba(235, 135, 0, 0.75));
+}
+
+@keyframes lp-jarvis-stuck-blink {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 165, 0, 0); }
+  50% { box-shadow: 0 0 0 4px rgba(255, 165, 0, 0.45); }
+}
+
+#lp-jarvis-bottom-toggle {
+  flex: 0 0 auto;
+  width: 28px;
+  border-radius: 8px;
+  border: 1px solid rgba(120, 170, 255, 0.2);
+  background: rgba(255, 255, 255, 0.04);
+  color: rgba(207, 224, 255, 0.55);
+  font-size: 0.85em;
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+}
+#lp-jarvis-bottom-toggle:hover {
+  color: #e8edf7;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.lp-jarvis-bottom-section {
+  flex: 0 0 auto;
+}
+.lp-jarvis-bottom-section.lp-jarvis-bottom-hidden {
+  display: none;
+}
+
+#lp-jarvis-hint {
+  padding: 0 14px 8px;
+  font-size: 0.846em;
+  color: rgba(207, 224, 255, 0.45);
+}
+
+.lp-jarvis-confirm {
+  margin-left: 6px;
+  border: 1px solid rgba(120, 255, 170, 0.4);
+  background: rgba(60, 200, 120, 0.22);
+  color: #d6ffe6;
+  border-radius: 8px;
+  padding: 3px 10px;
+  cursor: pointer;
+  font-size: 0.923em;
+  font-weight: 700;
+}
+
+.lp-jarvis-confirm:hover {
+  background: rgba(60, 200, 120, 0.4);
+}
+
+/* Inline choice row (e.g. "buka" -> current page vs new tab). */
+.lp-jarvis-choice-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.lp-jarvis-choice-row .lp-jarvis-confirm {
+  margin-left: 0;
+}
+
+/* Clear focus ring so keyboard users can see which choice is selected. */
+.lp-jarvis-confirm:focus-visible,
+.lp-jarvis-confirm:focus {
+  outline: 2px solid #9fc2ff;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 3px rgba(120, 170, 255, 0.35);
+}
+
+.lp-jarvis-choice-hint {
+  margin-top: 6px;
+  font-size: 0.77em;
+  color: rgba(207, 224, 255, 0.5);
+}
+
+.lp-jarvis-choice-cancel {
+  border-color: rgba(255, 255, 255, 0.22) !important;
+  background: rgba(255, 255, 255, 0.06) !important;
+  color: #cdd2da !important;
+  font-weight: 500 !important;
+}
+
+.lp-jarvis-choice-cancel:hover {
+  background: rgba(255, 255, 255, 0.14) !important;
+}
+
+/* Drag-to-resize handle (bottom-right corner). */
+#lp-jarvis-resize {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 16px;
+  height: 16px;
+  cursor: nwse-resize;
+  z-index: 6;
+  background: linear-gradient(135deg, transparent 50%, rgba(120, 170, 255, 0.55) 50%);
+  border-bottom-right-radius: 16px;
+}
+
+.lp-jarvis-suggest {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 0; /* set dynamically in JS so it floats just above the input row,
+                overlaying the transcript instead of pushing the bottom rows. */
+  z-index: 7; /* above the provider iframe (5) and floating back button (6). */
+  display: none;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px;
+  border-radius: 10px;
+  background: rgba(10, 14, 24, 0.98);
+  border: 1px solid rgba(120, 170, 255, 0.35);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.55);
+  max-height: 176px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.lp-jarvis-suggest.lp-jarvis-suggest-show {
+  display: flex;
+}
+
+.lp-jarvis-suggest-item {
+  padding: 7px 10px;
+  border-radius: 8px;
+  font-size: 0.923em;
+  color: #e3ecff;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lp-jarvis-suggest-item:hover,
+.lp-jarvis-suggest-item.lp-jarvis-suggest-active {
+  background: rgba(120, 170, 255, 0.32);
+  color: #fff;
+}
+
+/* "Loading" feedback while JARVIS is busy (mid-command). */
+.lp-jarvis-busy {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  margin-left: 8px;
+  color: #9fc2ff;
+  font-size: 0.846em;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.lp-jarvis-busy.lp-jarvis-busy-show {
+  display: flex;
+}
+
+.lp-jarvis-spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid rgba(159, 194, 255, 0.35);
+  border-top-color: #9fc2ff;
+  animation: lp-jarvis-spin 0.7s linear infinite;
+}
+
+@keyframes lp-jarvis-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Subtle pulsing outline on the input while busy. */
+#lp-jarvis-root.lp-jarvis-busy-state #lp-jarvis-input {
+  border-color: rgba(120, 170, 255, 0.6);
+  box-shadow: 0 0 0 2px rgba(120, 170, 255, 0.18);
+}
+
+/* Pulsing panel border while busy so the "processing" state is unmistakable.
+   IMPORTANT: do NOT animate box-shadow here. The root panel contains the
+   (growing) transcript, and animating a large blurred box-shadow forced a
+   full-panel repaint on every animation frame — which made typing in the input
+   janky ONLY while JARVIS was answering (smooth when idle). Use a cheap,
+   STATIC outline instead so there is no per-frame repaint during streaming. */
+#lp-jarvis-root.lp-jarvis-busy-state {
+  outline: 1px solid rgba(120, 170, 255, 0.32);
+  outline-offset: -1px;
+}
+
+/* In-transcript "processing / cancellable" indicator: shown inside the JARVIS
+   bubble that is still being generated so the busy + cancel state is obvious
+   right in the conversation, not only on the input row. */
+.lp-jarvis-bubble-processing {
+  border-color: rgba(255, 140, 140, 0.35);
+  box-shadow: inset 3px 0 0 rgba(240, 90, 90, 0.7);
+}
+
+.lp-jarvis-bubble-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 7px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 120, 120, 0.35);
+  background: rgba(220, 70, 70, 0.14);
+  color: #ffd4d4;
+  font-size: 0.808em;
+  font-weight: 600;
+  cursor: pointer;
+  width: max-content;
+  max-width: 100%;
+  user-select: none;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.lp-jarvis-bubble-status:hover {
+  background: rgba(240, 90, 90, 0.28);
+  border-color: rgba(255, 150, 150, 0.6);
+  color: #fff;
+}
+
+.lp-jarvis-bubble-status-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 0 auto;
+}
+
+.lp-jarvis-bubble-status-dots i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.35;
+  animation: lp-jarvis-status-dot 1s ease-in-out infinite;
+}
+
+.lp-jarvis-bubble-status-dots i:nth-child(2) { animation-delay: 0.18s; }
+.lp-jarvis-bubble-status-dots i:nth-child(3) { animation-delay: 0.36s; }
+
+@keyframes lp-jarvis-status-dot {
+  0%, 100% { opacity: 0.3; transform: translateY(0); }
+  50% { opacity: 1; transform: translateY(-2px); }
+}
+
+.lp-jarvis-bubble-status-text {
+  white-space: nowrap;
+}
+
+/* In-panel font size / font family controls. */
+.lp-jarvis-font-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-bottom: 1px solid rgba(120, 170, 255, 0.16);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.lp-jarvis-font-row .lp-jarvis-font-label {
+  color: #cfe0ff;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  margin-right: auto;
+  opacity: 0.7;
+}
+
+.lp-jarvis-font-row button {
+  flex: 0 0 auto;
+  border: 1px solid rgba(120, 170, 255, 0.25);
+  background: rgba(8, 10, 18, 0.7);
+  color: #cfe0ff;
+  min-width: 28px;
+  height: 26px;
+  padding: 0 8px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-weight: 700;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.lp-jarvis-font-row button:hover {
+  background: rgba(120, 170, 255, 0.28);
+  color: #fff;
+}
+
+.lp-jarvis-font-row #lp-jarvis-font-size-label {
+  min-width: 42px;
+  text-align: center;
+  border: none;
+  background: transparent;
+  color: #cfe0ff;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: default;
+}
+
+#lp-jarvis-font-family {
+  flex: 0 0 auto;
+  border: 1px solid rgba(120, 170, 255, 0.25);
+  background: rgba(8, 10, 18, 0.7);
+  color: #cfe0ff;
+  height: 26px;
+  padding: 0 6px;
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  max-width: 120px;
+}
+
+#lp-jarvis-font-family:focus {
+  outline: none;
+  border-color: rgba(120, 170, 255, 0.6);
+}
+
+/* Saved prompt templates modal (copied from LP Sidebar AI). */
+#lp-jarvis-tpl-btn {
+  border: none;
+  background: rgba(255, 255, 255, 0.08);
+  color: #cfe0ff;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 7px;
+  font-size: 0.77em;
+  font-weight: 700;
+  cursor: pointer;
+}
+#lp-jarvis-tpl-btn:hover {
+  background: rgba(120, 170, 255, 0.25);
+}
+.lp-jarvis-tpl-modal {
+  display: none;
+  position: absolute;
+  inset: 8px;
+  z-index: 40;
+  background: rgba(12, 16, 30, 0.97);
+  border: 1px solid rgba(120, 170, 255, 0.3);
+  border-radius: 10px;
+  padding: 10px;
+  flex-direction: column;
+  gap: 8px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.lp-jarvis-tpl-modal.lp-jarvis-show {
+  display: flex;
+}
+.lp-jarvis-tpl-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: 700;
+  color: #cfe0ff;
+}
+.lp-jarvis-tpl-close {
+  border: none;
+  background: rgba(255, 255, 255, 0.06);
+  color: #cfe0ff;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 1.077em;
+  line-height: 1;
+}
+.lp-jarvis-tpl-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 200px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.lp-jarvis-tpl-empty {
+  color: rgba(207, 224, 255, 0.6);
+  font-style: italic;
+  font-size: 12px;
+}
+.lp-jarvis-tpl-foot {
+  display: flex;
+  justify-content: flex-end;
+  border-top: 1px solid rgba(120, 170, 255, 0.18);
+  padding-top: 8px;
+  margin-top: 2px;
+}
+.lp-jarvis-tpl-clear-btn {
+  border: 1px solid rgba(255, 120, 120, 0.45);
+  background: rgba(255, 80, 80, 0.14);
+  color: #ffd7d7;
+  border-radius: 7px;
+  padding: 5px 12px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.lp-jarvis-tpl-clear-btn:hover {
+  background: rgba(255, 80, 80, 0.26);
+}
+.lp-jarvis-tpl-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 7px;
+  padding: 5px 7px;
+}
+.lp-jarvis-tpl-name-lbl {
+  color: #cfe0ff;
+  font-size: 12px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lp-jarvis-tpl-item-btns {
+  display: flex;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+.lp-jarvis-tpl-item-btns button {
+  border: none;
+  background: rgba(120, 170, 255, 0.2);
+  color: #cfe0ff;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.lp-jarvis-tpl-divider {
+  color: rgba(207, 224, 255, 0.7);
+  font-size: 12px;
+  font-weight: 700;
+  margin-top: 2px;
+}
+.lp-jarvis-tpl-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.lp-jarvis-tpl-name,
+.lp-jarvis-tpl-text {
+  border: 1px solid rgba(120, 170, 255, 0.25);
+  background: rgba(8, 10, 18, 0.7);
+  color: #cfe0ff;
+  border-radius: 7px;
+  padding: 6px;
+  font-size: 12px;
+  font-family: inherit;
+}
+.lp-jarvis-tpl-name:focus,
+.lp-jarvis-tpl-text:focus {
+  outline: none;
+  border-color: rgba(120, 170, 255, 0.6);
+}
+.lp-jarvis-tpl-form-btns {
+  display: flex;
+  gap: 6px;
+}
+.lp-jarvis-tpl-save {
+  border: none;
+  background: rgba(95, 208, 255, 0.3);
+  color: #fff;
+  height: 26px;
+  padding: 0 12px;
+  border-radius: 7px;
+  font-weight: 700;
+  font-size: 12px;
+  cursor: pointer;
+}
+.lp-jarvis-tpl-cancel {
+  border: none;
+  background: rgba(255, 255, 255, 0.08);
+  color: #cfe0ff;
+  height: 26px;
+  padding: 0 12px;
+  border-radius: 7px;
+  font-weight: 700;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+/* Floating text-selection buttons (copied from LP Sidebar AI). */
+#lp-jarvis-sel-buttons {
+  display: none;
+  position: fixed;
+  z-index: 2147483646;
+  gap: 4px;
+  background: rgba(12, 16, 30, 0.96);
+  border: 1px solid rgba(120, 170, 255, 0.4);
+  border-radius: 9px;
+  padding: 4px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+}
+#lp-jarvis-sel-buttons button {
+  border: none;
+  cursor: pointer;
+  font-weight: 700;
+  font-size: 12px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 6px;
+  color: #fff;
+}
+.lp-jarvis-sel-ai {
+  background: rgba(95, 208, 255, 0.35);
+}
+.lp-jarvis-sel-note {
+  background: rgba(120, 170, 255, 0.35);
+}
+.lp-jarvis-sel-search {
+  background: rgba(255, 255, 255, 0.14) !important;
+  color: #cfe0ff !important;
+}
+#lp-jarvis-sel-buttons button:hover {
+  filter: brightness(1.2);
+}
+/* Hint that the popup background is draggable. */
+#lp-jarvis-sel-buttons {
+  cursor: move;
+}
+
+/* Custom summary-mode prompt row. */
+#lp-jarvis-custom-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: rgba(20, 30, 60, 0.35);
+  border-bottom: 1px solid rgba(120, 170, 255, 0.14);
+}
+.lp-jarvis-custom-label {
+  color: #cfe0ff;
+  font-size: 11px;
+  font-weight: 700;
+}
+.lp-jarvis-custom-prompt {
+  flex: 1 1 auto;
+  border: 1px solid rgba(120, 170, 255, 0.25);
+  background: rgba(8, 10, 18, 0.7);
+  color: #cfe0ff;
+  border-radius: 7px;
+  padding: 5px 7px;
+  font-size: 12px;
+  font-family: inherit;
+}
+.lp-jarvis-custom-prompt:focus {
+  outline: none;
+  border-color: rgba(120, 170, 255, 0.6);
+}
+.lp-jarvis-custom-tpl-btn {
+  flex: 0 0 auto;
+  border: 1px solid rgba(120, 170, 255, 0.25);
+  background: rgba(255, 255, 255, 0.08);
+  color: #cfe0ff;
+  border-radius: 7px;
+  padding: 5px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.lp-jarvis-custom-tpl-btn:hover {
+  background: rgba(120, 170, 255, 0.25);
+}
+
+/* Selection-search settings button + config modal. */
+#lp-jarvis-summarize-btn {
+  border: none;
+  background: rgba(95, 208, 255, 0.3);
+  color: #fff;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 7px;
+  font-size: 0.77em;
+  font-weight: 700;
+  cursor: pointer;
+}
+#lp-jarvis-save-convo {
+  border: none;
+  background: rgba(255, 255, 255, 0.06);
+  color: #cfe0ff;
+  height: 24px;
+  width: 28px;
+  padding: 0;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 1em;
+  line-height: 1;
+  margin-right: 6px;
+}
+
+#lp-jarvis-save-convo:hover {
+  background: rgba(120, 170, 255, 0.25);
+}
+
+/* Quick-command chips + offline follow-up suggestions (feature #3). */
+.lp-jarvis-quick-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 12px 0;
+}
+
+.lp-jarvis-chip {
+  border: 1px solid rgba(120, 170, 255, 0.28);
+  background: rgba(255, 255, 255, 0.05);
+  color: #d6e2ff;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: 0.808em;
+  font-weight: 700;
+  white-space: nowrap;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.lp-jarvis-chip:hover {
+  background: rgba(120, 170, 255, 0.28);
+  color: #fff;
+  border-color: rgba(150, 200, 255, 0.6);
+}
+
+.lp-jarvis-followups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.lp-jarvis-chip-followup {
+  height: 24px;
+  font-size: 0.769em;
+  font-weight: 600;
+}
+
+.lp-jarvis-chip-action {
+  border-color: rgba(120, 230, 170, 0.45);
+  background: rgba(60, 200, 130, 0.14);
+  color: #b6f5d6;
+}
+.lp-jarvis-chip-action:hover {
+  background: rgba(60, 200, 130, 0.32);
+  color: #eafff4;
+  border-color: rgba(120, 230, 170, 0.8);
+}
+
+#lp-jarvis-img-attach {
+  flex: 0 0 auto;
+  width: 38px;
+  border-radius: 10px;
+  border: 1px solid rgba(120, 170, 255, 0.25);
+  background: rgba(8, 10, 18, 0.9);
+  color: #cfe0ff;
+  font-size: 1em;
+  cursor: pointer;
+}
+#lp-jarvis-img-attach:hover {
+  background: rgba(120, 170, 255, 0.25);
+}
+
+#lp-jarvis-file-upload {
+  flex: 0 0 auto;
+  width: 38px;
+  border-radius: 10px;
+  border: 1px solid rgba(120, 170, 255, 0.25);
+  background: rgba(8, 10, 18, 0.9);
+  color: #cfe0ff;
+  font-size: 1em;
+  cursor: pointer;
+}
+ #lp-jarvis-file-upload:hover {
+   background: rgba(120, 170, 255, 0.25);
+ }
+
+ #lp-jarvis-tts {
+   flex: 0 0 auto;
+   width: 38px;
+   border-radius: 10px;
+   border: 1px solid rgba(120, 170, 255, 0.25);
+   background: rgba(8, 10, 18, 0.9);
+   color: #cfe0ff;
+   font-size: 1em;
+   cursor: pointer;
+ }
+ #lp-jarvis-tts:hover {
+   background: rgba(120, 170, 255, 0.25);
+ }
+ /* TTS toggle ON */
+ #lp-jarvis-tts.lp-jarvis-tts-on {
+   background: rgba(16, 185, 129, 0.3);
+   border-color: rgba(16, 185, 129, 0.8);
+   color: #b9f5dd;
+ }
+
+
+/* Image in user bubble (Gemini-style) */
+.lp-jarvis-bubble-img-wrap {
+  margin-bottom: 6px;
+}
+.lp-jarvis-bubble-img {
+  max-height: 160px;
+  max-width: 100%;
+  border-radius: 8px;
+  border: 1px solid rgba(120, 170, 255, 0.25);
+  display: block;
+}
+.lp-jarvis-bubble-user .lp-jarvis-bubble-img {
+  border-color: rgba(120, 170, 255, 0.4);
+}
+
+/* Full-screen image lightbox (click a bubble/attachment thumbnail to enlarge). */
+.lp-jarvis-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483646;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(4, 6, 12, 0.86);
+  cursor: zoom-out;
+}
+.lp-jarvis-lightbox-img {
+  max-width: 92vw;
+  max-height: 92vh;
+  border-radius: 10px;
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
+  border: 1px solid rgba(120, 170, 255, 0.3);
+}
+.lp-jarvis-lightbox-close {
+  position: absolute;
+  top: 16px;
+  right: 18px;
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: rgba(8, 12, 22, 0.85);
+  border: 1px solid rgba(120, 170, 255, 0.4);
+  color: #eaf1ff;
+  font-size: 18px;
+  cursor: pointer;
+}
+.lp-jarvis-lightbox-close:hover {
+  background: rgba(120, 170, 255, 0.3);
+}
+
+/* E11: Responsif / mobile-friendly. Di skrin kecil panel JARVIS jadi
+   full-screen (bukan terpotong). Kecuali mod sidebar-host (panel
+   sidebar extension itu sendiri) yang biar kekal asli. */
+@media (max-width: 480px) {
+  #lp-jarvis-root:not(.lp-jarvis-host) {
+    right: 0 !important;
+    bottom: 0 !important;
+    width: 100vw !important;
+    height: 100vh !important;
+    max-width: none !important;
+    max-height: none !important;
+    border-radius: 0 !important;
+  }
+  .lp-jarvis-bubble-img {
+    max-height: 120px;
+  }
+}
+
+/* E10: Loading skeleton — animasi shimmer untuk bubble sedang memproses
+   (ganti teks "…" agar nampak JARVIS sedang berfikir). */
+.lp-jarvis-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 2px 0;
+}
+.lp-jarvis-skeleton-line {
+  height: 12px;
+  border-radius: 6px;
+  background: linear-gradient(90deg, rgba(255,255,255,0.06) 25%, rgba(255,255,255,0.12) 50%, rgba(255,255,255,0.06) 75%);
+  background-size: 200% 100%;
+  animation: lp-jarvis-shimmer 1.5s infinite;
+}
+@keyframes lp-jarvis-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+/* Sorok butang salin/nota semasa bubble sedang memproses. */
+.lp-jarvis-bubble.lp-jarvis-bubble-loading .lp-jarvis-copy-btn,
+.lp-jarvis-bubble.lp-jarvis-bubble-loading .lp-jarvis-note-btn {
+  display: none;
+}
+
+/* "Pilih imej" hover-highlight + hint bar (feature #6c). */
+.lp-jarvis-img-select-hl {
+  position: fixed;
+  z-index: 2147483645;
+  border: 2px solid #5fd0ff;
+  background: rgba(95, 208, 255, 0.12);
+  border-radius: 4px;
+  pointer-events: none;
+  display: none;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45), 0 0 12px rgba(95, 208, 255, 0.5);
+}
+.lp-jarvis-img-select-label {
+  position: absolute;
+  top: -20px;
+  left: 0;
+  background: rgba(8, 12, 22, 0.92);
+  color: #eaf1ff;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 6px;
+  white-space: nowrap;
+  border: 1px solid rgba(120, 170, 255, 0.4);
+}
+.lp-jarvis-img-select-hint {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 2147483646;
+  display: none;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: rgba(12, 16, 30, 0.96);
+  border: 1px solid rgba(120, 170, 255, 0.4);
+  color: #eaf1ff;
+  font-size: 12px;
+  font-weight: 600;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+}
+
+/* Shared capture-option button (capture popup + selection bars + image-select hint). */
+.lp-jarvis-cap-opt {
+  border: 1px solid rgba(120, 170, 255, 0.4);
+  background: rgba(120, 170, 255, 0.18);
+  color: #eaf1ff;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.lp-jarvis-cap-opt:hover {
+  background: rgba(120, 170, 255, 0.34);
+  color: #fff;
+}
+
+/* Region selection (feature #6b). These were previously unstyled, so drawing a
+   box never started — now the overlay covers the viewport and captures pointer
+   events; the box uses a huge spread shadow to dim everything outside it. */
+.lp-jarvis-select-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483645;
+  cursor: crosshair;
+}
+.lp-jarvis-select-box {
+  position: fixed;
+  display: none;
+  border: 2px solid #5fd0ff;
+  background: rgba(95, 208, 255, 0.12);
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.5);
+  box-sizing: border-box;
+  cursor: move;
+}
+.lp-jarvis-select-handle {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  background: #5fd0ff;
+  border: 1px solid #fff;
+  border-radius: 2px;
+}
+.lp-jarvis-select-handle-nw { left: -7px; top: -7px; cursor: nwse-resize; }
+.lp-jarvis-select-handle-ne { right: -7px; top: -7px; cursor: nesw-resize; }
+.lp-jarvis-select-handle-sw { left: -7px; bottom: -7px; cursor: nesw-resize; }
+.lp-jarvis-select-handle-se { right: -7px; bottom: -7px; cursor: nwse-resize; }
+.lp-jarvis-select-bar {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 2147483646;
+  display: flex;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: rgba(12, 16, 30, 0.96);
+  border: 1px solid rgba(120, 170, 255, 0.4);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+}
+
+/* JARVIS docked sidebar mode (toggled from the panel header button).
+   Overrides the floating-popup positioning from #lp-jarvis-root. */
+#lp-jarvis-root.lp-jarvis-sidebar {
+  top: 0;
+  right: 0;
+  bottom: auto;
+  left: auto;
+  width: 400px;
+  max-width: 92vw;
+  height: 100vh;
+  max-height: 100vh;
+  border-radius: 0;
+  border-top: none;
+  border-bottom: none;
+  border-right: none;
+  box-shadow: -10px 0 40px rgba(0, 0, 0, 0.5);
+}
+
+/* ─── Conflict Resolution UI ─── */
+
+.lp-jarvis-conflict-card {
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.7);
+  padding: 10px 12px;
+  margin: 6px 0;
+  animation: lp-jarvis-conflict-in 0.25s ease-out;
+}
+
+@keyframes lp-jarvis-conflict-in {
+  from { opacity: 0; transform: translateY(-8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.lp-jarvis-conflict-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.lp-jarvis-conflict-icon { font-size: 14px; }
+.lp-jarvis-conflict-label {
+  font-weight: 600;
+  font-size: 13px;
+  color: #f1f5f9;
+}
+.lp-jarvis-conflict-desc {
+  font-size: 11px;
+  color: #94a3b8;
+  margin-bottom: 8px;
+  line-height: 1.4;
+}
+
+.lp-jarvis-conflict-alts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.lp-jarvis-conflict-alt {
+  flex: 1 1 calc(50% - 6px);
+  min-width: 110px;
+  background: rgba(30, 41, 59, 0.7);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 10px;
+  padding: 8px 10px;
+  cursor: pointer;
+  text-align: left;
+  color: #e2e8f0;
+  font-size: 12px;
+  transition: background 0.15s, border-color 0.15s, transform 0.1s;
+  position: relative;
+}
+.lp-jarvis-conflict-alt:hover {
+  background: rgba(59, 130, 246, 0.2);
+  border-color: rgba(59, 130, 246, 0.5);
+  transform: translateY(-1px);
+}
+.lp-jarvis-conflict-alt:focus-visible {
+  outline: 2px solid rgba(59, 130, 246, 0.7);
+  outline-offset: 2px;
+}
+.lp-jarvis-conflict-custom {
+  border-style: dashed;
+  opacity: 0.8;
+}
+.lp-jarvis-conflict-alt-icon { font-size: 18px; margin-bottom: 2px; }
+.lp-jarvis-conflict-alt-label {
+  font-weight: 600;
+  font-size: 12px;
+  color: #f8fafc;
+}
+.lp-jarvis-conflict-alt-desc {
+  font-size: 10px;
+  color: #94a3b8;
+  margin-top: 1px;
+}
+.lp-jarvis-conflict-alt-edit {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  opacity: 0.5;
+  padding: 2px;
+  border-radius: 4px;
+}
+.lp-jarvis-conflict-alt-edit:hover {
+  opacity: 1;
+  background: rgba(255,255,255,0.1);
+}
+
+.lp-jarvis-conflict-pref {
+  display: flex;
+  align-items: center;
+  margin-top: 4px;
+}
+.lp-jarvis-conflict-dontask {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: #64748b;
+  cursor: pointer;
+  user-select: none;
+}
+.lp-jarvis-conflict-dontask input { width: 12px; height: 12px; cursor: pointer; }
+
+.lp-jarvis-conflict-timer {
+  height: 2px;
+  background: rgba(148, 163, 184, 0.15);
+  border-radius: 2px;
+  margin-top: 6px;
+  overflow: hidden;
+}
+.lp-jarvis-conflict-timer-fill {
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+  border-radius: 2px;
+}
+
+/* Conflict card choices row (horizontal layout for 2 choices) */
+.lp-jarvis-choice-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+.lp-jarvis-choice-hint {
+  font-size: 10px;
+  color: #64748b;
+  margin: 2px 0 4px;
+}
+
+/* ─── Modal (Edit / Custom Input) ─── */
+
+.lp-jarvis-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: lp-jarvis-fade-in 0.15s ease-out;
+}
+@keyframes lp-jarvis-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.lp-jarvis-modal {
+  background: rgb(18, 20, 28);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 14px;
+  padding: 18px;
+  min-width: 300px;
+  max-width: 380px;
+  max-height: 80vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.6);
+  color: #e8edf7;
+  font-size: 13px;
+}
+
+.lp-jarvis-modal-title {
+  font-weight: 700;
+  font-size: 14px;
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+.lp-jarvis-modal-desc {
+  font-size: 12px;
+  color: #94a3b8;
+  margin-bottom: 8px;
+}
+.lp-jarvis-modal-fields { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+.lp-jarvis-modal-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.lp-jarvis-modal-field-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: #94a3b8;
+  text-transform: capitalize;
+}
+.lp-jarvis-modal-field-input,
+.lp-jarvis-modal-textarea {
+  background: rgba(30, 41, 59, 0.7);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: #e2e8f0;
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  width: 100%;
+  box-sizing: border-box;
+}
+.lp-jarvis-modal-field-input:focus,
+.lp-jarvis-modal-textarea:focus {
+  border-color: rgba(59, 130, 246, 0.6);
+}
+.lp-jarvis-modal-field-input:disabled {
+  opacity: 0.6;
+}
+.lp-jarvis-modal-textarea {
+  min-height: 60px;
+  resize: vertical;
+  margin-bottom: 8px;
+}
+.lp-jarvis-modal-btnrow {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.lp-jarvis-modal-btn {
+  padding: 7px 16px;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  background: transparent;
+  color: #cbd5e1;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.lp-jarvis-modal-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+.lp-jarvis-modal-btn-primary {
+  background: #3b82f6;
+  border-color: #3b82f6;
+  color: #fff;
+}
+.lp-jarvis-modal-btn-primary:hover {
+  background: #2563eb;
+}
+
+#lp-jarvis-root pre {
+  background: rgba(0,0,0,0.3);
+  border-radius: 8px;
+  padding: 10px 14px;
+  overflow-x: auto;
+  overscroll-behavior: contain;
+  font-size: 0.923em;
+  margin: 8px 0;
+  max-width: 100%;
+}
+#lp-jarvis-root code {
+  background: rgba(255,255,255,0.08);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 0.923em;
+}
+#lp-jarvis-root pre code {
+  background: none;
+  padding: 0;
+}
+#lp-jarvis-root ul, #lp-jarvis-root ol {
+  padding-left: 20px;
+  margin: 6px 0;
+}
+#lp-jarvis-root li {
+  margin: 2px 0;
+}
+#lp-jarvis-root h2, #lp-jarvis-root h3, #lp-jarvis-root h4 {
+  margin: 10px 0 4px;
+  color: #cfe0ff;
+}
+#lp-jarvis-root h2 { font-size: 1.154em; }
+#lp-jarvis-root h3 { font-size: 1.077em; }
+#lp-jarvis-root h4 { font-size: 1em; }
+.lp-jarvis-code-copy {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  background: rgba(255,255,255,0.1);
+  border: 1px solid rgba(255,255,255,0.15);
+  color: #cfe0ff;
+  border-radius: 5px;
+  padding: 2px 8px;
+  font-size: 0.769em;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.2s;
+  z-index: 1;
+}
+pre:hover .lp-jarvis-code-copy { opacity: 1; }
+/* E4: butang "ke bawah" bila pengguna scroll ke atas (smart auto-scroll).
+   `bottom` di-override oleh JS supaya sentiasa tepat di atas baris input
+   (tak kira tinggi baris input / chips lampiran). */
+.lp-jarvis-scroll-down {
+  position: absolute;
+  right: 12px;
+  bottom: 66px;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 1px solid rgba(120, 170, 255, 0.4);
+  background: rgba(16, 19, 30, 0.94);
+  color: #cfe0ff;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 30;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+  transition: background 0.15s ease, transform 0.15s ease;
+}
+.lp-jarvis-scroll-down:hover { background: rgba(40, 90, 200, 0.7); transform: translateY(-1px); }
+
+/* E9: highlight bila imej diheret ke dalam panel (drag & drop). */
+.lp-jarvis-drag-over {
+  outline: 2px dashed #5fd0ff;
+  outline-offset: -6px;
+}
+
+/* E6: butang edit / padam pada bubble pengguna. */
+.lp-jarvis-edit-btn, .lp-jarvis-del-btn {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #cfe0ff;
+  border-radius: 5px;
+  padding: 2px 6px;
+  font-size: 0.846em;
+  cursor: pointer;
+}
+.lp-jarvis-edit-btn:hover, .lp-jarvis-del-btn:hover { background: rgba(255, 255, 255, 0.14); }
+
+/* ── #3 Proactive Agent: lencana/titik terapung + popover cadangan ────────── */
+/* Gaya kritikal juga ditetapkan inline dalam proactiveIndicator.js supaya
+   lencana kekal kelihatan walau stylesheet ini gagal dimuat pada halaman. */
+#lp-jarvis-proactive-dot {
+  transition: transform 0.15s ease, box-shadow 0.2s ease;
+}
+#lp-jarvis-proactive-dot:hover {
+  transform: scale(1.08);
+}
+#lp-jarvis-proactive-dot.lp-jarvis-proactive-pulse {
+  animation: lp-jarvis-proactive-pulse 2s ease-in-out infinite;
+}
+@keyframes lp-jarvis-proactive-pulse {
+  0%   { box-shadow: 0 4px 16px rgba(60, 90, 220, 0.5), 0 0 0 0 rgba(120, 150, 255, 0.55); }
+  70%  { box-shadow: 0 4px 16px rgba(60, 90, 220, 0.5), 0 0 0 12px rgba(120, 150, 255, 0); }
+  100% { box-shadow: 0 4px 16px rgba(60, 90, 220, 0.5), 0 0 0 0 rgba(120, 150, 255, 0); }
+}
+#lp-jarvis-proactive-pop .lp-jarvis-proactive-accept:hover {
+  filter: brightness(1.1);
+}
+#lp-jarvis-proactive-pop .lp-jarvis-proactive-reject:hover {
+  background: rgba(255, 255, 255, 0.18) !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  #lp-jarvis-proactive-dot.lp-jarvis-proactive-pulse { animation: none; }
+}
+
+
+

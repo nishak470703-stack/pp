@@ -1,0 +1,301 @@
+﻿async function buildCategoryPickerPayload(options) {
+  const [settings, data, pickerToggleShortcut, rawData] = await Promise.all([
+    currentSettings ? Promise.resolve(currentSettings) : getSettings(),
+    lpStoreGet([
+      ITEM_KEY,
+      CATEGORY_KEY,
+      SELECTED_CATEGORY_KEY,
+      CATEGORY_PICKER_LAST_LOCATION_KEY,
+    ]),
+    getCommandShortcut("open-category-picker"),
+    _rawGet([SELECTED_CATEGORY_KEY, CATEGORY_PICKER_LAST_LOCATION_KEY]), // bypass LP_STORAGE cache â€” picker tulis terus ke chrome.storage.local
+  ]);
+  // Guna nilai direct dari chrome.storage.local untuk selectedCategory dan
+  // categoryPickerLastLocation supaya picker yang tulis terus ke storage
+  // (tanpa LP_STORAGE cache) dapat dibaca dengan betul.
+  if (rawData && typeof rawData[SELECTED_CATEGORY_KEY] !== "undefined") {
+    data[SELECTED_CATEGORY_KEY] = rawData[SELECTED_CATEGORY_KEY];
+  }
+  if (rawData && rawData[CATEGORY_PICKER_LAST_LOCATION_KEY]) {
+    data[CATEGORY_PICKER_LAST_LOCATION_KEY] = rawData[CATEGORY_PICKER_LAST_LOCATION_KEY];
+  }
+  let items = coerceArray(data[ITEM_KEY]);
+  const filled = ensureManualOrderDefaults(items);
+  if (filled.changed) {
+    items = filled.items;
+    await setItems(items);
+  }
+  const categories = sortCategories(coerceArray(data[CATEGORY_KEY]));
+  const counts = buildCategoryCounts(items, categories, {
+    showHiddenCategories: settings.showHiddenCategories,
+  });
+  let currentTabUrl = "";
+  let currentTabTitle = "";
+  let currentTabId = options && options.tabId ? options.tabId : null;
+  try {
+    if (options && options.tabUrl) {
+      currentTabUrl = options.tabUrl;
+    }
+    if (options && options.tabTitle) {
+      currentTabTitle = options.tabTitle;
+    }
+    if (
+      (!currentTabUrl || !currentTabTitle) &&
+      options &&
+      options.tabId &&
+      lpApi.tabs &&
+      lpApi.tabs.get
+    ) {
+      const tab = await promisifyTabsGet(options.tabId);
+      if (tab && tab.id) {
+        currentTabId = tab.id;
+      }
+      if (!currentTabUrl) {
+        currentTabUrl = tab && tab.url ? tab.url : "";
+      }
+      if (!currentTabTitle) {
+        currentTabTitle = tab && tab.title ? tab.title : "";
+      }
+    } else if (
+      (!currentTabUrl || !currentTabTitle) &&
+      lpApi.tabs &&
+      lpApi.tabs.query
+    ) {
+      const tabs = await promisifyTabsQuery({
+        active: true,
+        currentWindow: true,
+      });
+      if (!currentTabId) {
+        currentTabId = tabs && tabs[0] && tabs[0].id ? tabs[0].id : null;
+      }
+      if (!currentTabUrl) {
+        currentTabUrl = tabs && tabs[0] && tabs[0].url ? tabs[0].url : "";
+      }
+      if (!currentTabTitle) {
+        currentTabTitle = tabs && tabs[0] && tabs[0].title ? tabs[0].title : "";
+      }
+    }
+  } catch (err) {
+    if (!currentTabUrl) currentTabUrl = "";
+    if (!currentTabTitle) currentTabTitle = "";
+  }
+  if (
+    currentTabId &&
+    (looksLikeUrlText(
+      normalizeExtractedTitle(currentTabTitle),
+      currentTabUrl,
+    ) ||
+      isGenericFallbackTitleText(currentTabTitle)) &&
+    lpApi.tabs &&
+    lpApi.tabs.executeScript
+  ) {
+    try {
+      const scriptResult = await executeScriptSafe(currentTabId, {
+        code: "(function () { return document && document.title ? document.title : ''; })();",
+      });
+      const pageTitle = Array.isArray(scriptResult)
+        ? scriptResult[0]
+        : scriptResult;
+      const normalizedPageTitle = normalizeExtractedTitle(pageTitle);
+      if (
+        normalizedPageTitle &&
+        !looksLikeUrlText(normalizedPageTitle, currentTabUrl)
+      ) {
+        currentTabTitle = normalizedPageTitle;
+      }
+    } catch (err) {
+      // ignore pages that block script execution
+    }
+  }
+  const matchedCurrentIndex = currentTabUrl
+    ? items.findIndex((item) =>
+      urlsMatchForSave(currentTabUrl, item && item.url ? item.url : ""),
+    )
+    : -1;
+  const matchedCurrentItem =
+    matchedCurrentIndex >= 0 ? items[matchedCurrentIndex] : null;
+  const matchedCurrentItemId =
+    matchedCurrentItem && matchedCurrentItem.id
+      ? String(matchedCurrentItem.id)
+      : "";
+  const matchedCurrentUrl =
+    matchedCurrentItem && matchedCurrentItem.url
+      ? String(matchedCurrentItem.url)
+      : "";
+  if (matchedCurrentUrl) {
+    currentTabUrl = matchedCurrentUrl;
+  }
+
+  const normalizedCurrentTabTitle = normalizeExtractedTitle(currentTabTitle);
+  const normalizedStoredCurrentTitle =
+    matchedCurrentItem && matchedCurrentItem.title
+      ? normalizeExtractedTitle(matchedCurrentItem.title)
+      : "";
+  const titleReferenceUrl = matchedCurrentUrl || currentTabUrl;
+  let resolvedCurrentTitle = "";
+  if (
+    normalizedCurrentTabTitle &&
+    !looksLikeUrlText(normalizedCurrentTabTitle, titleReferenceUrl) &&
+    !isGenericFallbackTitleText(normalizedCurrentTabTitle)
+  ) {
+    resolvedCurrentTitle = normalizedCurrentTabTitle;
+  } else if (
+    normalizedStoredCurrentTitle &&
+    !looksLikeUrlText(normalizedStoredCurrentTitle, titleReferenceUrl) &&
+    !isGenericFallbackTitleText(normalizedStoredCurrentTitle)
+  ) {
+    resolvedCurrentTitle = normalizedStoredCurrentTitle;
+  } else if (currentTabUrl) {
+    // Skip remote fetch to keep picker opening instant; rely on tab/stored titles
+    resolvedCurrentTitle = "";
+  }
+  if (resolvedCurrentTitle) {
+    currentTabTitle = resolvedCurrentTitle;
+  }
+  if (
+    matchedCurrentIndex >= 0 &&
+    currentTabTitle &&
+    !looksLikeUrlText(currentTabTitle, matchedCurrentUrl || currentTabUrl) &&
+    normalizeExtractedTitle(matchedCurrentItem.title) !== currentTabTitle
+  ) {
+    items = items.slice();
+    items[matchedCurrentIndex] = {
+      ...matchedCurrentItem,
+      title: currentTabTitle,
+    };
+    // Persist update lazily to avoid blocking picker open
+    updateStoredItemByIdentity(
+      matchedCurrentItemId,
+      matchedCurrentUrl || currentTabUrl,
+      (currentItem) => {
+        const liveTitle =
+          currentItem && currentItem.title
+            ? normalizeExtractedTitle(currentItem.title)
+            : "";
+        if (liveTitle === currentTabTitle) {
+          return currentItem;
+        }
+        return { ...currentItem, title: currentTabTitle };
+      },
+    ).catch(() => { });
+  }
+  const selectedCategoryId = data[SELECTED_CATEGORY_KEY]
+    ? data[SELECTED_CATEGORY_KEY]
+    : "none";
+  // Baca storedLastLocation tanpa mengira pickerStartMode â€” untuk highlight "last opened"
+  // yang perlu berfungsi walau apa mode pun (termasuk "home").
+  const storedLastLocation = data[CATEGORY_PICKER_LAST_LOCATION_KEY] &&
+    typeof data[CATEGORY_PICKER_LAST_LOCATION_KEY] === "object"
+      ? data[CATEGORY_PICKER_LAST_LOCATION_KEY]
+      : null;
+  const rawLastLocation = (settings.pickerStartMode === "last" || settings.pickerStartMode === "last-category" || settings.pickerStartMode === "last-page" || settings.pickerStartMode === "last-link") &&
+    storedLastLocation
+      ? storedLastLocation
+      : null;
+  // Jika kategori terpilih (dari mini picker atau luar) berbeza dari lokasi
+  // terakhir picker, override lokasi supaya picker buka dengan kategori yang betul.
+  // Jika kategori BERBEZA (ditukar), padam highlight "last opened".
+  const categoryChanged = !!(rawLastLocation && rawLastLocation.categoryId &&
+    String(rawLastLocation.categoryId) !== String(selectedCategoryId));
+  const resolvedLastLocation = rawLastLocation
+    ? { ...rawLastLocation, categoryId: selectedCategoryId, itemId: "", url: "" }
+    : null;
+  if (resolvedLastLocation && categoryChanged) {
+    resolvedLastLocation.lastOpenedItemId = "";
+    resolvedLastLocation.lastOpenedAt = 0;
+  }
+  const payload = {
+    selected: selectedCategoryId,
+    includeAll: settings.cycleIncludeAll !== false,
+    includeUncategorized: settings.cycleIncludeUncategorized !== false,
+    counts: serializeCategoryCountsForPicker(counts),
+    favoriteCountVisible: countVisibleFavoriteItemsForPicker(
+      items,
+      categories,
+      settings.showHiddenCategories,
+    ),
+    showHiddenCategories: settings.showHiddenCategories,
+    categoryPickerLastLocation: resolvedLastLocation || (storedLastLocation && storedLastLocation.lastOpenedItemId ? {
+      mode: "items",
+      categoryId: selectedCategoryId,
+      page: 1,
+      itemId: "",
+      url: "",
+      itemFilter: "all",
+      sortDir: "manual",
+      lastOpenedItemId: String(storedLastLocation.lastOpenedItemId),
+      lastOpenedAt: storedLastLocation.lastOpenedAt || 0,
+    } : null),
+    categories: categories.map((cat) => ({
+      id: cat.id,
+      name: cat.name,
+      count: typeof counts.byId[cat.id] === "number" ? counts.byId[cat.id] : 0,
+      hidden: !!cat.hidden,
+      icon: cat.icon ? String(cat.icon) : "",
+    })),
+    items: [],
+    currentItemSummary: mapItemToPickerPayload(matchedCurrentItem),
+    clearLoadedItems: true,
+    currentTabUrl,
+    currentTabTitle,
+    pageSize: settings.pageSize,
+    pickerAnimation: settings.pickerAnimation || "fade",
+    pickerAnimationDuration: settings.pickerAnimationDuration || 200,
+    pickerLayout: settings.pickerLayout || "cozy",
+    pickerYoutubeThumbnails: settings.pickerYoutubeThumbnails !== false,
+    favoritesSortMode: settings.favoritesSortMode || "manual",
+    hoverSoundEnabled: settings.pickerHoverSound === true,
+    hoverSoundUrl: (() => {
+      const sounds = Array.isArray(settings.pickerHoverSounds)
+        ? settings.pickerHoverSounds
+        : [];
+      const activeId = settings.activePickerHoverSoundId || "";
+      const match = sounds.find((s) => s && s.id === activeId);
+      if (match && match.dataUrl) return match.dataUrl;
+      // Legacy fallback
+      return settings.pickerHoverSoundUrl || "";
+    })(),
+    themePreset: settings.themePreset || "classic",
+    customThemeColors: settings.customThemeColors || null,
+    pickerHighlightColor: settings.pickerHighlightColor || "#48d597",
+    pickerStartMode: settings.pickerStartMode || "home",
+    navigationFavoritesOnly: settings.navigationFavoritesOnly === true,
+    youtubeAutoNext: settings.youtubeAutoNext === true,
+    youtubeAutoRandom: settings.youtubeAutoRandom === true,
+    deleteAfterOpen: settings.deleteAfterOpen === true,
+    randomAcrossAllCategories: settings.randomAcrossAllCategories === true,
+    enableDedupeButton: settings.enableDedupeButton !== false,
+    sidebarAiProvider: settings.sidebarAiProvider || "chatgpt",
+
+    categoryPaletteShortcut: settings.categoryPaletteShortcut || "M",
+    pickerNextPageShortcut: settings.pickerNextPageShortcut || "",
+    pickerToggleDeleteAfterOpenShortcut: settings.pickerToggleDeleteAfterOpenShortcut || "",
+    pickerToggleShowHiddenShortcut: settings.pickerToggleShowHiddenShortcut || "",
+    pickerImportShortcut: settings.pickerImportShortcut || "",
+    pickerExportShortcut: settings.pickerExportShortcut || "",
+    pickerClearFavShortcut: settings.pickerClearFavShortcut || "",
+    pickerRestoreFavShortcut: settings.pickerRestoreFavShortcut || "",
+    pickerAutoNextShortcut: settings.pickerAutoNextShortcut || "",
+    pickerAutoRandomShortcut: settings.pickerAutoRandomShortcut || "",
+    pickerSelectPageShortcut: settings.pickerSelectPageShortcut || "",
+    pickerClearSelectionShortcut: settings.pickerClearSelectionShortcut || "",
+    pickerBulkDeleteShortcut: settings.pickerBulkDeleteShortcut || "",
+    pickerBulkFavShortcut: settings.pickerBulkFavShortcut || "",
+    pickerRenameCategoryShortcut: settings.pickerRenameCategoryShortcut || "",
+    pickerScanDupShortcut: settings.pickerScanDupShortcut || "",
+    pickerFavShortcut: settings.pickerFavShortcut || "F",
+    pickerToggleFavShortcut: settings.pickerToggleFavShortcut || "",
+    pickerTrashShortcut: settings.pickerTrashShortcut || "",
+    pickerPinShortcut: settings.pickerPinShortcut || "",
+    pickerToggleSelfShortcut: pickerToggleShortcut || "",
+  };
+  if (options && options.forceCategories) {
+    payload.forceCategories = true;
+    payload.pickerStartMode = "home";
+  }
+  if (options && options.openTrash) {
+    payload.openTrash = true;
+  }
+  return { payload, tabId: currentTabId };
+}
+

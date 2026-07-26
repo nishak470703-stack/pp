@@ -1,0 +1,19732 @@
+const ITEM_KEY = "items";
+const TRASH_KEY = "trashItems";
+const SELECTED_CATEGORY_KEY = "selectedCategory";
+const CATEGORY_KEY = "categories";
+const CATEGORY_PICKER_LAST_LOCATION_KEY = "categoryPickerLastLocation";
+const SIDEBAR_NOTES_KEY = "sidebarNotes";
+
+// Global tracking for saveAllTabsInWindow
+// B5 NOTE: These variables are intentionally declared here in background.js
+// rather than delegated to tabManagerCore.js. tabManagerCore.js has its own
+// private copies which are only used if tabManagerCore functions are called
+// directly. background.js manages its own state directly for performance.
+// Do NOT use tabManagerCore's version here or a split-brain will occur.
+let saveAllTabsPending = 0;
+let saveAllTabsResolver = null;
+const saveAllTabsIds = new Set();
+const contentScriptInjectedTabs = new Set();
+const SIDEBAR_NOTE_FOLDERS_KEY = "sidebarNoteFolders";
+const SIDEBAR_NOTES_UI_KEY = "sidebarNotesUi";
+const SUMMARY_MODE_PREFERENCE_KEY = "summaryModePreference";
+const PROMPT_TEMPLATES_KEY = "summaryPromptTemplates";
+const ATTACHMENTS_KEY = "sidebarNoteAttachments";
+const CATEGORY_NOTIFICATION_ID = "local-pocket-category";
+const PAGE_ACTION_ICON_DEFAULT = {
+  16: "icons/icon-default-16.png",
+  32: "icons/icon-default-32.png",
+};
+const PAGE_ACTION_ICON_SAVED = {
+  16: "icons/icon-saved-16.png",
+  32: "icons/icon-saved-32.png",
+};
+const TRACKING_QUERY_PARAM_KEYS = new Set([
+  "fbclid",
+  "gclid",
+  "igshid",
+  "mc_cid",
+  "mc_eid",
+  "mkt_tok",
+  "msclkid",
+  "pp",
+  "ref",
+  "si",
+  "spm",
+  "vero_conv",
+  "vero_id",
+  "yclid",
+]);
+const DEFAULT_INDEX_FILENAMES = new Set([
+  "default.asp",
+  "default.aspx",
+  "default.htm",
+  "default.html",
+  "index.asp",
+  "index.aspx",
+  "index.htm",
+  "index.html",
+  "index.php",
+]);
+const LINK_TITLE_FETCH_TIMEOUT_MS = 4000;
+const YOUTUBE_TITLE_FETCH_TIMEOUT_MS = 3500;
+const ALLOWED_ITEM_URL_PROTOCOLS = new Set(["http:", "https:", "file:"]);
+
+// Ensure a single shared WebExtension lpApi handle across background scripts.
+const lpApi = typeof browser !== "undefined" ? browser : chrome;
+// Whether the current lpApi returns promises (Firefox) or uses callbacks (Chromium MV2).
+const USE_PROMISE_TABS = typeof browser !== "undefined" && lpApi === browser;
+
+// ── Core module integration (additive; safe fallback to console / direct storage) ──
+// These wrappers let background.js adopt the shared core modules incrementally.
+// They are no-ops with fallback behaviour if the core modules are unavailable.
+const LP_LOGGER = (typeof LocalPocketLoggerCore !== "undefined") ? LocalPocketLoggerCore : null;
+const LP_STORAGE = (typeof LocalPocketStorageManagerCore !== "undefined")
+  ? LocalPocketStorageManagerCore.getStorageManager({
+      cacheEnabled: true, cacheTTL: 60000, batchEnabled: true, batchDelay: 100
+    })
+  : null;
+
+// Centralized logging — routes through LocalPocketLoggerCore when available.
+// NOTE: the fallback branches below intentionally use console.* directly (not
+// lpErr/lpWarn/lpLog) to avoid infinite recursion when the logger is absent.
+function lpLog(level, ...args) {
+  if (LP_LOGGER && typeof LP_LOGGER[level] === "function") {
+    LP_LOGGER[level]("[Background]", ...args);
+  } else if (level === "error") {
+    console.error(...args);
+  } else if (level === "warn") {
+    console.warn(...args);
+  } else {
+    console.log(...args);
+  }
+}
+function lpErr(...args) { lpLog("error", ...args); }
+function lpWarn(...args) { lpLog("warn", ...args); }
+
+// Raw storage handle — used only by the lpStore* fallback path so that the
+// bulk rename of lpApi.storage.local.* -> lpStore* does NOT touch these internals.
+const _rawStore = (lpApi && lpApi.storage && lpApi.storage.local) ? lpApi.storage.local : null;
+
+function _rawGet(keys) {
+  return new Promise((resolve) => {
+    if (!_rawStore) return resolve({});
+    try { _rawStore.get(keys, (v) => resolve(v || {})); }
+    catch (e) { resolve({}); }
+  });
+}
+function _rawSet(data) {
+  return new Promise((resolve) => {
+    if (!_rawStore) return resolve();
+    try { _rawStore.set(data, () => resolve()); }
+    catch (e) { resolve(); }
+  });
+}
+function _rawRemove(keys) {
+  return new Promise((resolve) => {
+    if (!_rawStore) return resolve();
+    try { _rawStore.remove(keys, () => resolve()); }
+    catch (e) { resolve(); }
+  });
+}
+
+// Centralized storage — routes through StorageManagerCore (batching + cache) when
+// available. Each accepts an OPTIONAL callback as the last argument so that the
+// existing callback-style call sites can be migrated by a simple rename.
+async function lpStoreGet(keys, cb) {
+  let result;
+  try { result = LP_STORAGE ? await LP_STORAGE.get(keys) : await _rawGet(keys); }
+  catch (e) { result = {}; }
+  if (typeof cb === "function") { try { cb(result); } catch (e) { /* ignore */ } }
+  return result;
+}
+async function lpStoreSet(data, cb) {
+  try { LP_STORAGE ? await LP_STORAGE.set(data) : await _rawSet(data); }
+  catch (e) { /* swallow */ }
+  if (typeof cb === "function") { try { cb(); } catch (e) { /* ignore */ } }
+}
+async function lpStoreRemove(keys, cb) {
+  try { LP_STORAGE ? await LP_STORAGE.remove(keys) : await _rawRemove(keys); }
+  catch (e) { /* swallow */ }
+  if (typeof cb === "function") { try { cb(); } catch (e) { /* ignore */ } }
+}
+
+// Activate the configured log level (no-op if the logger is unavailable).
+if (LP_LOGGER && typeof LP_LOGGER.loadLogLevelFromStorage === "function") {
+  LP_LOGGER.loadLogLevelFromStorage().catch(() => {});
+}
+
+let currentSettings = DEFAULT_SETTINGS;
+let cachedItems = [];
+let hasCachedItems = false;
+let cachedItemsPromise = null;
+let cachedCategories = null;
+// Cache untuk selected category ID — elak storage.local.get berulang pada setiap save
+let cachedSelectedCategoryId = null;
+
+let urlIndexCache = new Map();
+let urlIndexCacheBuilt = false;
+
+function getUrlCompareCandidatesFn() {
+  return typeof buildUrlCompareCandidates === "function" ? buildUrlCompareCandidates : null;
+}
+
+function buildUrlIndexCache(items) {
+  const compareFn = getUrlCompareCandidatesFn();
+  if (!compareFn) {
+    // compareFn not ready yet — ensure flag remains false so
+    // caller knows cache is invalid and will retry later
+    urlIndexCacheBuilt = false;
+    return;
+  }
+  urlIndexCache = new Map();
+  if (!Array.isArray(items)) return;
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (!item || !item.url) continue;
+    const candidates = compareFn(item.url);
+    if (candidates && candidates.size > 0) {
+      for (const candidate of candidates) {
+        urlIndexCache.set(candidate, item.id);
+      }
+    }
+  }
+  urlIndexCacheBuilt = true;
+}
+
+function isUrlSavedWithIndex(url, items) {
+  if (!url) return false;
+  const compareFn = getUrlCompareCandidatesFn();
+  if (!compareFn) {
+    if (!Array.isArray(items)) return false;
+    return items.some((item) => urlsMatchForSave(url, item && item.url ? item.url : ""));
+  }
+  // Cuba bina cache kalau belum sah (sama ada belum dibina atau compareFn baru ready)
+  if (!urlIndexCacheBuilt && Array.isArray(items)) {
+    buildUrlIndexCache(items);
+  }
+  // Kalau cache masih tak berjaya (compareFn tiada masa buildUrlIndexCache dipanggil),
+  // fallback ke linear scan supaya hasil tetap betul
+  if (!urlIndexCacheBuilt) {
+    if (!Array.isArray(items)) return false;
+    return items.some((item) => urlsMatchForSave(url, item && item.url ? item.url : ""));
+  }
+  const candidates = compareFn(url);
+  if (candidates && candidates.size > 0) {
+    for (const candidate of candidates) {
+      if (urlIndexCache.has(candidate)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function getExistingIndexFromUrl(url, items) {
+  if (!url || !Array.isArray(items)) return -1;
+  const compareFn = getUrlCompareCandidatesFn();
+  if (!compareFn) {
+    return items.findIndex((item) => urlsMatchForSave(url, item && item.url ? item.url : ""));
+  }
+  if (!urlIndexCacheBuilt) {
+    buildUrlIndexCache(items);
+  }
+  // Kalau cache masih tak berjaya (compareFn tiada masa buildUrlIndexCache dipanggil),
+  // fallback ke linear scan supaya hasil tetap betul
+  if (!urlIndexCacheBuilt) {
+    return items.findIndex((item) => urlsMatchForSave(url, item && item.url ? item.url : ""));
+  }
+  const candidates = compareFn(url);
+  if (candidates && candidates.size > 0) {
+    for (const candidate of candidates) {
+      if (urlIndexCache.has(candidate)) {
+        const id = urlIndexCache.get(candidate);
+        return items.findIndex(item => item && item.id === id);
+      }
+    }
+  }
+  return -1;
+}
+
+function updateUrlIndexCacheIncremental(previousItems, nextItems) {
+  const compareFn = getUrlCompareCandidatesFn();
+  if (!compareFn || !urlIndexCacheBuilt) {
+    // Kalau compareFn ada tapi cache belum sah, cuba bina penuh
+    // Kalau compareFn tiada, biarkan — buildUrlIndexCache akan set urlIndexCacheBuilt = false
+    buildUrlIndexCache(nextItems);
+    return;
+  }
+  // Bina set ID baru untuk mengesan item yang ditambah/dibuang
+  const prevById = new Map();
+  for (const item of previousItems) {
+    if (item && item.id) prevById.set(item.id, item);
+  }
+  const nextById = new Map();
+  for (const item of nextItems) {
+    if (item && item.id) nextById.set(item.id, item);
+  }
+  // Buang entry cache bagi item yang telah dipadam
+  for (const [id, item] of prevById) {
+    if (!nextById.has(id) && item.url) {
+      const candidates = compareFn(item.url);
+      if (candidates) for (const c of candidates) urlIndexCache.delete(c);
+    }
+  }
+  // Tambah entry cache bagi item baru
+  for (const [id, item] of nextById) {
+    if (!prevById.has(id) && item.url) {
+      const candidates = compareFn(item.url);
+      if (candidates) for (const c of candidates) urlIndexCache.set(c, id);
+    }
+  }
+}
+
+async function getCachedCategories() {
+  if (cachedCategories !== null) return cachedCategories;
+  try {
+    const data = await lpStoreGet(CATEGORY_KEY);
+    cachedCategories = Array.isArray(data[CATEGORY_KEY]) ? data[CATEGORY_KEY] : [];
+    return cachedCategories;
+  } catch (err) {
+    return [];
+  }
+}
+
+let itemsMutationQueue = Promise.resolve();
+let itemsMutationQueueTimer = null;
+let categoryNotificationTimer = null;
+let categoryBadgeTimer = null;
+const nextSequenceCursorByCategory = new Map();
+const pendingNextLinkCursor = new Map();
+const pendingContextMenuCategoryByTabId = new Map();
+const pendingContextMenuCategoryCleanupTimers = new Map();
+const pageActionStateByTabId = new Map();
+// Debounce timer per-tab untuk updatePageActionForTab
+// Elak multiple calls untuk tab yang sama dalam masa singkat (contoh: redirect chain)
+const pageActionDebounceByTabId = new Map();
+const PAGE_ACTION_TAB_DEBOUNCE_MS = 150;
+const urlCompareCandidatesCache = new Map();
+const thumbnailCacheByDomain = new Map();
+const THUMBNAIL_CACHE_MAX_DOMAINS = 100;
+const DOMAIN_THUMBNAIL_PATTERNS_KEY = "domainThumbnailPatternsV1";
+const CONTEXT_MENU_CATEGORY_OVERRIDE_TTL_MS = 15000;
+const CONTEXT_MENU_ID_SAVE_TO_POCKET = "save-to-local-pocket";
+const CONTEXT_MENU_ID_FLOATING_ROOT = "floating-button-context";
+const CONTEXT_MENU_ID_FLOATING_ADD_DOMAIN = "floating-add-domain-exception";
+const CONTEXT_MENU_ID_FLOATING_REMOVE_DOMAIN =
+  "floating-remove-domain-exception";
+const CONTEXT_MENU_ID_SELECTION_ROOT = "selection-search-root";
+const CONTEXT_MENU_ID_SELECTION_PREFIX = "selection-search-engine-";
+const CONTEXT_MENU_ID_SET_THUMBNAIL = "set-thumbnail-from-image";
+const CONTEXT_MENU_ID_SET_CATEGORY_ICON = "set-category-icon-from-image";
+const CONTEXT_MENU_WEB_CONTEXTS = [
+  "page",
+  "frame",
+  "selection",
+  "link",
+  "image",
+  "video",
+  "audio",
+];
+const PAGE_ACTION_REFRESH_DEBOUNCE_MS = 120;
+const PAGE_ACTION_REFRESH_MAX_PARALLEL = 6;
+const FLOATING_BUTTON_AUTO_SUSPEND_REFRESH_DEBOUNCE_MS = 2000; // Increased from 250ms to reduce tabs.query spam
+let pageActionRefreshTimer = null;
+let pageActionRefreshInFlight = false;
+let pageActionRefreshQueued = false;
+let floatingButtonAutoSuspendRefreshTimer = null;
+let currentEligibleTabCount = 0; // Track tab count in memory to avoid repeated full tabs.query({})
+let floatingButtonAutoSuspendRefreshInFlight = false;
+let floatingButtonAutoSuspendRefreshQueued = false;
+let saveAllTabsInProgress = false;
+const IS_FIREFOX = (() => {
+  try {
+    return typeof browser !== "undefined" && !!browser.sidebarAction;
+  } catch (_) {
+    return typeof browser !== "undefined";
+  }
+})();
+const inFlightTitleRefreshByUrl = new Map();
+const inFlightThumbnailFetchByUrl = new Map();
+const thumbnailFetchQueue = [];
+const THUMBNAIL_FETCH_DELAY_MS = 50;
+const THUMBNAIL_FETCH_BATCH_DELAY_MS = 20;
+const THUMBNAIL_FETCH_CONCURRENT_LIMIT = 2;
+const faviconCache = new Map(); // Cache for favicon URLs by domain
+const FAVICON_CACHE_MAX = 100;
+let chatGptPopupWindowId = null;
+let chatGptPopupTabId = null;
+
+// Stores prompt data for the sidebar content script to pull
+let pendingSidebarPromptData = null;
+let pendingSidebarProviderOverride = "";
+let pendingSidebarProviderOverrideSetAt = 0;
+const PENDING_SIDEBAR_PROMPT_STORAGE_KEY = "__lpPendingSidebarPromptV1";
+let summarySidebarTabId = null;
+let lastOverlayTabId = null;
+let sidebarPanelOpen = false;
+let skipF6FocusForNextOpen = false;
+let sidebarCurrentMode = "ai";
+// Penjejak panel sidebar SEBENAR yang dimuat (setiap kali kita setPanel):
+// "jarvis" = jarvisSidebar.html, "ai" = sidebar.html (AI/Gemini). Berbeza dari
+// sidebarCurrentMode kerana openLocalPocketSidebar() sentiasa paksa mode "ai"/"notes"
+// walaupun panel sebenar ialah JARVIS — jadi toggel tak boleh bergantung padanya saja.
+let currentSidebarPanel = "ai";
+// Debounce toggel supaya auto-repeat kekunci/gesture berkembar tak buka semula
+// panel sejurus selepas ditutup.
+let lastToggleJarvisAt = 0;
+// Tanda masa bila JARVIS sedang dibuka/dibuka semula. Dipakai untuk ELak
+// reset-sidebar-panel (yang di-fir oleh pagehide semasa close+reopen) menukar
+// semula panel ke sidebar.html (Gemini) dan membatalkan penjejak "jarvis".
+let jarvisReopening = 0;
+// Penanda: toggleJarvisByMode set ini = true SEBELUM menekan shortcut
+// open-jarvis-sidebar via native helper, supaya command tersebut tahu ia
+// perlu TUTUP (bukan buka). Elak kekeliruan dengan currentSidebarPanel yang
+// openJarvisByMode tetapkan "jarvis" sebelum shortcut ditekan.
+let jarvisCloseViaToggle = false;
+let sidebarCurrentProvider = "";
+let hiddenChatGptTabId = null;
+let tempChatGptTabId = null;
+let tempChatGptWindowId = null;
+let sidebarReminderShown = false;
+const SUMMARY_AUTO_TOGGLE_TIMEOUT_MS = 15 * 60 * 1000;
+const pendingSummaryAutoToggleTimersBySessionId = new Map();
+const SUMMARY_TEMP_WINDOW_FALLBACK_CLOSE_MS = 3 * 60 * 1000;
+const pendingSummaryTempWindowBySessionId = new Map();
+const OVERLAY_RESPONSE_TAB_STORAGE_KEY = "__lpOverlayResponseTabMapV1";
+const OVERLAY_HIDDEN_TAB_STORAGE_KEY = "__lpOverlayHiddenTabMapV1";
+
+// Helper to persist overlay mapping
+async function saveOverlayResponseTabMap(token, data) {
+  try {
+    const res = await lpStoreGet(OVERLAY_RESPONSE_TAB_STORAGE_KEY);
+    const map = res[OVERLAY_RESPONSE_TAB_STORAGE_KEY] || {};
+    if (data) {
+      map[token] = data;
+    } else {
+      delete map[token];
+    }
+    await lpStoreSet({ [OVERLAY_RESPONSE_TAB_STORAGE_KEY]: map });
+  } catch (err) {}
+}
+
+async function getOverlayResponseTabMap(token) {
+  try {
+    const res = await lpStoreGet(OVERLAY_RESPONSE_TAB_STORAGE_KEY);
+    const map = res[OVERLAY_RESPONSE_TAB_STORAGE_KEY] || {};
+    return token ? map[token] : map;
+  } catch (err) {
+    return token ? null : {};
+  }
+}
+
+async function saveOverlayHiddenTabMap(token, tabId) {
+  try {
+    const res = await lpStoreGet(OVERLAY_HIDDEN_TAB_STORAGE_KEY);
+    const map = res[OVERLAY_HIDDEN_TAB_STORAGE_KEY] || {};
+    if (tabId) {
+      map[token] = tabId;
+    } else {
+      delete map[token];
+    }
+    await lpStoreSet({ [OVERLAY_HIDDEN_TAB_STORAGE_KEY]: map });
+  } catch (err) {}
+}
+
+async function getOverlayHiddenTabMap(token) {
+  try {
+    const res = await lpStoreGet(OVERLAY_HIDDEN_TAB_STORAGE_KEY);
+    const map = res[OVERLAY_HIDDEN_TAB_STORAGE_KEY] || {};
+    return token ? map[token] : map;
+  } catch (err) {
+    return token ? null : {};
+  }
+}
+
+const overlayResponseTabMap = new Map();
+const overlayHiddenTabMap = new Map();
+
+// Map untuk simpan metadata sumber summary (sessionId → { sourceUrl, title, provider })
+// Digunakan oleh getSummarySessionSourceMeta() untuk log history
+const summarySessionSourceMetaMap = new Map();
+const SUMMARY_SESSION_META_MAX_AGE_MS = 30 * 60 * 1000; // 30 minit
+
+function storeSummarySessionSourceMeta(sessionId, meta) {
+  if (!sessionId || !meta) return;
+  summarySessionSourceMetaMap.set(String(sessionId), {
+    sourceUrl: meta.sourceUrl || "",
+    title: meta.title || "",
+    provider: meta.provider || "",
+    storedAt: Date.now()
+  });
+  // Bersihkan entries lama
+  for (const [key, val] of summarySessionSourceMetaMap.entries()) {
+    if (Date.now() - (val.storedAt || 0) > SUMMARY_SESSION_META_MAX_AGE_MS) {
+      summarySessionSourceMetaMap.delete(key);
+    }
+  }
+}
+
+function getSummarySessionSourceMeta(sessionId) {
+  if (!sessionId) return null;
+  const meta = summarySessionSourceMetaMap.get(String(sessionId));
+  if (!meta) return null;
+  // Return null jika dah expired
+  if (Date.now() - (meta.storedAt || 0) > SUMMARY_SESSION_META_MAX_AGE_MS) {
+    summarySessionSourceMetaMap.delete(String(sessionId));
+    return null;
+  }
+  return meta;
+}
+
+async function saveSummaryHistoryEntry(sourceUrl, chatUrl, meta) {
+  if (!sourceUrl || !chatUrl) return;
+  try {
+    const key = "summaryHistory";
+    const res = await lpStoreGet(key);
+    const history = (res && Array.isArray(res[key])) ? res[key] : [];
+    history.unshift({
+      sourceUrl: String(sourceUrl),
+      chatUrl: String(chatUrl),
+      title: meta && meta.title ? String(meta.title) : "",
+      provider: meta && meta.provider ? String(meta.provider) : "",
+      savedAt: Date.now()
+    });
+    // Simpan max 200 entries
+    const trimmed = history.slice(0, 200);
+    await lpStoreSet({ [key]: trimmed });
+  } catch (err) {}
+}
+
+// Initialize maps from storage
+(async function initOverlayMaps() {
+  try {
+    const res = await lpStoreGet([OVERLAY_RESPONSE_TAB_STORAGE_KEY, OVERLAY_HIDDEN_TAB_STORAGE_KEY]);
+    const respMap = res[OVERLAY_RESPONSE_TAB_STORAGE_KEY] || {};
+    const hiddenMap = res[OVERLAY_HIDDEN_TAB_STORAGE_KEY] || {};
+    for (const [k, v] of Object.entries(respMap)) overlayResponseTabMap.set(k, v);
+    for (const [k, v] of Object.entries(hiddenMap)) overlayHiddenTabMap.set(k, v);
+  } catch (err) {}
+})();
+
+// Buka sekatan iframe untuk AI providers
+let _webRequestAvailable = false;
+try { _webRequestAvailable = !!(lpApi.webRequest && lpApi.webRequest.onHeadersReceived); } catch (_) {}
+if (_webRequestAvailable) {
+  const aiDomains = [
+    "*://chatgpt.com/*",
+    "*://*.chatgpt.com/*",
+    "*://chat.openai.com/*",
+    "*://claude.ai/*",
+    "*://*.claude.ai/*",
+    "*://gemini.google.com/*",
+    "*://notebooklm.google.com/*",
+    "*://*.notebooklm.google.com/*",
+    // Google auth domains — diperlukan untuk Gemini sign-in dalam iframe
+    "*://accounts.google.com/*",
+    "*://*.accounts.google.com/*",
+    "*://www.google.com/*",
+    "*://www.perplexity.ai/*",
+    "*://*.perplexity.ai/*",
+    "*://copilot.microsoft.com/*",
+    "*://grok.com/*",
+    "*://*.grok.com/*",
+    "*://chat.deepseek.com/*",
+    "*://*.deepseek.com/*",
+    "*://poe.com/*",
+    "*://*.poe.com/*",
+    "*://chat.mistral.ai/*",
+  ];
+
+  lpApi.webRequest.onHeadersReceived.addListener(
+    (details) => {
+      const headers = details.responseHeaders;
+      for (let i = 0; i < headers.length; i++) {
+        const name = headers[i].name.toLowerCase();
+        if (name === "x-frame-options" || name === "frame-options") {
+          headers.splice(i, 1);
+          i--;
+        } else if (name === "content-security-policy") {
+          headers[i].value = headers[i].value
+            .replace(/frame-ancestors\s+[^;]+(;|$)/gi, "")
+            .replace(/frame-src\s+[^;]+(;|$)/gi, "")
+            .replace(/;\s*;/g, ";")
+            .replace(/^;+\s*/, "")
+            .replace(/;\s*$/, "")
+            .trim();
+        } else if (name === "set-cookie") {
+          let val = headers[i].value;
+          if (!val.toLowerCase().includes("samesite=none")) {
+            val = val.replace(/samesite=(lax|strict)/gi, "SameSite=None");
+            if (!val.toLowerCase().includes("samesite=")) {
+              val += "; SameSite=None";
+            }
+          }
+          if (!val.toLowerCase().includes("secure")) {
+            val += "; Secure";
+          }
+          headers[i].value = val;
+        }
+      }
+      return { responseHeaders: headers };
+    },
+    {
+      urls: aiDomains,
+      types: ["sub_frame", "main_frame", "xmlhttprequest"],
+    },
+    ["blocking", "responseHeaders"]
+  );
+
+  // Manipulasi request headers untuk sorok status iframe
+  // Jangan apply ke Google auth domains — akan rosak OAuth flow
+  const aiDomainsNoGoogle = aiDomains.filter(d =>
+    !d.includes("accounts.google.com") && !d.includes("www.google.com")
+  );
+  lpApi.webRequest.onBeforeSendHeaders.addListener(
+    (details) => {
+      const headers = details.requestHeaders;
+      for (let i = 0; i < headers.length; i++) {
+        const name = headers[i].name.toLowerCase();
+        if (name === "sec-fetch-dest") {
+          headers[i].value = "document"; // Menyamar sebagai navigasi dokumen biasa
+        } else if (name === "sec-fetch-mode") {
+          headers[i].value = "navigate";
+        } else if (name === "referer" || name === "origin") {
+          // Sesetengah provider perlukan referer yang sepadan dengan domain mereka
+          try {
+            const url = new URL(details.url);
+            headers[i].value = url.origin + "/";
+          } catch (_) {}
+        }
+      }
+      return { requestHeaders: headers };
+    },
+    {
+      urls: aiDomainsNoGoogle,
+      types: ["sub_frame"],
+    },
+    ["blocking", "requestHeaders"]
+  );
+}
+const SIDEBAR_CHAT_FOCUS_SIGNAL_KEY = "__lpSidebarChatFocusSignal";
+const SIDEBAR_AI_FOCUS_PORT_NAMES = new Set([
+  "lp-sidebar-chatgpt-focus",
+  "lp-sidebar-ai-focus",
+]);
+const SIDEBAR_AI_TAB_URL_PATTERNS = [
+  "*://chatgpt.com/*",
+  "*://*.chatgpt.com/*",
+  "*://chat.openai.com/*",
+  "*://claude.ai/*",
+  "*://*.claude.ai/*",
+  "*://gemini.google.com/*",
+  "*://notebooklm.google.com/*",
+  "*://*.notebooklm.google.com/*",
+  "*://www.perplexity.ai/*",
+  "*://*.perplexity.ai/*",
+  "*://copilot.microsoft.com/*",
+  "*://grok.com/*",
+  "*://*.grok.com/*",
+  "*://chat.deepseek.com/*",
+  "*://*.deepseek.com/*",
+  "*://poe.com/*",
+  "*://*.poe.com/*",
+  "*://chat.mistral.ai/*",
+];
+const NATIVE_FOCUS_HELPER_HOST = "localpocket_focus_helper";
+const DEBUG_LOG_PREFIX = "[LocalPocket]";
+const DEBUG_LOGS_ENABLED = false;
+const SIDEBAR_PORT_CONNECT_FOCUS_PULSE_DELAYS_MS = [120, 360, 820];
+const SIDEBAR_OPEN_FALSE_POLLS_REQUIRED = 2;
+const SIDEBAR_OPEN_TRUE_POLLS_REQUIRED = 1;
+const SIDEBAR_OPEN_DETECTED_COOLDOWN_MS = 0;
+const SIDEBAR_NATIVE_F6_RETRY_COOLDOWN_MS = 1500;
+const SIDEBAR_PORT_RECONNECT_F6_COOLDOWN_MS = 2500;
+const SIDEBAR_PORT_RECONNECT_F6_WINDOW_MS = 15000;
+const AI_CATEGORY_TAB_TIMEOUT_MS = 90 * 1000;
+const categoryAutoRuleCore =
+  typeof LocalPocketCategoryAutoRuleCore !== "undefined"
+    ? LocalPocketCategoryAutoRuleCore
+    : null;
+const dedupeCore =
+  typeof LocalPocketDedupeCore !== "undefined" ? LocalPocketDedupeCore : null;
+const summaryPromptCore =
+  typeof LocalPocketSummaryPromptCore !== "undefined"
+    ? LocalPocketSummaryPromptCore
+    : null;
+const itemsMutationCore =
+  typeof LocalPocketItemsMutationCore !== "undefined"
+    ? LocalPocketItemsMutationCore
+    : null;
+const itemsIndexedDbCore =
+  typeof LocalPocketItemsIndexedDbCore !== "undefined"
+    ? LocalPocketItemsIndexedDbCore
+    : null;
+const itemsIndexedDbStore =
+  itemsIndexedDbCore && typeof itemsIndexedDbCore.createStore === "function"
+    ? itemsIndexedDbCore.createStore({
+      dbName: "local-pocket-items-db",
+      storeName: "items",
+    })
+    : null;
+let itemsIndexedDbAvailability = null;
+const sidebarChatFocusPorts = new Set();
+let nativeFocusHelperPort = null;
+let nativeFocusHelperLastErrorAt = 0;
+const IS_WINDOWS_PLATFORM =
+  typeof navigator !== "undefined"
+  && navigator.platform
+  && String(navigator.platform).toLowerCase().includes("win");
+let sidebarOpenWatcherTimer = null;
+let lastObservedSidebarOpenState = null;
+let consecutiveSidebarClosedPolls = 0;
+let consecutiveSidebarOpenPolls = 0;
+let lastSidebarOpenDetectedAt = 0;
+let pendingNativeF6SidebarFocusOnPortConnect = null;
+let lastNativeF6RetryAt = 0;
+let lastSidebarPortDisconnectAt = 0;
+let lastSidebarPortReconnectF6At = 0;
+const SIDEBAR_FOCUS_DEBUG_LOG_LIMIT = 240;
+const sidebarFocusDebugLog = [];
+let sidebarProviderLoaded = false;
+const SIDEBAR_PROVIDER_LOADED_TIMEOUT_MS = 10000;
+let sidebarFocusReportedAt = 0;
+let sidebarOsFocusReportedAt = 0;
+const FAVORITES_DEBUG_LOG_LIMIT = 320;
+const favoritesDebugLog = [];
+let cachedPickerBaseScript = null;
+const pendingPickerPayloads = new Map();
+const PICKER_BLOCK_NOTICE_COOLDOWN_MS = 20000;
+let lastPickerBlockedNoticeAt = 0;
+const FILE_PERMISSION_ORIGIN = "file:///*";
+const FILE_PERMISSION_NOTICE_COOLDOWN_MS = 20000;
+let lastFilePermissionNoticeAt = 0;
+const SUMMARY_AUTOFILL_FALLBACK_NOTICE_COOLDOWN_MS = 12000;
+let lastSummaryAutofillFallbackNoticeAt = 0;
+const SUMMARY_WEB_CONTENT_TIME_BUDGET_MS = 4000;
+const SUMMARY_WEB_FETCH_TIMEOUT_MS = 4500;
+const SUMMARY_YOUTUBE_TRANSCRIPT_PRIMARY_BUDGET_MS = 2800;
+const SUMMARY_YOUTUBE_TRANSCRIPT_TOTAL_BUDGET_MS = 3800;
+const SUMMARY_YOUTUBE_WATCH_FETCH_TIMEOUT_MS = 2200;
+const SUMMARY_YOUTUBE_CAPTION_FETCH_TIMEOUT_MS = 2200;
+const SUMMARY_YOUTUBE_TRANSCRIPT_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const SUMMARY_YOUTUBE_ENABLE_TEMP_TAB_TRANSCRIPT_FALLBACK = false;
+const SUMMARY_TAB_SCRIPT_RETRY_TIMEOUT_MS = 5000;
+const SUMMARY_TAB_SCRIPT_RETRY_INTERVAL_MS = 180;
+const SUMMARY_BACKGROUND_SUBMIT_MAX_ATTEMPTS = 26;
+const SUMMARY_BACKGROUND_SUBMIT_INTERVAL_MS = 180;
+const PENDING_SIDEBAR_PROVIDER_OVERRIDE_TTL_MS = 2 * 60 * 1000;
+const pendingAiCategoryQueue = [];
+const pendingAiCategorySessionsById = new Map();
+const cachedYouTubeTranscriptByVideoId = new Map();
+const inFlightYouTubeTranscriptByVideoId = new Map();
+let activeAiCategorySessionId = "";
+let aiCategoryQueueTimer = null;
+const volatileManualOrderOffsetByCategoryId = new Map();
+
+function clonePendingSidebarPromptData(value) {
+  if (!value || typeof value !== "object") return null;
+  const text = value.text ? String(value.text) : "";
+  const sessionId = value.sessionId ? String(value.sessionId) : "";
+  const provider = normalizeSummaryAiProvider(value.provider || "chatgpt");
+  if (!text.trim()) return null;
+  const result = { text, sessionId, provider };
+  if (value.overlayToken) result.overlayToken = String(value.overlayToken);
+  if (value.image) result.image = value.image;
+  if (value.suppressPageContext) result.suppressPageContext = true;
+  return result;
+}
+
+function persistPendingSidebarPromptDataToStorage() {
+  if (!lpApi.storage || !lpApi.storage.local || !lpApi.storage.local.set) {
+    return Promise.resolve(false);
+  }
+  try {
+    const payload = {
+      [PENDING_SIDEBAR_PROMPT_STORAGE_KEY]: pendingSidebarPromptData
+        ? clonePendingSidebarPromptData(pendingSidebarPromptData)
+        : null,
+    };
+    const maybePromise = lpStoreSet(payload);
+    if (maybePromise && typeof maybePromise.then === "function") {
+      return maybePromise.then(() => true).catch(() => false);
+    }
+    return Promise.resolve(true);
+  } catch (err) {
+    // ignore persistence errors
+    return Promise.resolve(false);
+  }
+}
+
+function setPendingSidebarPromptData(value) {
+  pendingSidebarPromptData = clonePendingSidebarPromptData(value);
+  return persistPendingSidebarPromptDataToStorage();
+}
+
+function clearPendingSidebarPromptData() {
+  pendingSidebarPromptData = null;
+  return persistPendingSidebarPromptDataToStorage();
+}
+
+async function loadPendingSidebarPromptDataFromStorage() {
+  if (!lpApi.storage || !lpApi.storage.local || !lpApi.storage.local.get) {
+    return null;
+  }
+  try {
+    const result = await lpStoreGet(
+      PENDING_SIDEBAR_PROMPT_STORAGE_KEY,
+    );
+    if (!result || typeof result !== "object") {
+      return null;
+    }
+    if (
+      !Object.prototype.hasOwnProperty.call(
+        result,
+        PENDING_SIDEBAR_PROMPT_STORAGE_KEY,
+      )
+    ) {
+      return null;
+    }
+    const restored = clonePendingSidebarPromptData(
+      result[PENDING_SIDEBAR_PROMPT_STORAGE_KEY],
+    );
+    if (!restored) {
+      return null;
+    }
+    pendingSidebarPromptData = restored;
+    return clonePendingSidebarPromptData(restored);
+  } catch (err) {
+    return null;
+  }
+}
+
+async function ensurePendingSidebarPromptDataLoaded() {
+  if (pendingSidebarPromptData) {
+    return clonePendingSidebarPromptData(pendingSidebarPromptData);
+  }
+  return loadPendingSidebarPromptDataFromStorage();
+}
+
+function buildNoPendingSidebarPromptResponse(
+  provider = "chatgpt",
+  sessionId = "",
+) {
+  return {
+    hasPendingPrompt: false,
+    provider: normalizeSummaryAiProvider(provider),
+    prompt: "",
+    sessionId: sessionId ? String(sessionId) : "",
+  };
+}
+
+function buildPendingSidebarPromptResponse(value) {
+  const data = clonePendingSidebarPromptData(value);
+  if (!data) return buildNoPendingSidebarPromptResponse("chatgpt", "");
+  return {
+    hasPendingPrompt: true,
+    provider: normalizeSummaryAiProvider(data.provider || "chatgpt"),
+    prompt: data.text ? String(data.text) : "",
+    sessionId: data.sessionId ? String(data.sessionId) : "",
+    overlayToken: data.overlayToken ? String(data.overlayToken) : "",
+    image: data.image || null,
+    suppressPageContext: data.suppressPageContext === true,
+  };
+}
+
+function restorePendingSidebarPromptDataFromStorage() {
+  ensurePendingSidebarPromptDataLoaded().catch(() => { });
+}
+
+restorePendingSidebarPromptDataFromStorage();
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function debugLog(...args) {
+  if (!DEBUG_LOGS_ENABLED) return;
+  lpLog("info", DEBUG_LOG_PREFIX, ...args);
+}
+
+function debugWarn(...args) {
+  if (!DEBUG_LOGS_ENABLED) return;
+  lpWarn(DEBUG_LOG_PREFIX, ...args);
+}
+
+function keyDescriptorFromShortcutToken(token) {
+  const raw = String(token || "").trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  if (lower === "space" || lower === "spacebar")
+    return { key: " ", code: "Space", keyCode: 32 };
+  if (lower === "enter" || lower === "return")
+    return { key: "Enter", code: "Enter", keyCode: 13 };
+  if (lower === "tab") return { key: "Tab", code: "Tab", keyCode: 9 };
+  if (lower === "escape" || lower === "esc")
+    return { key: "Escape", code: "Escape", keyCode: 27 };
+  if (lower === "backspace")
+    return { key: "Backspace", code: "Backspace", keyCode: 8 };
+  if (lower === "delete" || lower === "del")
+    return { key: "Delete", code: "Delete", keyCode: 46 };
+  if (lower === "home") return { key: "Home", code: "Home", keyCode: 36 };
+  if (lower === "end") return { key: "End", code: "End", keyCode: 35 };
+  if (lower === "pageup" || lower === "page-up" || lower === "pgup")
+    return { key: "PageUp", code: "PageUp", keyCode: 33 };
+  if (lower === "pagedown" || lower === "page-down" || lower === "pgdn")
+    return { key: "PageDown", code: "PageDown", keyCode: 34 };
+  if (lower === "up" || lower === "arrowup")
+    return { key: "ArrowUp", code: "ArrowUp", keyCode: 38 };
+  if (lower === "down" || lower === "arrowdown")
+    return { key: "ArrowDown", code: "ArrowDown", keyCode: 40 };
+  if (lower === "left" || lower === "arrowleft")
+    return { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 };
+  if (lower === "right" || lower === "arrowright")
+    return { key: "ArrowRight", code: "ArrowRight", keyCode: 39 };
+  if (/^f([1-9]|1[0-2])$/.test(lower)) {
+    const num = Number.parseInt(lower.slice(1), 10);
+    return { key: "F" + num, code: "F" + num, keyCode: 111 + num };
+  }
+  if (/^[a-z]$/.test(lower)) {
+    return {
+      key: lower,
+      code: "Key" + lower.toUpperCase(),
+      keyCode: lower.toUpperCase().charCodeAt(0),
+    };
+  }
+  if (/^[0-9]$/.test(lower)) {
+    return {
+      key: lower,
+      code: "Digit" + lower,
+      keyCode: 48 + Number.parseInt(lower, 10),
+    };
+  }
+  return { key: raw, code: raw, keyCode: 0 };
+}
+
+function parseShortcutToKeyboardPayload(shortcut) {
+  const raw = String(shortcut || "").trim();
+  if (!raw) return null;
+  const parts = raw
+    .split("+")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (!parts.length) return null;
+  const payload = {
+    altKey: false,
+    ctrlKey: false,
+    shiftKey: false,
+    metaKey: false,
+    key: "",
+    code: "",
+    keyCode: 0,
+  };
+  let keyPart = "";
+  parts.forEach((part) => {
+    const lower = part.toLowerCase();
+    if (lower === "alt" || lower === "option") {
+      payload.altKey = true;
+      return;
+    }
+    if (lower === "ctrl" || lower === "control") {
+      payload.ctrlKey = true;
+      return;
+    }
+    if (lower === "shift") {
+      payload.shiftKey = true;
+      return;
+    }
+    if (
+      lower === "cmd" ||
+      lower === "command" ||
+      lower === "meta" ||
+      lower === "super"
+    ) {
+      payload.metaKey = true;
+      return;
+    }
+    keyPart = part;
+  });
+  if (!keyPart) {
+    return null;
+  }
+  const desc = keyDescriptorFromShortcutToken(keyPart);
+  if (!desc) return null;
+  payload.key = desc.key;
+  payload.code = desc.code;
+  payload.keyCode = desc.keyCode;
+  return payload;
+}
+
+async function getCommandShortcut(commandName) {
+  const name = commandName ? String(commandName) : "";
+  if (!name || !lpApi.commands || !lpApi.commands.getAll) return "";
+  try {
+    const commands = await lpApi.commands.getAll();
+    if (!Array.isArray(commands)) return "";
+    const match = commands.find((entry) => entry && entry.name === name);
+    return match && match.shortcut ? String(match.shortcut) : "";
+  } catch (err) {
+    return "";
+  }
+}
+
+function buildSyntheticShortcutScript(payload) {
+  const safePayload = JSON.stringify(payload || {});
+  return `(function () {
+    const cfg = ${safePayload};
+    const baseTarget = document.activeElement || document.body || document.documentElement || document;
+    function fire(type, data) {
+      const init = {
+        key: data.key || "",
+        code: data.code || "",
+        keyCode: Number.isFinite(data.keyCode) ? data.keyCode : 0,
+        which: Number.isFinite(data.keyCode) ? data.keyCode : 0,
+        altKey: !!data.altKey,
+        ctrlKey: !!data.ctrlKey,
+        shiftKey: !!data.shiftKey,
+        metaKey: !!data.metaKey,
+        bubbles: true,
+        cancelable: true
+      };
+      let ev = null;
+      try {
+        ev = new KeyboardEvent(type, init);
+      } catch (err) {
+        return;
+      }
+      try { Object.defineProperty(ev, "keyCode", { get: () => init.keyCode }); } catch (err) {}
+      try { Object.defineProperty(ev, "which", { get: () => init.which }); } catch (err) {}
+      try { baseTarget.dispatchEvent(ev); } catch (err) {}
+      try { document.dispatchEvent(ev); } catch (err) {}
+      try { window.dispatchEvent(ev); } catch (err) {}
+    }
+    if (cfg.ctrlKey) fire("keydown", { key: "Control", code: "ControlLeft", keyCode: 17, ctrlKey: true });
+    if (cfg.altKey) fire("keydown", { key: "Alt", code: "AltLeft", keyCode: 18, altKey: true, ctrlKey: !!cfg.ctrlKey });
+    if (cfg.shiftKey) fire("keydown", { key: "Shift", code: "ShiftLeft", keyCode: 16, shiftKey: true, altKey: !!cfg.altKey, ctrlKey: !!cfg.ctrlKey });
+    if (cfg.metaKey) fire("keydown", { key: "Meta", code: "MetaLeft", keyCode: 91, metaKey: true, altKey: !!cfg.altKey, ctrlKey: !!cfg.ctrlKey, shiftKey: !!cfg.shiftKey });
+
+    fire("keydown", cfg);
+    fire("keyup", cfg);
+
+    if (cfg.metaKey) fire("keyup", { key: "Meta", code: "MetaLeft", keyCode: 91 });
+    if (cfg.shiftKey) fire("keyup", { key: "Shift", code: "ShiftLeft", keyCode: 16 });
+    if (cfg.altKey) fire("keyup", { key: "Alt", code: "AltLeft", keyCode: 18 });
+    if (cfg.ctrlKey) fire("keyup", { key: "Control", code: "ControlLeft", keyCode: 17 });
+  })();`;
+}
+
+async function triggerSyntheticOpenSidebarShortcut() {
+  const shortcut = await getCommandShortcut("_execute_sidebar_action");
+  const payload = parseShortcutToKeyboardPayload(shortcut);
+  if (!payload) return false;
+  const activeTab = await getActiveTabForCommands();
+  if (!activeTab || !activeTab.id) return false;
+  try {
+    await executeScriptSafe(activeTab.id, {
+      code: buildSyntheticShortcutScript(payload),
+    });
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+async function dispatchSyntheticF6Twice(targetWindowId = null, delayMs = null) {
+  // AUTO F6 DISABLED: this injected synthetic F6 into the active webpage and
+  // could yank focus back to the sidebar header / topbar. Focus is now handled
+  // directly via the sidebar relay (focus-sidebar-iframe) + content script
+  // focusPromptInput(), so no synthetic F6 is dispatched.
+  return false;
+}
+
+function normalizeSidebarFocusDelayMs(value) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.min(Math.max(parsed, 0), 5000);
+}
+
+function getSidebarFocusDelayMs() {
+  return normalizeSidebarFocusDelayMs(
+    currentSettings && currentSettings.sidebarFocusF6DelayMs,
+  );
+}
+
+function sanitizeSidebarFocusDebugValue(value, depth = 0) {
+  if (value == null) return value;
+  if (typeof value === "string") {
+    return value.length > 220 ? `${value.slice(0, 217)}...` : value;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (value instanceof Error) {
+    return {
+      name: value.name || "Error",
+      message: value.message || String(value),
+    };
+  }
+  if (Array.isArray(value)) {
+    if (depth >= 2) return `[array:${value.length}]`;
+    return value
+      .slice(0, 8)
+      .map((entry) => sanitizeSidebarFocusDebugValue(entry, depth + 1));
+  }
+  if (typeof value === "object") {
+    if (depth >= 2) return "[object]";
+    const out = {};
+    Object.keys(value)
+      .slice(0, 12)
+      .forEach((key) => {
+        out[key] = sanitizeSidebarFocusDebugValue(value[key], depth + 1);
+      });
+    return out;
+  }
+  return String(value);
+}
+
+function addSidebarFocusDebugLog(event, detail = null) {
+  const entry = {
+    at: Date.now(),
+    event: event ? String(event) : "unknown",
+  };
+  if (typeof detail !== "undefined" && detail !== null) {
+    entry.detail = sanitizeSidebarFocusDebugValue(detail);
+  }
+  sidebarFocusDebugLog.push(entry);
+  if (sidebarFocusDebugLog.length > SIDEBAR_FOCUS_DEBUG_LOG_LIMIT) {
+    sidebarFocusDebugLog.splice(
+      0,
+      sidebarFocusDebugLog.length - SIDEBAR_FOCUS_DEBUG_LOG_LIMIT,
+    );
+  }
+  if (DEBUG_LOGS_ENABLED) {
+    try {
+      lpLog("info", "[LocalPocket sidebar focus]", entry.event, entry.detail || "");
+    } catch (err) {
+      // ignore console issues
+    }
+  }
+  return entry;
+}
+
+function clearSidebarFocusDebugLog() {
+  sidebarFocusDebugLog.length = 0;
+}
+
+function buildSidebarFocusDebugReport() {
+  const manifest =
+    lpApi.runtime && typeof lpApi.runtime.getManifest === "function"
+      ? lpApi.runtime.getManifest()
+      : null;
+  const provider = normalizeSummaryAiProvider(
+    currentSettings && currentSettings.sidebarAiProvider,
+  );
+  const lines = [
+    "Local Pocket Sidebar Focus Debug",
+    `Generated: ${new Date().toISOString()}`,
+    `Version: ${manifest && manifest.version ? manifest.version : "unknown"}`,
+    `User agent: ${navigator && navigator.userAgent ? navigator.userAgent : ""}`,
+    `Platform: ${navigator && navigator.platform ? navigator.platform : ""}`,
+    `Sidebar provider: ${provider}`,
+    `Sidebar F6 delay (ms): ${getSidebarFocusDelayMs()}`,
+    `Native helper enabled: ${isNativeSidebarFocusHelperEnabled()}`,
+    `Native helper port connected: ${!!nativeFocusHelperPort}`,
+    `Connected sidebar focus ports: ${sidebarChatFocusPorts.size}`,
+    `Last observed sidebar open state: ${lastObservedSidebarOpenState === null
+      ? "unknown"
+      : String(lastObservedSidebarOpenState)
+    }`,
+    "",
+    "Recent events:",
+  ];
+  if (!sidebarFocusDebugLog.length) {
+    lines.push("(no events yet)");
+  } else {
+    sidebarFocusDebugLog.forEach((entry, index) => {
+      const prefix = `${String(index + 1).padStart(3, "0")} ${new Date(
+        entry.at,
+      ).toISOString()} ${entry.event}`;
+      if (typeof entry.detail === "undefined") {
+        lines.push(prefix);
+        return;
+      }
+      let detailText = "";
+      try {
+        detailText = JSON.stringify(entry.detail);
+      } catch (err) {
+        detailText = String(entry.detail);
+      }
+      lines.push(`${prefix} ${detailText}`);
+    });
+  }
+  return lines.join("\n");
+}
+
+function addFavoritesDebugLog(event, detail = null) {
+  const entry = {
+    at: Date.now(),
+    event: event ? String(event) : "unknown",
+  };
+  if (typeof detail !== "undefined" && detail !== null) {
+    entry.detail = sanitizeSidebarFocusDebugValue(detail);
+  }
+  favoritesDebugLog.push(entry);
+  if (favoritesDebugLog.length > FAVORITES_DEBUG_LOG_LIMIT) {
+    favoritesDebugLog.splice(
+      0,
+      favoritesDebugLog.length - FAVORITES_DEBUG_LOG_LIMIT,
+    );
+  }
+  if (DEBUG_LOGS_ENABLED) {
+    try {
+      console.debug("[LocalPocket favorites]", entry.event, entry.detail || "");
+    } catch (_err) {
+      // ignore console issues
+    }
+  }
+  return entry;
+}
+
+function clearFavoritesDebugLog() {
+  favoritesDebugLog.length = 0;
+}
+
+function summarizeFavoriteItemForDebug(item) {
+  if (!item || typeof item !== "object") return null;
+  return {
+    id: item.id ? String(item.id) : "",
+    favorite: item.favorite === true,
+    favoriteOrder: getFavoriteOrderValue(item),
+    manualOrder: getManualOrderValue(item),
+    categoryId: item.categoryId ? String(item.categoryId) : "",
+    title: sanitizeSidebarFocusDebugValue(item.title || ""),
+    url: sanitizeSidebarFocusDebugValue(item.url || ""),
+  };
+}
+
+function summarizeFavoritesDeltaForDebug(previousItems, nextItems) {
+  if (!Array.isArray(previousItems) || !Array.isArray(nextItems)) {
+    return null;
+  }
+  const prevById = new Map();
+  const nextById = new Map();
+  previousItems.forEach((item) => {
+    if (!item || !item.id) return;
+    prevById.set(String(item.id), item);
+  });
+  nextItems.forEach((item) => {
+    if (!item || !item.id) return;
+    nextById.set(String(item.id), item);
+  });
+  const ids = new Set([...prevById.keys(), ...nextById.keys()]);
+  const changed = [];
+  ids.forEach((id) => {
+    const prevItem = prevById.get(id) || null;
+    const nextItem = nextById.get(id) || null;
+    const prevFavorite = !!(prevItem && prevItem.favorite === true);
+    const nextFavorite = !!(nextItem && nextItem.favorite === true);
+    const prevFavoriteOrder = getFavoriteOrderValue(prevItem);
+    const nextFavoriteOrder = getFavoriteOrderValue(nextItem);
+    const prevManualOrder = getManualOrderValue(prevItem);
+    const nextManualOrder = getManualOrderValue(nextItem);
+    const prevCategoryId = prevItem && prevItem.categoryId ? String(prevItem.categoryId) : "";
+    const nextCategoryId = nextItem && nextItem.categoryId ? String(nextItem.categoryId) : "";
+    if (
+      prevFavorite === nextFavorite &&
+      prevFavoriteOrder === nextFavoriteOrder &&
+      prevManualOrder === nextManualOrder &&
+      prevCategoryId === nextCategoryId
+    ) {
+      return;
+    }
+    changed.push({
+      id,
+      before: summarizeFavoriteItemForDebug(prevItem),
+      after: summarizeFavoriteItemForDebug(nextItem),
+    });
+  });
+  if (!changed.length) return null;
+  const previousFavoriteCount = previousItems.filter(
+    (item) => item && item.favorite === true,
+  ).length;
+  const nextFavoriteCount = nextItems.filter(
+    (item) => item && item.favorite === true,
+  ).length;
+  return {
+    previousFavoriteCount,
+    nextFavoriteCount,
+    changedCount: changed.length,
+    changed: changed.slice(0, 12),
+  };
+}
+
+function appendDebugLogEntries(lines, entries) {
+  const safeEntries = Array.isArray(entries) ? entries : [];
+  if (!safeEntries.length) {
+    lines.push("(no events yet)");
+    return;
+  }
+  safeEntries.forEach((entry, index) => {
+    const prefix = `${String(index + 1).padStart(3, "0")} ${new Date(
+      entry.at,
+    ).toISOString()} ${entry.event}`;
+    if (typeof entry.detail === "undefined") {
+      lines.push(prefix);
+      return;
+    }
+    let detailText = "";
+    try {
+      detailText = JSON.stringify(entry.detail);
+    } catch (_err) {
+      detailText = String(entry.detail);
+    }
+    lines.push(`${prefix} ${detailText}`);
+  });
+}
+
+function appendFavoriteSnapshotLines(lines, label, items, options, limit = 20) {
+  lines.push(label);
+  const safeItems = Array.isArray(items) ? items : [];
+  if (!safeItems.length) {
+    lines.push("(none)");
+    lines.push("");
+    return;
+  }
+  const ordered = sortItemsBySavedAt(safeItems, options).slice(0, limit);
+  ordered.forEach((item, index) => {
+    const summary = summarizeFavoriteItemForDebug(item);
+    lines.push(
+      `${String(index + 1).padStart(3, "0")} id=${summary.id} favoriteOrder=${summary.favoriteOrder} manualOrder=${summary.manualOrder} category=${summary.categoryId || "(none)"} title=${JSON.stringify(summary.title || "")}`,
+    );
+  });
+  lines.push("");
+}
+
+function buildFavoritesDebugReport() {
+  const manifest =
+    lpApi.runtime && typeof lpApi.runtime.getManifest === "function"
+      ? lpApi.runtime.getManifest()
+      : null;
+  const items = Array.isArray(cachedItems) ? cachedItems.slice() : [];
+  const favoriteItems = items.filter((item) => item && item.favorite === true);
+  const activeSortOptions = buildNavigationSortOptions(currentSettings, true);
+  const lines = [
+    "Local Pocket Favorites Debug",
+    `Generated: ${new Date().toISOString()}`,
+    `Version: ${manifest && manifest.version ? manifest.version : "unknown"}`,
+    `User agent: ${navigator && navigator.userAgent ? navigator.userAgent : ""}`,
+    `Platform: ${navigator && navigator.platform ? navigator.platform : ""}`,
+    `Navigation favorites only: ${currentSettings && currentSettings.navigationFavoritesOnly === true}`,
+    `Favorites sort mode: ${currentSettings && currentSettings.favoritesSortMode
+      ? String(currentSettings.favoritesSortMode)
+      : "manual"
+    }`,
+    `Cached item count: ${items.length}`,
+    `Favorite item count: ${favoriteItems.length}`,
+    "",
+  ];
+  appendFavoriteSnapshotLines(
+    lines,
+    "Favorite snapshot (stored manual queue):",
+    favoriteItems,
+    { favoritesSortMode: "manual", savedAtDirection: "desc" },
+  );
+  appendFavoriteSnapshotLines(
+    lines,
+    "Favorite snapshot (active navigation order):",
+    favoriteItems,
+    activeSortOptions,
+  );
+  lines.push("Recent events:");
+  appendDebugLogEntries(lines, favoritesDebugLog);
+  return lines.join("\n");
+}
+
+function promisifyTabsQuery(queryInfo) {
+  if (!lpApi.tabs || !lpApi.tabs.query) return Promise.resolve(null);
+  if (USE_PROMISE_TABS) return lpApi.tabs.query(queryInfo);
+  return new Promise((resolve, reject) => {
+    try {
+      lpApi.tabs.query(queryInfo, (tabs) => {
+        const err = lpApi.runtime && lpApi.runtime.lastError;
+        if (err) return reject(new Error(err.message || String(err)));
+        resolve(tabs);
+      });
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+function promisifyTabsGet(tabId) {
+  if (!lpApi.tabs || !lpApi.tabs.get) return Promise.resolve(null);
+  if (USE_PROMISE_TABS) return lpApi.tabs.get(tabId);
+  return new Promise((resolve, reject) => {
+    try {
+      lpApi.tabs.get(tabId, (tab) => {
+        const err = lpApi.runtime && lpApi.runtime.lastError;
+        if (err) return reject(new Error(err.message || String(err)));
+        resolve(tab);
+      });
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+function isFloatingButtonEligibleTabUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") return false;
+  try {
+    const parsed = new URL(rawUrl);
+    return (
+      parsed.protocol === "http:" ||
+      parsed.protocol === "https:" ||
+      parsed.protocol === "file:"
+    );
+  } catch (err) {
+    return false;
+  }
+}
+
+function countFloatingButtonEligibleTabs(tabs) {
+  const entries = Array.isArray(tabs) ? tabs : [];
+  let count = 0;
+  entries.forEach((tab) => {
+    if (!tab || typeof tab !== "object") return;
+    const candidateUrl =
+      typeof tab.url === "string" && tab.url
+        ? tab.url
+        : typeof tab.pendingUrl === "string"
+          ? tab.pendingUrl
+          : "";
+    if (isFloatingButtonEligibleTabUrl(candidateUrl)) {
+      count += 1;
+    }
+  });
+  return count;
+}
+
+async function refreshFloatingButtonAutoSuspendStateNow() {
+  if (!lpApi.tabs || !lpApi.tabs.query) return;
+  if (floatingButtonAutoSuspendRefreshInFlight) {
+    floatingButtonAutoSuspendRefreshQueued = true;
+    return;
+  }
+  floatingButtonAutoSuspendRefreshInFlight = true;
+  try {
+    const thresholdRaw = Number.parseInt(
+      currentSettings && currentSettings.floatingButtonAutoSuspendTabThreshold,
+      10,
+    );
+    const threshold = Number.isFinite(thresholdRaw)
+      ? Math.max(0, Math.min(thresholdRaw, 500))
+      : DEFAULT_SETTINGS.floatingButtonAutoSuspendTabThreshold;
+
+    let eligibleTabCount = 0;
+    
+    // Check threshold configuration FIRST before expensive tabs.query
+    if (threshold === 0) {
+      eligibleTabCount = 0;
+    } else if (currentEligibleTabCount > 0) {
+      // Guna kiraan dalam memori jika ada — elak tabs.query({}) penuh
+      eligibleTabCount = currentEligibleTabCount;
+    } else {
+      // Hanya query bila memori kosong (startup atau selepas reset)
+      const tabs = await promisifyTabsQuery({});
+      eligibleTabCount = countFloatingButtonEligibleTabs(tabs);
+      currentEligibleTabCount = eligibleTabCount;
+    }
+    const nextActive = threshold > 0 && eligibleTabCount > threshold;
+    const nextCount = threshold > 0 ? eligibleTabCount : 0;
+    const prevActive = currentSettings && currentSettings.floatingButtonAutoSuspendActive === true;
+    const prevCountRaw = Number.parseInt(
+      currentSettings && currentSettings.floatingButtonAutoSuspendTabCount,
+      10,
+    );
+    const prevCount = Number.isFinite(prevCountRaw) ? Math.max(0, prevCountRaw) : 0;
+    if (prevActive === nextActive && prevCount === nextCount) {
+      return;
+    }
+    const nextSettings = mergeSettings({
+      ...currentSettings,
+      floatingButtonAutoSuspendActive: nextActive,
+      floatingButtonAutoSuspendTabCount: nextCount,
+    });
+    currentSettings = nextSettings;
+    await lpStoreSet({ [SETTINGS_KEY]: nextSettings });
+  } catch (err) {
+    // ignore auto-suspend refresh failures
+  } finally {
+    floatingButtonAutoSuspendRefreshInFlight = false;
+    if (floatingButtonAutoSuspendRefreshQueued) {
+      floatingButtonAutoSuspendRefreshQueued = false;
+      scheduleFloatingButtonAutoSuspendRefresh(0);
+    }
+  }
+}
+
+function scheduleFloatingButtonAutoSuspendRefresh(
+  delay = FLOATING_BUTTON_AUTO_SUSPEND_REFRESH_DEBOUNCE_MS,
+) {
+  if (floatingButtonAutoSuspendRefreshTimer) {
+    clearTimeout(floatingButtonAutoSuspendRefreshTimer);
+    floatingButtonAutoSuspendRefreshTimer = null;
+  }
+  floatingButtonAutoSuspendRefreshTimer = setTimeout(() => {
+    floatingButtonAutoSuspendRefreshTimer = null;
+    refreshFloatingButtonAutoSuspendStateNow();
+  }, Math.max(0, delay));
+}
+
+async function resolveSidebarWindowId(targetWindowId = null) {
+  let windowId = targetWindowId;
+  if (windowId === null && lpApi.windows && lpApi.windows.getLastFocused) {
+    try {
+      const focused = await lpApi.windows.getLastFocused({ populate: false });
+      if (focused && typeof focused.id === "number") {
+        windowId = focused.id;
+      }
+    } catch (err) {
+      windowId = null;
+    }
+  }
+  if (windowId === null && lpApi.windows && lpApi.windows.getCurrent) {
+    try {
+      const current = await lpApi.windows.getCurrent({ populate: false });
+      if (current && typeof current.id === "number") {
+        windowId = current.id;
+      }
+    } catch (err) {
+      windowId = null;
+    }
+  }
+  return windowId;
+}
+
+function buildLocalPocketSidebarPanelUrl(options = {}) {
+  const mode = options && options.mode === "notes" ? "notes" : "ai";
+  const provider =
+    options && options.provider
+      ? normalizeSummaryAiProvider(options.provider)
+      : "";
+  const forceReload = !!(options && options.forceReload);
+  const jarvis = !!(options && options.jarvis);
+  const panelFile = (options && options.panel) ? String(options.panel) : "sidebar.html";
+  let panelUrl = lpApi.runtime.getURL(panelFile);
+  try {
+    const panel = new URL(panelUrl);
+    panel.searchParams.set("mode", mode);
+    if (provider) {
+      panel.searchParams.set("provider", provider);
+    }
+    if (jarvis) {
+      panel.searchParams.set("jarvis", "1");
+    }
+    if (forceReload) {
+      panel.searchParams.set("reload", Date.now().toString(36));
+    }
+    return panel.toString();
+  } catch (err) {
+    const query = ["mode=" + encodeURIComponent(mode)];
+    if (provider) {
+      query.push("provider=" + encodeURIComponent(provider));
+    }
+    if (forceReload) {
+      query.push("reload=" + encodeURIComponent(Date.now().toString(36)));
+    }
+    return panelUrl + (panelUrl.includes("?") ? "&" : "?") + query.join("&");
+  }
+}
+
+async function openLocalPocketSidebar(targetWindowId = null, options = {}) {
+  if (!lpApi.sidebarAction || !lpApi.sidebarAction.open) {
+    return false;
+  }
+  const mode = options && options.mode === "notes" ? "notes" : "ai";
+  const forceReload = !!(options && options.forceReload);
+  const provider =
+    mode === "ai" && options && options.provider
+      ? normalizeSummaryAiProvider(options.provider)
+      : "";
+  const windowId = await resolveSidebarWindowId(targetWindowId);
+  try {
+    if (lpApi.sidebarAction.setPanel) {
+      const panelDetails = {
+        panel: buildLocalPocketSidebarPanelUrl(options),
+      };
+      if (windowId !== null) {
+        panelDetails.windowId = windowId;
+      }
+      await lpApi.sidebarAction.setPanel(panelDetails);
+    }
+    if (forceReload && lpApi.sidebarAction.close) {
+      try {
+        const isOpenNow = await isSidebarOpen(windowId);
+        if (isOpenNow === true) {
+          // Jangan hantar windowId — Firefox ~140 tolak argumen itu untuk close().
+          await lpApi.sidebarAction.close();
+          await sleep(90);
+        }
+      } catch (err) {
+        // ignore close before reload
+      }
+    }
+    let opened = false;
+    try {
+      await lpApi.sidebarAction.open();
+      opened = true;
+    } catch (openErr) {
+      if (windowId !== null) {
+        try {
+          await lpApi.sidebarAction.open({ windowId });
+          opened = true;
+        } catch (openErrWithWindow) {
+          opened = false;
+        }
+      }
+    }
+    if (!opened) {
+      throw new Error("sidebar-open-failed");
+    }
+    sidebarPanelOpen = true;
+    sidebarCurrentMode = (options && options.jarvis) ? "jarvis" : mode;
+    currentSidebarPanel = (options && options.jarvis) ? "jarvis" : "ai";
+    sidebarCurrentProvider = mode === "ai" ? provider : "";
+    return true;
+  } catch (err) {
+    if (
+      !sidebarReminderShown &&
+      lpApi.notifications &&
+      lpApi.notifications.create
+    ) {
+      sidebarReminderShown = true;
+      try {
+        lpApi.notifications.create("lp-sidebar-reminder", {
+          type: "basic",
+          iconUrl: lpApi.runtime.getURL("icons/icon48.png"),
+          title: "Buka sidebar sekali",
+          message:
+            "Firefox perlukan anda buka panel Local Pocket Reader sekali (View > Sidebar). Selepas itu pintasan Summary akan buka automatik.",
+        });
+      } catch (e) {
+        // ignore
+      }
+    }
+    return false;
+  }
+}
+
+async function openSidebarChatGpt(targetWindowId = null, options = {}) {
+  const requestedProvider =
+    options && options.provider
+      ? normalizeSummaryAiProvider(options.provider)
+      : await getSummaryAiProvider();
+  const forceReload = !!(options && options.forceReload);
+  return openLocalPocketSidebar(targetWindowId, {
+    mode: "ai",
+    provider: requestedProvider,
+    forceReload,
+  });
+}
+
+async function openNotesSidebar(targetWindowId = null, options = {}) {
+  const forceReload = !!(options && options.forceReload);
+  return openLocalPocketSidebar(targetWindowId, {
+    mode: "notes",
+    forceReload,
+  });
+}
+
+async function isSidebarOpen(targetWindowId = null) {
+  if (!lpApi.sidebarAction || typeof lpApi.sidebarAction.isOpen !== "function") {
+    return null;
+  }
+  try {
+    if (targetWindowId !== null) {
+      return !!(await lpApi.sidebarAction.isOpen({ windowId: targetWindowId }));
+    }
+    return !!(await lpApi.sidebarAction.isOpen({}));
+  } catch (err) {
+    try {
+      return !!(await lpApi.sidebarAction.isOpen());
+    } catch (fallbackErr) {
+      return null;
+    }
+  }
+}
+
+async function ensureSidebarOpen(targetWindowId = null) {
+  const openState = await isSidebarOpen(targetWindowId);
+  if (openState === true) {
+    sidebarPanelOpen = true;
+    const requestedProvider = await getSummaryAiProvider();
+    if (
+      sidebarCurrentMode !== "ai"
+      || !sidebarCurrentProvider
+      || sidebarCurrentProvider !== requestedProvider
+    ) {
+      // Tukar provider tanpa tutup sidebar — setPanel navigate iframe sahaja
+      return openSidebarChatGpt(targetWindowId, {
+        provider: requestedProvider,
+        forceReload: false,
+      });
+    }
+    return true;
+  }
+  const opened = await openSidebarChatGpt(targetWindowId);
+  if (opened) {
+    return true;
+  }
+  // Fallback: try native toggle only if we know sidebar is currently closed.
+  if (openState === false) {
+    try {
+      const toggled = await toggleSidebarChatGpt();
+      if (!toggled) return false;
+      const afterToggleState = await isSidebarOpen(targetWindowId);
+      if (afterToggleState === false) return false;
+      return true;
+    } catch (err) {
+      return false;
+    }
+  }
+  return false;
+}
+
+// Track tab yang sudah diinject overlay — elak double inject
+const overlayInjectedTabs = new Map(); // tabId -> Set("notes"|"ai"|"pomodoro")
+
+async function ensureOverlayInjected(tabId, overlayType) {
+  lpLog("debug", "ensureOverlayInjected called for tab", tabId, "type", overlayType);
+  if (typeof tabId !== "number") return;
+  const injected = overlayInjectedTabs.get(tabId);
+  if (injected && injected.has(overlayType)) {
+    lpLog("debug", "Already injected", overlayType, "for tab", tabId);
+    return; // sudah inject
+  }
+  let file;
+  if (overlayType === "notes") {
+    // Inject markdown export core first so notesOverlay can use LocalPocketMarkdownExportCore
+    try {
+      await executeScriptSafe(tabId, { file: "core/markdownExportCore.js" });
+    } catch (err) {
+      lpWarn("Could not inject markdown export core:", err);
+    }
+    file = "notesOverlay.js";
+  } else if (overlayType === "ai") {
+    file = "aiOverlay.js";
+  } else if (overlayType === "pomodoro") {
+    file = "pomodoroOverlay.js";
+  } else {
+    return;
+  }
+  lpLog("debug", "Injecting file:", file);
+  try {
+    await executeScriptSafe(tabId, { file });
+    if (!overlayInjectedTabs.has(tabId)) overlayInjectedTabs.set(tabId, new Set());
+    overlayInjectedTabs.get(tabId).add(overlayType);
+    lpLog("info", "Injection successful for", overlayType);
+  } catch (err) {
+    lpErr("Injection failed for", overlayType, ":", err);
+    // Tab mungkin tak support inject (browser pages, etc.) — abaikan
+  }
+}
+
+function sendMessageToTabSafe(tabId, payload) {
+  return new Promise((resolve) => {
+    if (!lpApi.tabs || !lpApi.tabs.sendMessage || typeof tabId !== "number") {
+      resolve(null);
+      return;
+    }
+    try {
+      if (USE_PROMISE_TABS) {
+        const maybePromise = lpApi.tabs.sendMessage(tabId, payload);
+        if (maybePromise && typeof maybePromise.then === "function") {
+          maybePromise
+            .then((response) => resolve(response || null))
+            .catch(() => resolve(null));
+          return;
+        }
+        resolve(maybePromise || null);
+        return;
+      }
+      lpApi.tabs.sendMessage(tabId, payload, (response) => {
+        const err = lpApi.runtime && lpApi.runtime.lastError;
+        if (err) {
+          resolve(null);
+          return;
+        }
+        resolve(response || null);
+      });
+    } catch (err) {
+      resolve(null);
+    }
+  });
+}
+
+function emitSidebarChatFocusSignal() {
+  const value = Date.now();
+  if (!lpApi.storage || !lpApi.storage.local || !lpApi.storage.local.set) {
+    return value;
+  }
+  try {
+    const payload = { [SIDEBAR_CHAT_FOCUS_SIGNAL_KEY]: value };
+    const maybePromise = lpStoreSet(payload);
+    if (maybePromise && typeof maybePromise.then === "function") {
+      maybePromise.catch(() => { });
+    }
+  } catch (err) {
+    // ignore
+  }
+  return value;
+}
+
+function requestFocusViaSidebarPorts() {
+  if (!sidebarChatFocusPorts.size) return false;
+  let posted = false;
+  for (const port of Array.from(sidebarChatFocusPorts)) {
+    if (!port) continue;
+    try {
+      port.postMessage({ type: "focus-input", forceFocus: true });
+      posted = true;
+    } catch (err) {
+      sidebarChatFocusPorts.delete(port);
+    }
+  }
+  if (posted) {
+    addSidebarFocusDebugLog("sidebar-focus-port-posted", {
+      portCount: sidebarChatFocusPorts.size,
+    });
+  }
+  return posted;
+}
+
+function queueSidebarPortFocusPulses(port) {
+  if (!port) return;
+  for (const delayMs of SIDEBAR_PORT_CONNECT_FOCUS_PULSE_DELAYS_MS) {
+    setTimeout(() => {
+      if (!port || !sidebarChatFocusPorts.has(port)) return;
+      try {
+        port.postMessage({ type: "focus-input", forceFocus: true });
+      } catch (err) {
+        sidebarChatFocusPorts.delete(port);
+      }
+    }, delayMs);
+  }
+}
+
+function isNativeSidebarFocusHelperEnabled() {
+  return !currentSettings || currentSettings.sidebarNativeFocusHelperEnabled !== false;
+}
+
+function disconnectNativeFocusHelperPort() {
+  if (!nativeFocusHelperPort) return;
+  try {
+    nativeFocusHelperPort.disconnect();
+  } catch (err) {
+    // ignore
+  }
+  nativeFocusHelperPort = null;
+}
+
+function notifyNativeFocusHelperError(message) {
+  const now = Date.now();
+  if (now - nativeFocusHelperLastErrorAt < 15000) return;
+  nativeFocusHelperLastErrorAt = now;
+  if (lpApi.notifications && lpApi.notifications.create) {
+    try {
+      lpApi.notifications.create("lp-native-focus-helper-error", {
+        type: "basic",
+        iconUrl: lpApi.runtime.getURL("icons/icon48.png"),
+        title: "Native F6 helper tidak aktif",
+        message:
+          message || "Buka Native Helper Setup untuk semak helper Windows yang dipasang berasingan.",
+      });
+      return;
+    } catch (err) {
+      // ignore
+    }
+  }
+  lpWarn("Native focus helper unavailable:", message || "unknown");
+}
+
+function getNativeHelperSetupUrl() {
+  return lpApi.runtime && lpApi.runtime.getURL
+    ? lpApi.runtime.getURL("native-helper-setup.html")
+    : "";
+}
+
+async function openNativeHelperSetupPage() {
+  const setupUrl = getNativeHelperSetupUrl();
+  if (!setupUrl || !lpApi.tabs || !lpApi.tabs.create) return false;
+  try {
+    await lpApi.tabs.create({ url: setupUrl });
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+function probeNativeFocusHelper(timeoutMs = 900) {
+  return new Promise((resolve) => {
+    if (!isNativeSidebarFocusHelperEnabled()) {
+      resolve({
+        ok: false,
+        enabled: false,
+        connected: false,
+        host: NATIVE_FOCUS_HELPER_HOST,
+        error: "disabled",
+      });
+      return;
+    }
+    if (!lpApi.runtime || typeof lpApi.runtime.connectNative !== "function") {
+      resolve({
+        ok: false,
+        enabled: true,
+        connected: false,
+        host: NATIVE_FOCUS_HELPER_HOST,
+        error: "connectNative unavailable",
+      });
+      return;
+    }
+    let finished = false;
+    let port = null;
+    const finish = (result) => {
+      if (finished) return;
+      finished = true;
+      try {
+        if (port) port.disconnect();
+      } catch (err) {
+        // ignore
+      }
+      resolve({
+        ok: !!(result && result.ok),
+        enabled: true,
+        connected: !!(result && result.ok),
+        host: NATIVE_FOCUS_HELPER_HOST,
+        error: result && result.error ? String(result.error) : "",
+      });
+    };
+    try {
+      port = lpApi.runtime.connectNative(NATIVE_FOCUS_HELPER_HOST);
+    } catch (err) {
+      finish({
+        ok: false,
+        error: err && err.message ? String(err.message) : String(err),
+      });
+      return;
+    }
+    if (port.onMessage && port.onMessage.addListener) {
+      port.onMessage.addListener((_message) => {
+        finish({ ok: true });
+      });
+    }
+    if (port.onDisconnect && port.onDisconnect.addListener) {
+      port.onDisconnect.addListener(() => {
+        const errMsg =
+          lpApi.runtime && lpApi.runtime.lastError && lpApi.runtime.lastError.message
+            ? String(lpApi.runtime.lastError.message)
+            : "";
+        finish({
+          ok: !errMsg,
+          error: errMsg,
+        });
+      });
+    }
+    try {
+      port.postMessage({
+        action: "ping",
+        source: "localpocket-native-helper-probe",
+        at: Date.now(),
+      });
+    } catch (err) {
+      finish({
+        ok: false,
+        error: err && err.message ? String(err.message) : String(err),
+      });
+      return;
+    }
+    setTimeout(() => {
+      finish({
+        ok: false,
+        error: "timeout",
+      });
+    }, Math.max(250, timeoutMs));
+  });
+}
+
+function ensureNativeFocusHelperPort() {
+  if (!isNativeSidebarFocusHelperEnabled()) return null;
+  if (!lpApi.runtime || typeof lpApi.runtime.connectNative !== "function") {
+    return null;
+  }
+  if (nativeFocusHelperPort) return nativeFocusHelperPort;
+  try {
+    const port = lpApi.runtime.connectNative(NATIVE_FOCUS_HELPER_HOST);
+    nativeFocusHelperPort = port;
+    addSidebarFocusDebugLog("native-helper-connected");
+    if (port.onDisconnect && port.onDisconnect.addListener) {
+      port.onDisconnect.addListener(() => {
+        const errMsg =
+          lpApi.runtime && lpApi.runtime.lastError && lpApi.runtime.lastError.message
+            ? String(lpApi.runtime.lastError.message)
+            : "";
+        addSidebarFocusDebugLog("native-helper-disconnected", {
+          error: errMsg || "",
+        });
+        if (errMsg && isNativeSidebarFocusHelperEnabled()) {
+          notifyNativeFocusHelperError(errMsg);
+        }
+        nativeFocusHelperPort = null;
+      });
+    }
+    if (port.onMessage && port.onMessage.addListener) {
+      port.onMessage.addListener((message) => {
+        addSidebarFocusDebugLog("native-helper-ack", message || {});
+      });
+    }
+    return port;
+  } catch (err) {
+    addSidebarFocusDebugLog("native-helper-connect-failed", {
+      error: err && err.message ? String(err.message) : String(err),
+    });
+    if (isNativeSidebarFocusHelperEnabled()) {
+      notifyNativeFocusHelperError(
+        err && err.message ? String(err.message) : "connectNative gagal.",
+      );
+    }
+    nativeFocusHelperPort = null;
+    return null;
+  }
+}
+
+function requestNativeF6SidebarFocusTwice(reason = "unknown") {
+  // AUTO F6 DISABLED: native helper "press_f6" was moving focus around and
+  // could leave it stuck at the header. Focus is handled via the sidebar
+  // relay + content script focusPromptInput() instead.
+  return false;
+}
+
+  function requestNativeF6Once(reason = "unknown") {
+    if (!isNativeSidebarFocusHelperEnabled()) return false;
+    const port = ensureNativeFocusHelperPort();
+    if (!port) return false;
+    try {
+      // Native helper menghantar kekunci F6 tulen (trusted) ke tetingkap
+      // yang sedang fokus, jadi handler F6 (event.isTrusted) akan berjalan.
+      port.postMessage({
+        action: "press_f6",
+        source: "localpocket-f6",
+        reason: reason || "unknown",
+        at: Date.now(),
+      });
+      return true;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  function requestNativeF6Times(times, reason = "unknown", gapMs = 150) {
+    const n = Math.max(1, parseInt(times, 10) || 1);
+    for (let i = 0; i < n; i++) {
+      setTimeout(() => {
+        requestNativeF6Once(reason);
+      }, i * gapMs);
+    }
+  }
+
+function scheduleNativeF6SidebarFocusFromPort(port, reason = "sidebar-port-connected") {
+  if (!port) return;
+  if (skipF6FocusForNextOpen) {
+    addSidebarFocusDebugLog("native-f6-skipped", { reason: "user-requested-skip", trigger: reason });
+    return;
+  }
+  if (!sidebarPanelOpen) {
+    addSidebarFocusDebugLog("native-f6-skipped", { reason: "sidebar-closed", trigger: reason });
+    return;
+  }
+  const delayMs = getSidebarFocusDelayMs();
+  addSidebarFocusDebugLog("native-f6-scheduled", {
+    trigger: reason,
+    delayMs,
+  });
+  setTimeout(() => {
+    if (!port || !sidebarChatFocusPorts.has(port)) {
+      addSidebarFocusDebugLog("native-f6-schedule-cancelled", {
+        trigger: reason,
+      });
+      return;
+    }
+    requestNativeF6SidebarFocusTwice(reason);
+  }, delayMs);
+}
+
+function armNativeF6SidebarFocusOnNextPortConnect(reason = "unknown", detail = {}) {
+  if (skipF6FocusForNextOpen) {
+    addSidebarFocusDebugLog("native-f6-armed-for-port-connect-skipped", { reason: "user-requested-skip", trigger: reason, ...detail });
+    return;
+  }
+  if (!sidebarPanelOpen) {
+    addSidebarFocusDebugLog("native-f6-armed-for-port-connect-skipped", { reason: "sidebar-closed", trigger: reason, ...detail });
+    return;
+  }
+  pendingNativeF6SidebarFocusOnPortConnect = {
+    reason,
+    armedAt: Date.now(),
+  };
+  addSidebarFocusDebugLog("native-f6-armed-for-port-connect", {
+    trigger: reason,
+    ...detail,
+  });
+}
+
+function consumeNativeF6SidebarFocusOnNextPortConnect() {
+  const pending = pendingNativeF6SidebarFocusOnPortConnect;
+  pendingNativeF6SidebarFocusOnPortConnect = null;
+  return pending;
+}
+
+function clearNativeF6SidebarFocusOnNextPortConnect() {
+  pendingNativeF6SidebarFocusOnPortConnect = null;
+}
+
+function startSidebarOpenWatcher() {
+  if (sidebarOpenWatcherTimer) return;
+  // Tingkatkan interval dari 900ms ke 2000ms untuk kurangkan polling overhead
+  // Sidebar focus detection tidak perlu sangat responsif — 2 saat sudah cukup
+  sidebarOpenWatcherTimer = setInterval(async () => {
+    try {
+      // Jika sidebar sudah diketahui tertutup dan tiada port aktif,
+      // skip polling untuk jimat resource
+      if (lastObservedSidebarOpenState === false && sidebarChatFocusPorts.size === 0) {
+        consecutiveSidebarOpenPolls = 0;
+        return;
+      }
+      const openState = await isSidebarOpen();
+      if (openState === true) {
+        consecutiveSidebarClosedPolls = 0;
+        consecutiveSidebarOpenPolls += 1;
+        if (
+          consecutiveSidebarOpenPolls >= SIDEBAR_OPEN_TRUE_POLLS_REQUIRED &&
+          lastObservedSidebarOpenState !== true
+        ) {
+          const now = Date.now();
+          if (
+            SIDEBAR_OPEN_DETECTED_COOLDOWN_MS <= 0 ||
+            now - lastSidebarOpenDetectedAt >= SIDEBAR_OPEN_DETECTED_COOLDOWN_MS
+          ) {
+            lastSidebarOpenDetectedAt = now;
+            addSidebarFocusDebugLog("sidebar-open-detected");
+            emitSidebarChatFocusSignal();
+            const posted = requestFocusViaSidebarPorts();
+            if (!posted) {
+              armNativeF6SidebarFocusOnNextPortConnect("sidebar-open-detected");
+            }
+          } else {
+            addSidebarFocusDebugLog("sidebar-open-detected-skipped", {
+              reason: "cooldown",
+              cooldownMs: SIDEBAR_OPEN_DETECTED_COOLDOWN_MS,
+            });
+          }
+        }
+        if (consecutiveSidebarOpenPolls >= SIDEBAR_OPEN_TRUE_POLLS_REQUIRED) {
+          if (lastObservedSidebarOpenState !== true) {
+            broadcastJarvisSidebarState().catch(function () {});
+          }
+          lastObservedSidebarOpenState = true;
+        }
+        return;
+      }
+      if (openState === false) {
+        consecutiveSidebarOpenPolls = 0;
+        consecutiveSidebarClosedPolls += 1;
+        if (consecutiveSidebarClosedPolls >= SIDEBAR_OPEN_FALSE_POLLS_REQUIRED) {
+          lastObservedSidebarOpenState = false;
+          sidebarPanelOpen = false; // Sync state
+          clearNativeF6SidebarFocusOnNextPortConnect();
+          sendSidebarCleanupMessage().catch(() => {});
+          broadcastJarvisSidebarState().catch(function () {});
+        }
+      }
+    } catch (err) {
+      // ignore
+    }
+  }, 2000);
+}
+
+async function requestPendingPromptCheckOnSidebarAiTabs(targetWindowId = null, attempts = 8) {
+  if (!lpApi.tabs || !lpApi.tabs.query) return false;
+  // Beri masa singkat untuk page load, kemudian cuba segera
+  await sleep(300);
+  // Kalau prompt sudah tiada, tak perlu proceed
+  if (!pendingSidebarPromptData || !pendingSidebarPromptData.text) return false;
+  let applied = false;
+  const maxAttempts = Math.max(1, Number.isFinite(attempts) ? attempts : 12);
+  for (let attempt = 0; attempt < maxAttempts && !applied; attempt++) {
+    const query = { url: SIDEBAR_AI_TAB_URL_PATTERNS };
+    if (typeof targetWindowId === "number") {
+      query.windowId = targetWindowId;
+    }
+    let tabs = [];
+    try {
+      tabs = await lpApi.tabs.query(query);
+    } catch (err) {
+      tabs = [];
+    }
+
+    // Fallback: jika tiada tab dijumpai dengan URL pattern (contoh Firefox sidebar),
+    // query semua tab dan cari yang URL-nya sepadan dengan AI provider
+    if (!tabs || tabs.length === 0) {
+      try {
+        const allTabs = await lpApi.tabs.query(
+          typeof targetWindowId === "number" ? { windowId: targetWindowId } : {}
+        );
+        tabs = (allTabs || []).filter(tab => {
+          if (!tab || !tab.url) return false;
+          try {
+            const h = new URL(tab.url).hostname;
+            return SIDEBAR_AI_TAB_URL_PATTERNS.some(p => {
+              const domain = p.replace(/^\*:\/\/\*?\*?\.?/, "").replace(/\/\*$/, "");
+              return h === domain || h.endsWith("." + domain);
+            });
+          } catch (e) { return false; }
+        });
+      } catch (err) {
+        tabs = [];
+      }
+    }
+
+    for (const tab of tabs || []) {
+      const tabId = tab && typeof tab.id === "number" ? tab.id : null;
+      if (tabId === null) continue;
+      const response = await sendMessageToTabSafe(tabId, { type: "check-pending-prompt" });
+      if (response && response.applied) {
+        applied = true;
+        break;
+      }
+      // Jika tab sedang busy (submission in progress), tunggu dan retry
+      if (response && response.busy) {
+        await sleep(attempt < 3 ? 300 : 600);
+        continue;
+      }
+    }
+    if (!applied) {
+      // Kalau prompt dah consumed semasa kita menunggu, berhenti
+      if (!pendingSidebarPromptData || !pendingSidebarPromptData.text) return true;
+      await sleep(attempt < 3 ? 300 : (attempt < 8 ? 600 : 1000));
+    }
+  }
+  return applied;
+}
+async function requestFocusOnSidebarAiInputTabs(targetWindowId = null) {
+  if (!lpApi.tabs || !lpApi.tabs.query) return false;
+  const query = {
+    url: SIDEBAR_AI_TAB_URL_PATTERNS,
+  };
+  if (typeof targetWindowId === "number") {
+    query.windowId = targetWindowId;
+  }
+  let tabs = [];
+  try {
+    tabs = await lpApi.tabs.query(query);
+  } catch (err) {
+    tabs = [];
+  }
+  if (!tabs || !tabs.length) {
+    addSidebarFocusDebugLog("sidebar-ai-tabs-missing", { targetWindowId });
+    return false;
+  }
+  for (const tab of tabs) {
+    const tabId = tab && typeof tab.id === "number" ? tab.id : null;
+    if (tabId === null) continue;
+    const response = await sendMessageToTabSafe(tabId, {
+      type: "focus-sidebar-ai-input",
+    });
+    if (response && response.ok) {
+      addSidebarFocusDebugLog("sidebar-ai-input-focused", {
+        targetWindowId,
+        tabId,
+      });
+      return true;
+    }
+  }
+  addSidebarFocusDebugLog("sidebar-ai-input-not-focused", {
+    targetWindowId,
+    tabCount: tabs.length,
+  });
+  return false;
+}
+
+async function copySidebarSelectionDebugLogFromTabs() {
+  if (!lpApi.tabs || !lpApi.tabs.query) return false;
+  const query = {
+    url: SIDEBAR_AI_TAB_URL_PATTERNS,
+  };
+  let tabs = [];
+  try {
+    tabs = await lpApi.tabs.query(query);
+  } catch (err) {
+    tabs = [];
+  }
+  if (!tabs || !tabs.length) {
+    return false;
+  }
+  for (const tab of tabs) {
+    const tabId = tab && typeof tab.id === "number" ? tab.id : null;
+    if (tabId === null) continue;
+    const response = await sendMessageToTabSafe(tabId, {
+      type: "copy-sidebar-selection-debug-log",
+    });
+    if (response && response.ok) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function sendSidebarCleanupMessage() {
+  if (!lpApi.tabs || !lpApi.tabs.query) return false;
+  const query = {
+    url: SIDEBAR_AI_TAB_URL_PATTERNS,
+  };
+  let tabs = [];
+  try {
+    tabs = await lpApi.tabs.query(query);
+  } catch (err) {
+    tabs = [];
+  }
+  if (!tabs || !tabs.length) {
+    return false;
+  }
+  for (const tab of tabs) {
+    const tabId = tab && typeof tab.id === "number" ? tab.id : null;
+    if (tabId === null) continue;
+    try {
+      await sendMessageToTabSafe(tabId, {
+        type: "sidebar-cleanup",
+      });
+    } catch (err) {
+      // ignore errors during cleanup
+    }
+  }
+  return true;
+}
+let focusPipelineRunning = false;
+
+async function focusSidebarChatInputFromAnywhere(targetWindowId = null) {
+  if (focusPipelineRunning) {
+    addSidebarFocusDebugLog("focus-pipeline-skipped-already-running");
+    return false;
+  }
+  focusPipelineRunning = true;
+  
+  try {
+    const requestedProvider = await getSummaryAiProvider();
+    const isGemini = requestedProvider === "gemini";
+    const portWaitIterations = isGemini ? 40 : 25;
+    const initialRenderWaitMs = isGemini ? 1000 : 300;
+  
+  const sidebarOpenState = await isSidebarOpen(targetWindowId);
+  if (
+    sidebarOpenState === true
+    && (
+      sidebarCurrentMode !== "ai"
+      || !sidebarCurrentProvider
+      || sidebarCurrentProvider !== requestedProvider
+    )
+  ) {
+    const reopenedAi = await openSidebarChatGpt(targetWindowId, {
+      provider: requestedProvider,
+      forceReload: false,
+    });
+    if (!reopenedAi) return false;
+  }
+  
+  emitSidebarChatFocusSignal();
+  requestFocusViaSidebarPorts();
+  const opened = await ensureSidebarOpen(targetWindowId);
+  if (!opened) return false;
+
+  // TUNGGU SEHINGGA SIDEBAR BETUL-BETUL HABIS LOAD (PORT CONNECTED)
+  if (sidebarChatFocusPorts.size === 0) {
+    addSidebarFocusDebugLog("focus-pipeline-waiting-loaded", { targetWindowId, isGemini });
+    for (let i = 0; i < portWaitIterations; i++) {
+      await sleep(200);
+      if (sidebarChatFocusPorts.size > 0) break;
+    }
+  }
+  addSidebarFocusDebugLog("focus-pipeline-provider-status", {
+    loaded: !!(sidebarChatFocusPorts.size > 0),
+    ports: sidebarChatFocusPorts.size,
+    targetWindowId,
+    provider: requestedProvider,
+  });
+
+  // Tunggu sedikit lagi supaya halaman AI betul-betul siap dirender
+  await sleep(initialRenderWaitMs);
+
+  // If skipping F6 focus, just request focus via ports and reset the skip flag
+  if (skipF6FocusForNextOpen) {
+    addSidebarFocusDebugLog("focus-pipeline-skipping-f6");
+    emitSidebarChatFocusSignal();
+    requestFocusViaSidebarPorts();
+    // Also ask sidebar.js to forward focus to iframe
+    try {
+      lpApi.runtime.sendMessage({ type: "focus-sidebar-iframe" }).catch(() => {});
+    } catch (e) {}
+    skipF6FocusForNextOpen = false; // Reset the flag
+    return true;
+  }
+
+  // Otherwise, proceed with normal F6 focus attempts
+  const sidebarFocusDelayMs = getSidebarFocusDelayMs();
+  const maxF6Attempts = isGemini ? 5 : 3;
+  sidebarFocusReportedAt = 0;
+  sidebarOsFocusReportedAt = 0;
+
+  for (let attempt = 0; attempt < maxF6Attempts; attempt++) {
+    addSidebarFocusDebugLog("focus-pipeline-f6-attempt", { attempt, targetWindowId, provider: requestedProvider });
+
+    // Tekan F6 empat kali
+    await dispatchSyntheticF6Twice(targetWindowId, sidebarFocusDelayMs);
+    await dispatchSyntheticF6Twice(targetWindowId, sidebarFocusDelayMs);
+    requestNativeF6SidebarFocusTwice("focus-pipeline-attempt-" + attempt);
+    requestNativeF6SidebarFocusTwice("focus-pipeline-attempt-" + attempt + "-b");
+
+    // Juga minta sidebar.js forward focus ke iframe
+    try {
+      lpApi.runtime.sendMessage({ type: "focus-sidebar-iframe" }).catch(() => {});
+    } catch (e) {}
+
+    // Minta content script laporkan status dan cuba focus
+    emitSidebarChatFocusSignal();
+    requestFocusViaSidebarPorts();
+
+    // Tunggu dan semak beberapa kali sama ada kursor sudah masuk
+    for (let check = 0; check < 8; check++) {
+      await sleep(250);
+      emitSidebarChatFocusSignal();
+      requestFocusViaSidebarPorts();
+
+      // JIKA KURSOR DAH MASUK (OS FOCUS) → BERHENTI SERTA-MERTA!
+      if (Date.now() - sidebarOsFocusReportedAt < 600) {
+        addSidebarFocusDebugLog("focus-pipeline-os-focused-success", {
+          attempt,
+          check,
+          targetWindowId,
+        });
+        return true;
+      }
+    }
+  }
+
+    return false;
+  } finally {
+    focusPipelineRunning = false;
+    // Reset skip flag in case something went wrong
+    setTimeout(() => { skipF6FocusForNextOpen = false; }, 3000);
+  }
+}
+
+async function toggleSidebarChatGpt() {
+  // Firefox: use native toggle if available (handles open/close)
+  if (lpApi.sidebarAction && typeof lpApi.sidebarAction.toggle === "function") {
+    try {
+      await lpApi.sidebarAction.toggle();
+      sidebarPanelOpen = !sidebarPanelOpen;
+      return true;
+    } catch (err) {
+      // fall through to manual logic
+    }
+  }
+
+  // Firefox native sidebar support
+  if (lpApi.sidebarAction && lpApi.sidebarAction.open) {
+    let windowId = null;
+    if (lpApi.windows && lpApi.windows.getCurrent) {
+      try {
+        const win = await lpApi.windows.getCurrent({ populate: false });
+        if (win && typeof win.id === "number") {
+          windowId = win.id;
+        }
+      } catch (err) {
+        windowId = null;
+      }
+    }
+    if (lpApi.sidebarAction.close) {
+      try {
+        await lpApi.sidebarAction.close(
+          windowId !== null ? { windowId } : undefined,
+        );
+        sidebarPanelOpen = false;
+        return true;
+      } catch (err) {
+        // If sidebar is already closed or unsupported, fall through to open.
+      }
+    }
+    return openSidebarChatGpt(windowId);
+  }
+
+  // Chromium/Edge fallback removed for Firefox-only build
+  return false;
+}
+
+async function closeSidebarPanel(windowId = null) {
+  if (!lpApi.sidebarAction || typeof lpApi.sidebarAction.close !== "function") {
+    addSidebarFocusDebugLog("toggle-close-lpApi-unavailable", {
+      hasSidebarAction: !!lpApi.sidebarAction,
+      hasClose: !!(lpApi.sidebarAction && lpApi.sidebarAction.close),
+    });
+    lpErr("[closeSidebarPanel] lpApi.sidebarAction.close tidak tersedia");
+    return false;
+  }
+  addSidebarFocusDebugLog("toggle-close-attempt", { windowId });
+  try {
+    // Firefox (versi ~140) TAK terima argumen windowId untuk sidebarAction.close()
+    // — panggilan close({ windowId }) membuang "Incorrect argument types". Panggil
+    // tanpa argumen sahaja (tutup panel sidebar aktif). windowId diabaikan dengan
+    // selamat; jika perlu, kita boleh close() per-window cara lain kemudian.
+    await lpApi.sidebarAction.close();
+    sidebarPanelOpen = false;
+    clearNativeF6SidebarFocusOnNextPortConnect();
+    await sendSidebarCleanupMessage();
+    addSidebarFocusDebugLog("toggle-close-success");
+    return true;
+  } catch (err) {
+    addSidebarFocusDebugLog("toggle-close-error", { error: err && err.message ? err.message : String(err) });
+    lpErr("[closeSidebarPanel] Gagal menutup sidebar:", err);
+    return false;
+  }
+}
+
+async function runOpenSidebarCommandAction({ shouldClose = false } = {}) {
+  if (currentSettings && currentSettings.sidebarAiEnabled === false) {
+    await showInPageToast("AI Sidebar is disabled in settings.");
+    return false;
+  }
+  const requestedProvider = await getSummaryAiProvider();
+  const openState = await isSidebarOpen();
+
+  // Kes toggle buka semula: sidebarPanelOpen=false bermakna sidebar baru ditutup
+  // atau memang tertutup. Jangan percaya openState sahaja kerana Firefox lpApi
+  // mungkin lambat update selepas close() — guna sidebarPanelOpen sebagai override.
+  const effectivelyOpen = (openState === true && sidebarPanelOpen === true);
+
+  if (
+    effectivelyOpen
+    && (
+      sidebarCurrentMode !== "ai"
+      || !sidebarCurrentProvider
+      || sidebarCurrentProvider !== requestedProvider
+    )
+  ) {
+    // Jika sidebar sudah terbuka dengan provider berbeza, tukar provider sahaja
+    // tanpa tutup/buka semula — guna setPanel untuk navigate iframe
+    const reopenedAi = await openSidebarChatGpt(null, {
+      provider: requestedProvider,
+      forceReload: false,
+    });
+    if (!reopenedAi) return false;
+    try {
+      await focusSidebarChatInputFromAnywhere();
+    } catch (err) {}
+    requestFocusOnSidebarAiInputTabs(null).catch(() => {});
+    requestPendingPromptCheckOnSidebarAiTabs(null, requestedProvider === "gemini" ? 10 : 5).catch(() => {});
+    return true;
+  }
+  if (effectivelyOpen) {
+    // Sidebar sudah terbuka dengan provider yang betul — hantar prompt sahaja, jangan reload
+    await focusSidebarChatInputFromAnywhere();
+    requestFocusOnSidebarAiInputTabs(null).catch(() => {});
+    requestPendingPromptCheckOnSidebarAiTabs(null, requestedProvider === "gemini" ? 10 : 5).catch(() => {});
+    return true;
+  }
+  const opened = await ensureSidebarOpen();
+  if (!opened) return false;
+  try {
+    await focusSidebarChatInputFromAnywhere();
+  } catch (err) {
+    // ignore focus failure on toggle
+  }
+  requestFocusOnSidebarAiInputTabs(null).catch(() => {});
+  requestPendingPromptCheckOnSidebarAiTabs(null, requestedProvider === "gemini" ? 10 : 5).catch(() => {});
+  return true;
+}
+
+// Broadcast whether the Local Pocket AI sidebar is currently open so that
+// JARVIS can fully suspend itself while the AI sidebar is active (and resume
+// when it closes). See jarvisOverlay.js.
+async function broadcastJarvisSidebarState() {
+  const open = sidebarPanelOpen === true && sidebarCurrentMode === "ai";
+  if (open) {
+    // Sidebar AI baru dibuka — bersihkan semua hidden tab JARVIS yang
+    // mungkin masih berjalan supaya tidak bersaing dengan provider sidebar
+    // (kedua-dua memuat halaman AI provider yang sama).
+    cleanupAllJarvisHiddenTabs();
+  }
+  if (!lpApi.tabs || !lpApi.tabs.query) return;
+  let tabs = [];
+  try { tabs = await lpApi.tabs.query({}); } catch (e) { tabs = []; }
+  const payload = { type: "lp-ai-sidebar-state", open: open };
+  for (const t of (tabs || [])) {
+    if (t && typeof t.id === "number") {
+      sendMessageToTabSafe(t.id, payload).catch(function () {});
+    }
+  }
+}
+
+function cleanupAllJarvisHiddenTabs() {
+  // Tutup semua hidden tab yang masih berjalan untuk JARVIS overlay
+  if (overlayHiddenTabMap && overlayHiddenTabMap.size > 0) {
+    const entries = Array.from(overlayHiddenTabMap);
+    overlayHiddenTabMap.clear();
+    for (const [token, tabId] of entries) {
+      if (tabId && lpApi.tabs && lpApi.tabs.remove) {
+        lpApi.tabs.remove(tabId).catch(function () {});
+      }
+      saveOverlayHiddenTabMap(token, null);
+    }
+  }
+  // Juga cleanup response tab mapping
+  if (overlayResponseTabMap && overlayResponseTabMap.size > 0) {
+    const tokens = Array.from(overlayResponseTabMap.keys());
+    overlayResponseTabMap.clear();
+    for (const token of tokens) {
+      saveOverlayResponseTabMap(token, null);
+    }
+  }
+}
+
+async function runOpenNotesSidebarCommandAction() {
+  const activeTab = await getActiveTabForCommands();
+  if (!activeTab || typeof activeTab.id !== "number") return false;
+  // Inject notesOverlay jika belum ada — lazy inject menggantikan manifest auto-inject
+  await ensureOverlayInjected(activeTab.id, "notes");
+  const response = await sendMessageToTabSafe(activeTab.id, {
+    type: "toggle-notes-overlay",
+  });
+  return !!(response && response.ok);
+}
+
+// Peta untuk track tab warmup yang sedang berjalan (provider -> tabId)
+const overlayWarmupTabByProvider = new Map();
+// Peta untuk track masa terakhir warmup berjaya (provider -> timestamp)
+const overlayWarmupLastSuccessAt = new Map();
+// Cooldown: jangan warmup semula dalam masa 5 minit jika sudah berjaya
+const OVERLAY_WARMUP_COOLDOWN_MS = 5 * 60 * 1000;
+
+// Peta untuk track popup windows overlay AI (senderTabId -> { windowId, tabId, provider, currentUrl })
+const overlayPopupBySenderTab = new Map();
+let overlayPopupFocusTimer = null;
+// Auto-close overlay popup bila window lain dapat fokus
+if (lpApi.windows && lpApi.windows.onFocusChanged) {
+  try {
+    lpApi.windows.onFocusChanged.addListener(function onPopupFocusChange(windowId) {
+      if (overlayPopupBySenderTab.size === 0) return;
+      if (windowId === -1) return;
+      for (const [, entry] of overlayPopupBySenderTab) {
+        if (entry && entry.windowId && entry.windowId !== windowId) {
+          if (overlayPopupFocusTimer) clearTimeout(overlayPopupFocusTimer);
+          overlayPopupFocusTimer = setTimeout(function() {
+            overlayPopupFocusTimer = null;
+            if (lpApi.windows && lpApi.windows.remove) {
+              try { lpApi.windows.remove(entry.windowId).catch(function(){}); } catch(_) {}
+            }
+          }, 150);
+          return;
+        }
+      }
+      if (overlayPopupFocusTimer) {
+        clearTimeout(overlayPopupFocusTimer);
+        overlayPopupFocusTimer = null;
+      }
+    });
+  } catch (_) {}
+}
+// Helper to find overlay entry by either webpage tab (key) or popup tab (value.tabId)
+function findOverlayEntry(tabId) {
+  const direct = overlayPopupBySenderTab.get(tabId);
+  if (direct) return direct;
+  for (const [, entry] of overlayPopupBySenderTab) {
+    if (entry && entry.tabId === tabId) return entry;
+  }
+  return null;
+}
+// Peta untuk track last conversation URL per provider (provider -> URL tanpa lp_popup)
+const overlayLastConversationUrl = new Map();
+// Timeout untuk tunggu tab warmup load
+const OVERLAY_WARMUP_TAB_TIMEOUT_MS = 6000;
+// Masa tunggu selepas tab loaded sebelum tutup (bagi masa cookies ditetapkan)
+const OVERLAY_WARMUP_SETTLE_MS = 800;
+// Masa maksimum overlay akan tunggu warmup selesai sebelum teruskan tanpa warmup
+const OVERLAY_WARMUP_MAX_WAIT_MS = 3500;
+
+/**
+ * Buka tab tersembunyi ke provider URL untuk establish session cookies
+ * sebelum overlay iframe dipaparkan. Tab ditutup selepas loaded atau timeout.
+ * Ini memastikan cookies provider (login session) tersedia dalam iframe context.
+ *
+ * Returns a Promise yang resolve apabila warmup selesai (atau skip jika cooldown).
+ */
+async function warmUpProviderSession(provider) {
+  const key = normalizeSummaryAiProvider(provider || "chatgpt");
+  const providerUrl = getProviderUrl(key);
+  if (!providerUrl) return;
+
+  // Semak cooldown — skip warmup jika baru sahaja berjaya (cookies masih segar)
+  const lastSuccess = overlayWarmupLastSuccessAt.get(key) || 0;
+  if (Date.now() - lastSuccess < OVERLAY_WARMUP_COOLDOWN_MS) return;
+
+  // Jika tab warmup untuk provider ini sudah wujud, tunggu ia selesai
+  const existingTabId = overlayWarmupTabByProvider.get(key);
+  if (existingTabId) {
+    try {
+      const tab = await lpApi.tabs.get(existingTabId);
+      if (tab && tab.id) {
+        // Tab masih wujud — tunggu sehingga ia selesai (poll lastSuccess)
+        const waitStart = Date.now();
+        while (Date.now() - waitStart < OVERLAY_WARMUP_MAX_WAIT_MS) {
+          await sleep(120);
+          const updated = overlayWarmupLastSuccessAt.get(key) || 0;
+          if (updated > lastSuccess) return; // Warmup selesai
+          if (!overlayWarmupTabByProvider.has(key)) return; // Tab sudah tutup
+        }
+        return;
+      }
+    } catch (_) {
+      overlayWarmupTabByProvider.delete(key);
+    }
+  }
+
+  if (!lpApi.tabs || !lpApi.tabs.create) return;
+
+  let warmupTabId = null;
+  try {
+    const tab = await lpApi.tabs.create({ url: providerUrl, active: false });
+    if (!tab || !tab.id) return;
+    warmupTabId = tab.id;
+    overlayWarmupTabByProvider.set(key, warmupTabId);
+  } catch (_) {
+    return;
+  }
+
+  // Tunggu tab selesai load atau timeout, kemudian tutup
+  await new Promise((resolve) => {
+    let settled = false;
+
+    const closeWarmupTab = () => {
+      if (settled) return;
+      settled = true;
+      overlayWarmupTabByProvider.delete(key);
+      overlayWarmupLastSuccessAt.set(key, Date.now());
+      if (lpApi.tabs.onUpdated && lpApi.tabs.onUpdated.removeListener) {
+        lpApi.tabs.onUpdated.removeListener(onTabUpdated);
+      }
+      if (lpApi.tabs.onRemoved && lpApi.tabs.onRemoved.removeListener) {
+        lpApi.tabs.onRemoved.removeListener(onTabRemoved);
+      }
+      try { lpApi.tabs.remove(warmupTabId).catch(() => {}); } catch (_) {}
+      warmupTabId = null;
+      resolve();
+    };
+
+    const onTabUpdated = (tabId, changeInfo) => {
+      if (tabId !== warmupTabId) return;
+      if (changeInfo.status === "complete") {
+        setTimeout(closeWarmupTab, OVERLAY_WARMUP_SETTLE_MS);
+      }
+    };
+
+    const onTabRemoved = (tabId) => {
+      if (tabId !== warmupTabId) return;
+      closeWarmupTab();
+    };
+
+    if (lpApi.tabs.onUpdated && lpApi.tabs.onUpdated.addListener) {
+      lpApi.tabs.onUpdated.addListener(onTabUpdated);
+    }
+    if (lpApi.tabs.onRemoved && lpApi.tabs.onRemoved.addListener) {
+      lpApi.tabs.onRemoved.addListener(onTabRemoved);
+    }
+
+    setTimeout(closeWarmupTab, OVERLAY_WARMUP_TAB_TIMEOUT_MS);
+  });
+}
+
+async function runToggleAiOverlayCommandAction() {
+  const activeTab = await getActiveTabForCommands();
+  if (!activeTab || typeof activeTab.id !== "number") return false;
+
+  // Jika popup sudah terbuka untuk active tab, tutup
+  // active tab mungkin webpage (key) atau popup tab (entry.tabId)
+  for (const [sid, entry] of overlayPopupBySenderTab) {
+    if (sid === activeTab.id || (entry && entry.tabId === activeTab.id)) {
+      try { await lpApi.windows.remove(entry.windowId).catch(() => {}); } catch (_) {}
+      return true;
+    }
+  }
+
+  
+  // Dapatkan selected text jika ada
+  let selectedText = "";
+  try {
+    const result = await lpApi.tabs.executeScript(activeTab.id, {
+      code: "window.getSelection ? window.getSelection().toString() : ''",
+      runAt: "document_start"
+    });
+    if (result && result[0]) {
+      selectedText = String(result[0]).trim();
+    }
+  } catch (err) {
+    // Ignore error, proceed without selected text
+  }
+
+  // Inject aiOverlay jika belum ada — lazy inject menggantikan manifest auto-inject
+  await ensureOverlayInjected(activeTab.id, "ai");
+
+  // Hantar toggle dulu — overlay muncul tanpa delay
+  // Jalankan warmup session cookies secara serentak di background
+  const responsePromise = sendMessageToTabSafe(activeTab.id, {
+    type: "toggle-ai-overlay",
+    selectedText: selectedText
+  });
+
+  getSummaryAiProvider().then(provider => {
+    warmUpProviderSession(provider).catch(() => {});
+  }).catch(() => {});
+
+  const response = await responsePromise;
+  return !!(response && response.ok);
+}
+
+async function runTogglePomodoroOverlayCommandAction() {
+  lpLog("info", "[Background] runTogglePomodoroOverlayCommandAction called");
+  const activeTab = await getActiveTabForCommands();
+  if (!activeTab || typeof activeTab.id !== "number") {
+    lpLog("info", "[Background] No active tab found");
+    return false;
+  }
+  lpLog("info", "[Background] Active tab:", activeTab.id, activeTab.url);
+
+  // Inject pomodoroOverlay jika belum ada — lazy inject
+  lpLog("info", "[Background] Injecting pomodoro overlay");
+  await ensureOverlayInjected(activeTab.id, "pomodoro");
+
+  // Tunggu sebentar untuk memastikan script siap load
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+  // Hantar toggle message
+  lpLog("info", "[Background] Sending toggle-pomodoro-overlay message");
+  const response = await sendMessageToTabSafe(activeTab.id, {
+    type: "toggle-pomodoro-overlay"
+  });
+  lpLog("info", "[Background] Response:", response);
+
+  if (!response) {
+    lpLog("info", "[Background] No response - script may not be loaded");
+  }
+
+  return !!(response && response.ok);
+}
+
+async function runToggleTodoOverlayCommandAction() {
+  const activeTab = await getActiveTabForCommands();
+  if (!activeTab || typeof activeTab.id !== "number") return false;
+
+  await ensureOverlayInjected(activeTab.id, "notes");
+  const response = await sendMessageToTabSafe(activeTab.id, {
+    type: "toggle-todo-overlay"
+  });
+  return !!(response && response.ok);
+}
+
+async function openSidebarAfterInstall() {
+  try {
+    if (lpApi.sidebarAction && lpApi.sidebarAction.open) {
+      const ok = await ensureSidebarOpen();
+      return !!ok;
+    }
+    return false;
+  } catch (err) {
+    lpWarn("Auto-open sidebar failed", err);
+    return false;
+  }
+}
+
+function clearSummaryAutoToggleSession(sessionId) {
+  const key = sessionId ? String(sessionId) : "";
+  if (!key) return;
+  const timer = pendingSummaryAutoToggleTimersBySessionId.get(key);
+  if (timer) {
+    clearTimeout(timer);
+  }
+  pendingSummaryAutoToggleTimersBySessionId.delete(key);
+}
+
+function armSummaryAutoToggleSession(sessionId) {
+  const key = sessionId ? String(sessionId) : "";
+  if (!key) return;
+  for (const existingKey of Array.from(
+    pendingSummaryAutoToggleTimersBySessionId.keys(),
+  )) {
+    clearSummaryAutoToggleSession(existingKey);
+  }
+  const timer = setTimeout(() => {
+    clearSummaryAutoToggleSession(key);
+  }, SUMMARY_AUTO_TOGGLE_TIMEOUT_MS);
+  pendingSummaryAutoToggleTimersBySessionId.set(key, timer);
+}
+
+function clearSummaryTempWindowSessionState(sessionId) {
+  const key = sessionId ? String(sessionId) : "";
+  if (!key) return;
+  const existing = pendingSummaryTempWindowBySessionId.get(key);
+  if (existing && existing.fallbackTimer) {
+    clearTimeout(existing.fallbackTimer);
+  }
+  pendingSummaryTempWindowBySessionId.delete(key);
+}
+
+function dropSummaryTempWindowSessionByWindowId(windowId) {
+  if (windowId === null || typeof windowId === "undefined") return;
+  for (const [key, entry] of pendingSummaryTempWindowBySessionId.entries()) {
+    if (entry && entry.windowId === windowId) {
+      clearSummaryTempWindowSessionState(key);
+    }
+  }
+}
+
+function dropSummaryTempWindowSessionByTabId(tabId) {
+  if (tabId === null || typeof tabId === "undefined") return;
+  for (const [key, entry] of pendingSummaryTempWindowBySessionId.entries()) {
+    if (entry && entry.tabId === tabId) {
+      clearSummaryTempWindowSessionState(key);
+    }
+  }
+}
+
+function trackSummaryTempWindowSession(sessionId, windowId, tabId) {
+  const key = sessionId ? String(sessionId) : "";
+  if (!key) return;
+  clearSummaryTempWindowSessionState(key);
+  const fallbackTimer = setTimeout(() => {
+    closeSummaryTempWindowSession(key).catch(() => { });
+  }, SUMMARY_TEMP_WINDOW_FALLBACK_CLOSE_MS);
+  pendingSummaryTempWindowBySessionId.set(key, {
+    windowId: typeof windowId === "number" ? windowId : null,
+    tabId: typeof tabId === "number" ? tabId : null,
+    fallbackTimer,
+  });
+}
+
+async function closeSummaryTempWindowForSessionOrActive(sessionId) {
+  const key = sessionId ? String(sessionId) : "";
+  let closedTempWindow = false;
+  if (key) {
+    closedTempWindow = await closeSummaryTempWindowSession(key);
+  }
+  if (!closedTempWindow) {
+    if (tempChatGptWindowId !== null && lpApi.windows && lpApi.windows.remove) {
+      try {
+        await lpApi.windows.remove(tempChatGptWindowId);
+        tempChatGptWindowId = null;
+        tempChatGptTabId = null;
+        closedTempWindow = true;
+      } catch (err) {
+        // ignore
+      }
+    }
+    if (
+      !closedTempWindow &&
+      tempChatGptTabId !== null &&
+      lpApi.tabs &&
+      lpApi.tabs.remove
+    ) {
+      try {
+        await lpApi.tabs.remove(tempChatGptTabId);
+        tempChatGptTabId = null;
+        closedTempWindow = true;
+      } catch (err) {
+        // ignore
+      }
+    }
+  }
+  return closedTempWindow;
+}
+
+async function openSidebarAfterSummaryPopupClose() {
+  // Allow focus to return to user window after popup is removed.
+  await sleep(220);
+
+  // Try opening sidebar directly (works if called with valid context).
+  try {
+    const opened = await ensureSidebarOpen();
+    if (opened) {
+      sidebarPanelOpen = true;
+      return true;
+    }
+  } catch (err) {
+    // fall through to other methods
+  }
+
+  // Fallback: try synthetic keyboard shortcut (e.g. Alt+R configured in Options).
+  await triggerSyntheticOpenSidebarShortcut();
+  await sleep(220);
+  const openAfterSynthetic = await isSidebarOpen();
+  if (openAfterSynthetic === true) {
+    sidebarPanelOpen = true;
+    return true;
+  }
+
+  // Shortcut-like path: use the exact same toggle command flow.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const openStateBefore = await isSidebarOpen();
+    if (openStateBefore === true) {
+      sidebarPanelOpen = true;
+      return true;
+    }
+    const toggled = await runOpenSidebarCommandAction();
+    if (!toggled) {
+      await sleep(200);
+      continue;
+    }
+    await sleep(220);
+    const openStateAfter = await isSidebarOpen();
+    if (openStateAfter === true) {
+      sidebarPanelOpen = true;
+      return true;
+    }
+    if (openStateAfter === null && sidebarPanelOpen) {
+      return true;
+    }
+  }
+
+  // Last fallback.
+  const opened = await ensureSidebarOpen();
+  return !!opened;
+}
+
+async function handleSummarySessionSubmitted(sessionId) {
+  const key = sessionId ? String(sessionId) : "";
+  if (!key) return false;
+  await closeSummaryTempWindowForSessionOrActive(key);
+  clearSummaryAutoToggleSession(key);
+  try {
+    return await openSidebarAfterSummaryPopupClose();
+  } catch (err) {
+    return false;
+  }
+}
+
+async function closeSummaryTempWindowSession(sessionId) {
+  const key = sessionId ? String(sessionId) : "";
+  if (!key) return false;
+  const entry = pendingSummaryTempWindowBySessionId.get(key);
+  if (!entry) return false;
+  clearSummaryTempWindowSessionState(key);
+  const windowId =
+    entry && typeof entry.windowId === "number" ? entry.windowId : null;
+  const tabId = entry && typeof entry.tabId === "number" ? entry.tabId : null;
+
+  let closed = false;
+  if (windowId !== null && lpApi.windows && lpApi.windows.remove) {
+    try {
+      await lpApi.windows.remove(windowId);
+      closed = true;
+    } catch (err) {
+      // ignore
+    }
+  }
+  if (!closed && tabId !== null && lpApi.tabs && lpApi.tabs.remove) {
+    try {
+      await lpApi.tabs.remove(tabId);
+      closed = true;
+    } catch (err) {
+      // ignore
+    }
+  }
+  if (windowId !== null && tempChatGptWindowId === windowId) {
+    tempChatGptWindowId = null;
+  }
+  if (tabId !== null && tempChatGptTabId === tabId) {
+    tempChatGptTabId = null;
+  }
+  return closed;
+}
+
+async function handleSummarySessionComplete(sessionId) {
+  const key = sessionId ? String(sessionId) : "";
+  if (!key) return false;
+  await closeSummaryTempWindowForSessionOrActive(key);
+  if (!pendingSummaryAutoToggleTimersBySessionId.has(key)) return false;
+  clearSummaryAutoToggleSession(key);
+  try {
+    return await openSidebarAfterSummaryPopupClose();
+  } catch (err) {
+    return false;
+  }
+}
+
+try {
+  if (lpApi.windows && lpApi.windows.onRemoved && lpApi.windows.onRemoved.addListener) {
+    lpApi.windows.onRemoved.addListener((windowId) => {
+      if (windowId === chatGptPopupWindowId) {
+        chatGptPopupWindowId = null;
+        chatGptPopupTabId = null;
+      }
+    });
+  }
+} catch (_) {}
+
+try {
+  if (lpApi.tabs && lpApi.tabs.onRemoved && lpApi.tabs.onRemoved.addListener) {
+    lpApi.tabs.onRemoved.addListener((tabId) => {
+      if (tabId === chatGptPopupTabId) {
+        chatGptPopupTabId = null;
+      }
+      if (tabId === hiddenChatGptTabId) {
+        hiddenChatGptTabId = null;
+      }
+      if (tabId === tempChatGptTabId) {
+        tempChatGptTabId = null;
+      }
+      contentScriptInjectedTabs.delete(tabId);
+      dropSummaryTempWindowSessionByTabId(tabId);
+    });
+  }
+} catch (_) {}
+
+try {
+  if (lpApi.windows && lpApi.windows.onRemoved && lpApi.windows.onRemoved.addListener) {
+    lpApi.windows.onRemoved.addListener((windowId) => {
+      if (windowId === tempChatGptWindowId) {
+        tempChatGptWindowId = null;
+        tempChatGptTabId = null;
+      }
+      dropSummaryTempWindowSessionByWindowId(windowId);
+    });
+  }
+} catch (_) {}
+
+function executeScriptSafe(tabId, details) {
+  return new Promise((resolve, reject) => {
+    if (!lpApi.tabs || !lpApi.tabs.executeScript) {
+      reject(new Error("tabs.executeScript unavailable"));
+      return;
+    }
+    try {
+      if (USE_PROMISE_TABS) {
+        const maybePromise = lpApi.tabs.executeScript(tabId, details);
+        if (maybePromise && typeof maybePromise.then === "function") {
+          maybePromise.then(resolve).catch(reject);
+          return;
+        }
+        resolve(maybePromise);
+        return;
+      }
+      lpApi.tabs.executeScript(tabId, details, (result) => {
+        const err = lpApi.runtime && lpApi.runtime.lastError;
+        if (err) {
+          reject(new Error(err.message || String(err)));
+          return;
+        }
+        resolve(result);
+      });
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+async function executeScriptWithRetries(tabId, details, options = {}) {
+  const timeoutMs = Number.isFinite(options.timeoutMs)
+    ? Math.max(0, options.timeoutMs)
+    : SUMMARY_TAB_SCRIPT_RETRY_TIMEOUT_MS;
+  const intervalMs = Number.isFinite(options.intervalMs)
+    ? Math.max(20, options.intervalMs)
+    : SUMMARY_TAB_SCRIPT_RETRY_INTERVAL_MS;
+  const deadline = Date.now() + timeoutMs;
+  let lastError = null;
+
+  while (Date.now() <= deadline) {
+    try {
+      return await executeScriptSafe(tabId, details);
+    } catch (err) {
+      lastError = err;
+      if (isInvalidTabError(err) || isAccessDeniedError(err)) {
+        throw err;
+      }
+      await sleep(intervalMs);
+    }
+  }
+
+  if (lastError) {
+    throw lastError;
+  }
+  return executeScriptSafe(tabId, details);
+}
+
+function getErrorMessage(err) {
+  if (!err) return "";
+  if (typeof err === "string") return err;
+  if (err && err.message) return String(err.message);
+  try {
+    return String(err);
+  } catch (stringifyErr) {
+    return "";
+  }
+}
+
+function isInvalidTabError(err) {
+  const message = getErrorMessage(err).toLowerCase();
+  if (!message) return false;
+  return (
+    message.includes("invalid tab id") ||
+    message.includes("invalid tabid") ||
+    message.includes("no tab with id") ||
+    message.includes("tab not found")
+  );
+}
+
+function isAccessDeniedError(err) {
+  const message = getErrorMessage(err).toLowerCase();
+  if (!message) return false;
+  return (
+    message.includes("cannot access contents of the page") ||
+    message.includes("cannot access contents of url") ||
+    message.includes("cannot access a chrome-extension") ||
+    message.includes("cannot access contents of chrome") ||
+    message.includes("missing host permission") ||
+    message.includes("the extensions gallery cannot be scripted") ||
+    message.includes("restricted page")
+  );
+}
+
+function isMissingMessageReceiverError(err) {
+  const message = getErrorMessage(err).toLowerCase();
+  if (!message) return false;
+  return (
+    message.includes("could not establish connection") ||
+    message.includes("receiving end does not exist")
+  );
+}
+
+function isScriptableTab(tab) {
+  if (!tab || !tab.url) return true;
+  const url = String(tab.url).toLowerCase();
+  return !(
+    url.startsWith("chrome://") ||
+    url.startsWith("edge://") ||
+    url.startsWith("about:") ||
+    url.startsWith("view-source:") ||
+    url.startsWith("devtools://") ||
+    url.startsWith("chrome-extension://") ||
+    url.startsWith("moz-extension://") ||
+    url.startsWith("chrome-untrusted://") ||
+    url.startsWith("opera://") ||
+    url.startsWith("vivaldi://")
+  );
+}
+
+function getTabDisplayTarget(tab) {
+  if (!tab) return "";
+  const raw = tab.url || tab.pendingUrl || "";
+  try {
+    const parsed = new URL(raw);
+    return parsed.host || parsed.protocol || raw;
+  } catch (err) {
+    return raw ? String(raw).slice(0, 60) : "";
+  }
+}
+
+function getTabRawUrl(tab) {
+  if (!tab) return "";
+  if (tab.url) return String(tab.url);
+  if (tab.pendingUrl) return String(tab.pendingUrl);
+  return "";
+}
+
+function isFileUrl(rawUrl) {
+  if (!rawUrl) return false;
+  return /^file:/i.test(String(rawUrl));
+}
+
+async function permissionsContainsSafe(details) {
+  if (!lpApi.permissions || !lpApi.permissions.contains) return false;
+  try {
+    if (USE_PROMISE_TABS) {
+      const result = await lpApi.permissions.contains(details);
+      return !!result;
+    }
+    return await new Promise((resolve) => {
+      try {
+        lpApi.permissions.contains(details, (granted) => {
+          const err = lpApi.runtime && lpApi.runtime.lastError;
+          if (err) {
+            resolve(false);
+            return;
+          }
+          resolve(!!granted);
+        });
+      } catch (err) {
+        resolve(false);
+      }
+    });
+  } catch (err) {
+    return false;
+  }
+}
+
+async function permissionsRequestSafe(details) {
+  if (!lpApi.permissions || !lpApi.permissions.request) return false;
+  try {
+    if (USE_PROMISE_TABS) {
+      const result = await lpApi.permissions.request(details);
+      return !!result;
+    }
+    return await new Promise((resolve) => {
+      try {
+        lpApi.permissions.request(details, (granted) => {
+          const err = lpApi.runtime && lpApi.runtime.lastError;
+          if (err) {
+            resolve(false);
+            return;
+          }
+          resolve(!!granted);
+        });
+      } catch (err) {
+        resolve(false);
+      }
+    });
+  } catch (err) {
+    return false;
+  }
+}
+
+async function notifyFilePermissionNeeded(actionLabel) {
+  const now = Date.now();
+  if (now - lastFilePermissionNoticeAt < FILE_PERMISSION_NOTICE_COOLDOWN_MS) {
+    return false;
+  }
+  lastFilePermissionNoticeAt = now;
+  const message = actionLabel
+    ? `Untuk ${actionLabel}, benarkan akses file:// untuk Local Pocket dahulu.`
+    : "Benarkan akses file:// untuk Local Pocket dahulu.";
+  if (lpApi.notifications && lpApi.notifications.create) {
+    try {
+      const iconUrl =
+        lpApi.runtime && lpApi.runtime.getURL
+          ? lpApi.runtime.getURL("icons/icon-96.png")
+          : "icons/icon-96.png";
+      await lpApi.notifications.create("local-pocket-file-permission", {
+        type: "basic",
+        title: "Akses fail lokal diperlukan",
+        message,
+        iconUrl,
+      });
+      return true;
+    } catch (err) {
+      // ignore notification failures
+    }
+  }
+  flashCategoryBadge("FILE");
+  return true;
+}
+
+async function ensureFilePermissionForTab(tab, actionLabel) {
+  const rawUrl = getTabRawUrl(tab);
+  if (!isFileUrl(rawUrl)) {
+    return { ok: true, requiresFilePermission: false };
+  }
+  const hasPermission = await permissionsContainsSafe({
+    origins: [FILE_PERMISSION_ORIGIN],
+  });
+  if (hasPermission) {
+    return { ok: true, requiresFilePermission: true, alreadyGranted: true };
+  }
+  const granted = await permissionsRequestSafe({
+    origins: [FILE_PERMISSION_ORIGIN],
+  });
+  if (granted) {
+    return { ok: true, requiresFilePermission: true, grantedNow: true };
+  }
+  await notifyFilePermissionNeeded(actionLabel);
+  return {
+    ok: false,
+    requiresFilePermission: true,
+    reason: "file-permission-denied",
+  };
+}
+
+async function notifyCategoryPickerBlocked(tab, messageOverride) {
+  const now = Date.now();
+  if (now - lastPickerBlockedNoticeAt < PICKER_BLOCK_NOTICE_COOLDOWN_MS) {
+    return false;
+  }
+  lastPickerBlockedNoticeAt = now;
+  const host = getTabDisplayTarget(tab);
+  const message =
+    messageOverride ||
+    (host
+      ? `Category Picker tidak boleh dibuka pada halaman ${host}. Buka laman web biasa dahulu.`
+      : "Category Picker tidak boleh dibuka pada halaman ini. Buka laman web biasa dahulu.");
+  if (lpApi.notifications && lpApi.notifications.create) {
+    try {
+      const iconUrl =
+        lpApi.runtime && lpApi.runtime.getURL
+          ? lpApi.runtime.getURL("icons/icon-96.png")
+          : "icons/icon-96.png";
+      await lpApi.notifications.create("local-pocket-picker-blocked", {
+        type: "basic",
+        title: "Category Picker unavailable",
+        message,
+        iconUrl,
+      });
+    } catch (err) {
+      // ignore notification failures
+    }
+  }
+  flashCategoryBadge("OPEN");
+  return true;
+}
+
+async function runTabUiApiCall(call, tabId, label) {
+  try {
+    const maybePromise = call();
+    if (maybePromise && typeof maybePromise.then === "function") {
+      await maybePromise;
+    }
+    return true;
+  } catch (err) {
+    if (isInvalidTabError(err)) {
+      if (tabId || tabId === 0) {
+        pageActionStateByTabId.delete(tabId);
+        clearPendingContextMenuCategory(tabId);
+      }
+      return false;
+    }
+    if (label) {
+      lpWarn(label + " failed", err);
+    }
+    return false;
+  }
+}
+
+function parseUrlLenient(rawUrl) {
+  const raw = rawUrl ? String(rawUrl).trim() : "";
+  if (!raw) return null;
+  try {
+    return new URL(raw);
+  } catch (err) {
+    // try next strategy
+  }
+  if (raw.startsWith("//")) {
+    try {
+      return new URL(`https:${raw}`);
+    } catch (err) {
+      // try next strategy
+    }
+  }
+  if (/^[a-z0-9.-]+\.[a-z]{2,}(?:[/:?#]|$)/i.test(raw)) {
+    try {
+      return new URL(`https://${raw}`);
+    } catch (err) {
+      // invalid URL
+    }
+  }
+  return null;
+}
+
+function clearDefaultPort(parsed) {
+  if (!parsed) return;
+  if (
+    (parsed.protocol === "https:" && parsed.port === "443") ||
+    (parsed.protocol === "http:" && parsed.port === "80")
+  ) {
+    parsed.port = "";
+  }
+}
+
+function isAllowedItemUrlProtocol(protocol) {
+  if (!protocol) return false;
+  return ALLOWED_ITEM_URL_PROTOCOLS.has(String(protocol).toLowerCase());
+}
+
+function normalizeUrl(url) {
+  const parsed = parseUrlLenient(url);
+  if (!parsed || !isAllowedItemUrlProtocol(parsed.protocol)) return "";
+  parsed.hash = "";
+  clearDefaultPort(parsed);
+  return parsed.toString();
+}
+
+function normalizeExtractedTitle(rawTitle) {
+  if (!rawTitle) return "";
+  return String(rawTitle).replace(/\s+/g, " ").trim();
+}
+
+async function fetchYouTubeTitleFromOEmbed(rawUrl) {
+  const videoId = extractYouTubeVideoId(rawUrl);
+  if (!videoId) return "";
+
+  const canonicalUrl = `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`;
+  const endpoint = `https://www.youtube.com/oembed?url=${encodeURIComponent(canonicalUrl)}&format=json`;
+  const controller =
+    typeof AbortController === "function" ? new AbortController() : null;
+  let timeoutId = null;
+
+  try {
+    if (controller) {
+      timeoutId = setTimeout(() => {
+        controller.abort();
+      }, YOUTUBE_TITLE_FETCH_TIMEOUT_MS);
+    }
+
+    const response = await fetch(endpoint, {
+      method: "GET",
+      credentials: "omit",
+      cache: "no-store",
+      redirect: "follow",
+      signal: controller ? controller.signal : undefined,
+    });
+
+    if (!response || !response.ok) return "";
+    const json = await response.json();
+    return normalizeExtractedTitle(json && json.title ? json.title : "");
+  } catch (err) {
+    // Fallback to HTML title fetch if oEmbed fails
+    return "";
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+async function fetchHtmlTitleFromUrl(rawUrl) {
+  if (!rawUrl) return "";
+  if (!/^https?:/i.test(rawUrl)) return "";
+
+  const controller =
+    typeof AbortController === "function" ? new AbortController() : null;
+  let timeoutId = null;
+
+  try {
+    if (controller) {
+      timeoutId = setTimeout(() => {
+        controller.abort();
+      }, LINK_TITLE_FETCH_TIMEOUT_MS);
+    }
+
+    const response = await fetch(rawUrl, {
+      method: "GET",
+      credentials: "omit",
+      cache: "no-store",
+      redirect: "follow",
+      signal: controller ? controller.signal : undefined,
+      headers: { "Range": "bytes=0-51199" }, // Hanya 50KB — title sentiasa di <head>
+    });
+
+    if (!response || (!response.ok && response.status !== 206)) return "";
+
+    const contentType =
+      response.headers && response.headers.get
+        ? String(response.headers.get("content-type") || "").toLowerCase()
+        : "";
+    if (
+      contentType &&
+      !contentType.includes("text/html") &&
+      !contentType.includes("application/xhtml+xml")
+    ) {
+      return "";
+    }
+
+    let html = "";
+    if (response.body && typeof response.body.getReader === 'function') {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let bytesRead = 0;
+      const maxBytes = 51200; // 50KB limit
+      while (bytesRead < maxBytes) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        html += decoder.decode(value, { stream: true });
+        bytesRead += value.length;
+      }
+      html += decoder.decode();
+      reader.cancel().catch(() => {});
+    } else {
+      const fullHtml = await response.text();
+      html = fullHtml.length > 51200 ? fullHtml.substring(0, 51200) : fullHtml;
+    }
+    
+    if (!html) return "";
+
+    const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    if (!titleMatch || !titleMatch[1]) return "";
+
+    return normalizeExtractedTitle(titleMatch[1]);
+  } catch (err) {
+    return "";
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+async function resolveSavedItemTitle(rawUrl, preferredTitle, options) {
+  const preferred = normalizeExtractedTitle(preferredTitle);
+  const forceRemote = !!(options && options.forceRemote);
+  const safePreferred =
+    preferred &&
+      !looksLikeUrlText(preferred, rawUrl) &&
+      !isGenericFallbackTitleText(preferred)
+      ? preferred
+      : "";
+
+  // Always try YouTube oEmbed first for YouTube URLs, regardless of forceRemote
+  const isYouTube = !!extractYouTubeVideoId(rawUrl);
+  if (isYouTube) {
+    const youtubeTitle = await fetchYouTubeTitleFromOEmbed(rawUrl);
+    if (youtubeTitle && !looksLikeUrlText(youtubeTitle, rawUrl))
+      return youtubeTitle;
+    // If oEmbed fails, try HTML title fetch as fallback for YouTube
+    const htmlTitle = await fetchHtmlTitleFromUrl(rawUrl);
+    if (htmlTitle && !looksLikeUrlText(htmlTitle, rawUrl))
+      return htmlTitle;
+  }
+
+  if (!forceRemote && safePreferred) return safePreferred;
+
+  const pageTitle = await fetchHtmlTitleFromUrl(rawUrl);
+  if (pageTitle && !looksLikeUrlText(pageTitle, rawUrl)) return pageTitle;
+
+  if (safePreferred) return safePreferred;
+  return "";
+}
+
+async function resolveSavedLinkTitle(linkUrl) {
+  return resolveSavedItemTitle(linkUrl, "", { forceRemote: true });
+}
+
+// Params that indicate a playback position or timestamp within media content.
+// These do not change what the content IS, only where playback starts.
+// Applies to YouTube (t=), Vimeo (t=), Twitch (t=), podcasts, etc.
+const MEDIA_POSITION_PARAM_KEYS = new Set([
+  "t",
+  "start",
+  "time",
+  "timestamp",
+  "at",
+  "seek",
+  "position",
+]);
+
+// Params that control UI state (e.g. which tab is active, sort order, view mode)
+// and do not change the core content being saved.
+const UI_STATE_PARAM_KEYS = new Set([
+  "tab",
+  "view",
+  "sort",
+  "order",
+  "page",
+  "offset",
+  "limit",
+  "lang",
+  "locale",
+  "theme",
+  "modal",
+  "dialog",
+  "panel",
+  "sidebar",
+  "section",
+]);
+
+const YOUTUBE_HOSTNAME_PATTERN = /(?:^|\.)youtube\.com$|^youtu\.be$/i;
+
+function normalizeUrlForCompare(url) {
+  const parsed = parseUrlLenient(url);
+  if (!parsed) return "";
+  parsed.hash = "";
+  clearDefaultPort(parsed);
+  const trimmedPath = parsed.pathname.replace(/\/+$/g, "");
+  parsed.pathname = trimmedPath ? trimmedPath : "/";
+  const isYoutube = YOUTUBE_HOSTNAME_PATTERN.test(parsed.hostname || "");
+  const params = [];
+  parsed.searchParams.forEach((value, key) => {
+    const normalizedKey = String(key || "").toLowerCase();
+    if (!normalizedKey) return;
+    if (normalizedKey.startsWith("utm_")) return;
+    if (TRACKING_QUERY_PARAM_KEYS.has(normalizedKey)) return;
+    // Strip media position params universally — they indicate where playback
+    // starts but do not change what content is being saved (YouTube t=,
+    // Vimeo t=, Twitch t=, podcast players, etc.).
+    if (MEDIA_POSITION_PARAM_KEYS.has(normalizedKey)) return;
+    // Strip UI state params that don't affect the actual content being saved
+    // but can cause the same article/page to appear as a different URL.
+    // Only strip these for non-YouTube hosts where they are unlikely to be
+    // meaningful content discriminators (YouTube uses "tab" legitimately on
+    // channel pages, so keep them for YouTube).
+    if (!isYoutube && UI_STATE_PARAM_KEYS.has(normalizedKey)) return;
+    params.push([key, value]);
+  });
+  if (params.length) {
+    params.sort((a, b) => {
+      const keyOrder = a[0].localeCompare(b[0]);
+      if (keyOrder !== 0) return keyOrder;
+      return a[1].localeCompare(b[1]);
+    });
+    const normalizedParams = new URLSearchParams();
+    for (const [key, value] of params) {
+      normalizedParams.append(key, value);
+    }
+    parsed.search = `?${normalizedParams.toString()}`;
+  } else {
+    parsed.search = "";
+  }
+  return parsed.toString();
+}
+
+function normalizePathnameForCompare(pathname) {
+  const trimmedPath = String(pathname || "").replace(/\/+$/g, "");
+  return trimmedPath ? trimmedPath : "/";
+}
+
+function stripIndexFromPathname(pathname) {
+  const normalizedPath = normalizePathnameForCompare(pathname);
+  const parts = normalizedPath.split("/");
+  const last = parts.length ? parts[parts.length - 1].toLowerCase() : "";
+  if (!DEFAULT_INDEX_FILENAMES.has(last)) return normalizedPath;
+  parts.pop();
+  const parent = parts.join("/");
+  return normalizePathnameForCompare(parent);
+}
+
+function buildHostCompareCandidates(hostname) {
+  const base = String(hostname || "").toLowerCase();
+  const candidates = new Set();
+  if (!base) return candidates;
+
+  const root = base.startsWith("www.") ? base.slice(4) : base;
+  if (root) {
+    candidates.add(root);
+    candidates.add(`www.${root}`);
+  }
+  candidates.add(base);
+
+  // Removed mobile/amp prefixes to reduce candidate explosion
+  return candidates;
+}
+
+function buildUrlCompareCandidates(url) {
+  const normalized = normalizeUrlForCompare(url);
+  if (urlCompareCandidatesCache.has(normalized)) {
+    return urlCompareCandidatesCache.get(normalized);
+  }
+  const candidates = new Set();
+  if (!normalized) return candidates;
+  candidates.add(normalized);
+  try {
+    const parsed = new URL(normalized);
+    clearDefaultPort(parsed);
+
+    const protocolCandidates = new Set([parsed.protocol]);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+      protocolCandidates.add("http:");
+      protocolCandidates.add("https:");
+    }
+
+    const hostCandidates = buildHostCompareCandidates(parsed.hostname);
+
+    const pathCandidates = new Set([
+      normalizePathnameForCompare(parsed.pathname),
+    ]);
+    pathCandidates.add(stripIndexFromPathname(parsed.pathname));
+
+    for (const protocol of protocolCandidates) {
+      for (const host of hostCandidates) {
+        for (const pathname of pathCandidates) {
+          if (!host || !pathname) continue;
+          const variant = new URL(normalized);
+          variant.protocol = protocol;
+          variant.hostname = host;
+          variant.pathname = pathname;
+          clearDefaultPort(variant);
+          candidates.add(variant.toString());
+        }
+      }
+    }
+
+    // Removed YouTube special handling to reduce candidate explosion
+  } catch (err) {
+    // keep base normalized candidate only
+  }
+  if (urlCompareCandidatesCache.size >= 5000) {
+    var firstKey = urlCompareCandidatesCache.keys().next().value;
+    if (firstKey !== undefined) urlCompareCandidatesCache.delete(firstKey);
+  }
+  urlCompareCandidatesCache.set(normalized, candidates);
+  return candidates;
+}
+
+function urlsMatchForSave(urlA, urlB) {
+  if (!urlA || !urlB) return false;
+  const aCandidates = buildUrlCompareCandidates(urlA);
+  if (!aCandidates.size) return false;
+  const bCandidates = buildUrlCompareCandidates(urlB);
+  if (!bCandidates.size) return false;
+  for (const key of aCandidates) {
+    if (bCandidates.has(key)) return true;
+  }
+  return false;
+}
+
+function toFiniteTimestamp(value) {
+  if (!value) return 0;
+  const time = Date.parse(String(value));
+  return Number.isFinite(time) ? time : 0;
+}
+
+function pickLongerTextValue(primary, secondary) {
+  const first = primary ? String(primary) : "";
+  const second = secondary ? String(secondary) : "";
+  if (!first) return second;
+  if (!second) return first;
+  return second.length > first.length ? second : first;
+}
+
+function mergeCollectionById(primaryList, duplicateList, maxSize) {
+  const source = [...coerceArray(primaryList), ...coerceArray(duplicateList)];
+  const merged = [];
+  const seen = new Set();
+  source.forEach((entry) => {
+    if (!entry || typeof entry !== "object") return;
+    const id = entry.id ? String(entry.id) : "";
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    merged.push(entry);
+  });
+  return Number.isFinite(maxSize) && maxSize > 0
+    ? merged.slice(0, maxSize)
+    : merged;
+}
+
+function pickLatestReadingProgress(primaryProgress, duplicateProgress) {
+  const first =
+    primaryProgress && typeof primaryProgress === "object"
+      ? primaryProgress
+      : null;
+  const second =
+    duplicateProgress && typeof duplicateProgress === "object"
+      ? duplicateProgress
+      : null;
+  if (!first && !second) return null;
+  if (!first) return second;
+  if (!second) return first;
+  const firstUpdated = toFiniteTimestamp(first.updatedAt);
+  const secondUpdated = toFiniteTimestamp(second.updatedAt);
+  const merged =
+    secondUpdated > firstUpdated
+      ? { ...first, ...second }
+      : { ...second, ...first };
+  const percent = Number(merged.percent);
+  merged.completed =
+    merged.completed === true || (Number.isFinite(percent) && percent >= 99.5);
+  return merged;
+}
+
+function pickLatestWritingDraft(primaryDraft, duplicateDraft) {
+  const first =
+    primaryDraft && typeof primaryDraft === "object" ? primaryDraft : null;
+  const second =
+    duplicateDraft && typeof duplicateDraft === "object" ? duplicateDraft : null;
+  if (!first && !second) return null;
+  if (!first) return second;
+  if (!second) return first;
+  const firstUpdated = toFiniteTimestamp(first.updatedAt);
+  const secondUpdated = toFiniteTimestamp(second.updatedAt);
+  if (secondUpdated > firstUpdated) return { ...second };
+  if (firstUpdated > secondUpdated) return { ...first };
+  return String(second.text || "").length > String(first.text || "").length
+    ? { ...second }
+    : { ...first };
+}
+
+function looksLikeUrlText(text, referenceUrl) {
+  const raw = text ? String(text).trim() : "";
+  if (!raw) return false;
+  if (!referenceUrl) {
+    return (
+      /^https?:\/\//i.test(raw) ||
+      /^[a-z0-9.-]+\.[a-z]{2,}(?:[/:?#]|$)/i.test(raw)
+    );
+  }
+  if (urlsMatchForSave(raw, referenceUrl)) return true;
+  return false;
+}
+
+function isGenericFallbackTitleText(text) {
+  const normalized = normalizeExtractedTitle(text).toLowerCase();
+  if (!normalized) return false;
+  // Boolean strings or single-char values are not real titles
+  if (normalized === "true" || normalized === "false" || normalized === "1" || normalized === "0") return true;
+  // Pure duration text (e.g. "5:30", "1:02:30") bukan tajuk
+  if (/^\d+:\d{2}(?::\d{2})?$/.test(normalized.replace(/^▶\s*/, ""))) return true;
+  return normalized === "saved link" || normalized.startsWith("link from ");
+}
+
+function chooseMergedTitle(primaryTitle, secondaryTitle, referenceUrl) {
+  const first = normalizeExtractedTitle(primaryTitle);
+  const second = normalizeExtractedTitle(secondaryTitle);
+  if (!first) return second;
+  if (!second) return first;
+  const firstLooksUrl = looksLikeUrlText(first, referenceUrl);
+  const secondLooksUrl = looksLikeUrlText(second, referenceUrl);
+  if (firstLooksUrl && !secondLooksUrl) return second;
+  if (!firstLooksUrl && secondLooksUrl) return first;
+  if (second.length > first.length + 4) return second;
+  return first;
+}
+
+function mergeDuplicateItems(primaryItem, duplicateItem) {
+  const primary =
+    primaryItem && typeof primaryItem === "object" ? primaryItem : {};
+  const duplicate =
+    duplicateItem && typeof duplicateItem === "object" ? duplicateItem : {};
+  const merged = { ...primary };
+
+  if (!merged.id && duplicate.id) merged.id = duplicate.id;
+  if (!merged.url && duplicate.url) merged.url = duplicate.url;
+  if (!merged.siteName && duplicate.siteName)
+    merged.siteName = duplicate.siteName;
+  if (!merged.byline && duplicate.byline) merged.byline = duplicate.byline;
+  if (!merged.lang && duplicate.lang) merged.lang = duplicate.lang;
+  if (!merged.faviconUrl && duplicate.faviconUrl)
+    merged.faviconUrl = duplicate.faviconUrl;
+  if (!merged.thumbnailUrl && duplicate.thumbnailUrl)
+    merged.thumbnailUrl = duplicate.thumbnailUrl;
+  if (!merged.youtubeThumbnailUrl && duplicate.youtubeThumbnailUrl)
+    merged.youtubeThumbnailUrl = duplicate.youtubeThumbnailUrl;
+  if (
+    (!merged.categoryId || String(merged.categoryId) === "") &&
+    duplicate.categoryId
+  ) {
+    merged.categoryId = String(duplicate.categoryId);
+  }
+
+  merged.title = chooseMergedTitle(
+    primary.title,
+    duplicate.title,
+    merged.url || primary.url || duplicate.url || "",
+  );
+  merged.excerpt = pickLongerTextValue(primary.excerpt, duplicate.excerpt);
+  merged.content = pickLongerTextValue(primary.content, duplicate.content);
+  merged.textContent = pickLongerTextValue(
+    primary.textContent,
+    duplicate.textContent,
+  );
+
+  merged.wordCount = Math.max(
+    Number.isFinite(Number(primary.wordCount)) ? Number(primary.wordCount) : 0,
+    Number.isFinite(Number(duplicate.wordCount))
+      ? Number(duplicate.wordCount)
+      : 0,
+  );
+  merged.readingTime = Math.max(
+    Number.isFinite(Number(primary.readingTime))
+      ? Number(primary.readingTime)
+      : 0,
+    Number.isFinite(Number(duplicate.readingTime))
+      ? Number(duplicate.readingTime)
+      : 0,
+  );
+  const mergedProgress = pickLatestReadingProgress(
+    primary.readingProgress,
+    duplicate.readingProgress,
+  );
+  if (mergedProgress) {
+    merged.readingProgress = mergedProgress;
+  }
+  const mergedNotes = mergeCollectionById(primary.notes, duplicate.notes, 200);
+  if (
+    mergedNotes.length ||
+    Array.isArray(primary.notes) ||
+    Array.isArray(duplicate.notes)
+  ) {
+    merged.notes = mergedNotes;
+  }
+  const mergedHighlights = mergeCollectionById(
+    primary.highlights,
+    duplicate.highlights,
+    300,
+  );
+  if (
+    mergedHighlights.length ||
+    Array.isArray(primary.highlights) ||
+    Array.isArray(duplicate.highlights)
+  ) {
+    merged.highlights = mergedHighlights;
+  }
+  const mergedWritingDraft = pickLatestWritingDraft(
+    primary.writingDraft,
+    duplicate.writingDraft,
+  );
+  if (mergedWritingDraft) {
+    merged.writingDraft = mergedWritingDraft;
+  }
+  merged.favorite = !!(primary.favorite || duplicate.favorite);
+
+  const primarySavedAt = toFiniteTimestamp(primary.savedAt);
+  const duplicateSavedAt = toFiniteTimestamp(duplicate.savedAt);
+  if (duplicateSavedAt > primarySavedAt && duplicate.savedAt) {
+    merged.savedAt = duplicate.savedAt;
+  }
+
+  if (getManualOrderValue(merged) === null) {
+    const duplicateManualOrder = getManualOrderValue(duplicate);
+    if (duplicateManualOrder !== null) {
+      merged.manualOrder = duplicateManualOrder;
+    }
+  }
+  if (getFavoriteOrderValue(merged) === null) {
+    const duplicateFavoriteOrder = getFavoriteOrderValue(duplicate);
+    if (duplicateFavoriteOrder !== null) {
+      merged.favoriteOrder = duplicateFavoriteOrder;
+    }
+  }
+
+  return merged;
+}
+
+function dedupeItemsByUrl(items) {
+  if (dedupeCore && typeof dedupeCore.dedupeItemsByUrl === "function") {
+    return dedupeCore.dedupeItemsByUrl(items, {
+      coerceArray,
+      normalizeUrl,
+      buildUrlCompareCandidates,
+      mergeDuplicateItems,
+    });
+  }
+  const source = coerceArray(items);
+  const deduped = [];
+  const candidateToIndex = new Map();
+  let changed = false;
+
+  source.forEach((rawItem) => {
+    if (!rawItem || typeof rawItem !== "object") {
+      deduped.push(rawItem);
+      return;
+    }
+    const normalizedUrl = rawItem.url ? normalizeUrl(rawItem.url) : "";
+    const item =
+      normalizedUrl && normalizedUrl !== rawItem.url
+        ? { ...rawItem, url: normalizedUrl }
+        : rawItem;
+    if (item !== rawItem) changed = true;
+
+    const candidates = buildUrlCompareCandidates(item.url);
+    let existingIndex = -1;
+    if (candidates.size) {
+      for (const candidate of candidates) {
+        if (candidateToIndex.has(candidate)) {
+          existingIndex = candidateToIndex.get(candidate);
+          break;
+        }
+      }
+    }
+
+    if (existingIndex < 0) {
+      const nextIndex = deduped.length;
+      deduped.push(item);
+      if (candidates.size) {
+        candidates.forEach((candidate) => {
+          candidateToIndex.set(candidate, nextIndex);
+        });
+      }
+      return;
+    }
+
+    changed = true;
+    const merged = mergeDuplicateItems(deduped[existingIndex], item);
+    deduped[existingIndex] = merged;
+    const mergedCandidates = buildUrlCompareCandidates(
+      merged && merged.url ? merged.url : "",
+    );
+    if (mergedCandidates.size) {
+      mergedCandidates.forEach((candidate) => {
+        candidateToIndex.set(candidate, existingIndex);
+      });
+    }
+  });
+
+  return {
+    items: deduped,
+    changed,
+  };
+}
+
+function ensureManualOrderDefaults(items) {
+  const source = Array.isArray(items) ? items.slice() : [];
+  const next = source.slice();
+  const orderByCat = new Map(); // categoryId -> next index
+  let changed = false;
+  next.forEach((item, idx) => {
+    if (!item || !item.id) return;
+    const catId = item.categoryId ? String(item.categoryId) : "";
+    const manual = getManualOrderValue(item);
+    if (manual !== null) {
+      const nextIndex = (orderByCat.get(catId) || 0) + 1;
+      orderByCat.set(catId, nextIndex);
+      return;
+    }
+    const order = orderByCat.get(catId) || 0;
+    const withOrder = { ...item, manualOrder: order };
+    next[idx] = withOrder;
+    orderByCat.set(catId, order + 1);
+    changed = true;
+  });
+  return { items: next, changed };
+}
+
+function makeId(url) {
+  try {
+    return btoa(unescape(encodeURIComponent(url))).replace(/=+$/g, "");
+  } catch (err) {
+    return String(Date.now());
+  }
+}
+
+async function getItems() {
+  if (hasCachedItems) {
+    return Array.isArray(cachedItems) ? cachedItems : [];
+  }
+  // Use promise caching to prevent race conditions
+  if (cachedItemsPromise) {
+    return cachedItemsPromise;
+  }
+  cachedItemsPromise = loadItemsFromPrimaryStore().then((items) => {
+    cachedItems = items;
+    hasCachedItems = true;
+    buildUrlIndexCache(items);
+    cachedItemsPromise = null;
+    return items;
+  }).catch((err) => {
+    cachedItemsPromise = null;
+    throw err;
+  });
+  return cachedItemsPromise;
+}
+
+async function isItemsIndexedDbAvailable() {
+  if (
+    !itemsIndexedDbStore ||
+    typeof itemsIndexedDbStore.isAvailable !== "function"
+  ) {
+    return false;
+  }
+  if (typeof itemsIndexedDbAvailability === "boolean") {
+    return itemsIndexedDbAvailability;
+  }
+  try {
+    itemsIndexedDbAvailability = await itemsIndexedDbStore.isAvailable();
+  } catch (err) {
+    itemsIndexedDbAvailability = false;
+  }
+  return itemsIndexedDbAvailability;
+}
+
+async function loadItemsFromPrimaryStore() {
+  const useIndexedDb = await isItemsIndexedDbAvailable();
+
+  // Try IndexedDB first (fast path)
+  if (useIndexedDb && itemsIndexedDbStore && typeof itemsIndexedDbStore.list === "function") {
+    try {
+      const indexedDbItems = await itemsIndexedDbStore.list();
+      if (indexedDbItems && indexedDbItems.length > 0) {
+        return indexedDbItems;
+      }
+    } catch (err) {
+      // fallback to storage.local on error
+    }
+  }
+
+  // Fallback to storage.local (slow path)
+  const storageData = await lpStoreGet(ITEM_KEY);
+  const storageItems = coerceArray(storageData[ITEM_KEY]);
+
+  if (useIndexedDb && itemsIndexedDbStore && typeof itemsIndexedDbStore.replaceAll === "function" && storageItems.length > 0) {
+    try {
+      await itemsIndexedDbStore.replaceAll(storageItems);
+    } catch (err) {
+      // ignore
+    }
+  }
+  return storageItems;
+}
+
+async function getSelectedCategoryId() {
+  if (cachedSelectedCategoryId !== null) return cachedSelectedCategoryId;
+  const data = await lpApi.storage.local.get(SELECTED_CATEGORY_KEY);
+  cachedSelectedCategoryId = data[SELECTED_CATEGORY_KEY] || "";
+  return cachedSelectedCategoryId;
+}
+
+function normalizeCategoryIdForSave(id) {
+  if (!id || id === "none" || id === "all") return "";
+  return id;
+}
+
+async function getContextMenuSaveCategoryId() {
+  const settings = await getSettings();
+  let cid = "";
+  if (settings && settings.contextMenuSaveToUncategorized === true) {
+    cid = "";
+  } else {
+    cid = normalizeCategoryIdForSave(await getSelectedCategoryId());
+  }
+
+  // Jika hidden categories kelihatan (>=1), paksa ke realm hidden
+  if (settings.showHiddenCategories >= 1) {
+    if (!cid) {
+      cid = "hidden_none";
+    } else {
+      const cats = await getCachedCategories();
+      const isHidden = cats.some(c => c && c.id === cid && c.hidden);
+      if (!isHidden && cid !== "hidden_none") {
+        cid = "hidden_none";
+      }
+    }
+  }
+  return cid;
+}
+
+function normalizeCategoryNameForMatch(value) {
+  return value ? String(value).trim().toLowerCase() : "";
+}
+
+function buildAutoCategoryHaystack(candidate) {
+  if (!candidate || typeof candidate !== "object") return "";
+  const url = candidate.url ? String(candidate.url) : "";
+  const title = candidate.title ? String(candidate.title) : "";
+  const siteName = candidate.siteName ? String(candidate.siteName) : "";
+  return `${url}\n${title}\n${siteName}`.toLowerCase();
+}
+
+function normalizeCategoryAutoRuleList(value) {
+  if (
+    categoryAutoRuleCore &&
+    typeof categoryAutoRuleCore.normalizeRules === "function"
+  ) {
+    return categoryAutoRuleCore.normalizeRules(value);
+  }
+  const entries = Array.isArray(value) ? value : [];
+  const normalized = [];
+  const seen = new Set();
+  entries.forEach((entry) => {
+    if (!entry || typeof entry !== "object") return;
+    const pattern = entry.pattern ? String(entry.pattern).trim() : "";
+    const category = entry.category ? String(entry.category).trim() : "";
+    if (!pattern || !category) return;
+    const key = `${pattern.toLowerCase()}=>${category.toLowerCase()}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    normalized.push({
+      pattern: pattern.slice(0, 160),
+      category: category.slice(0, 120),
+    });
+  });
+  return normalized.slice(0, 100);
+}
+
+function matchesAutoCategoryRuleCandidate(rule, candidate) {
+  if (!rule || typeof rule !== "object") return false;
+  if (
+    categoryAutoRuleCore &&
+    typeof categoryAutoRuleCore.ruleMatchesCandidate === "function"
+  ) {
+    return categoryAutoRuleCore.ruleMatchesCandidate(rule, candidate);
+  }
+  const haystack = buildAutoCategoryHaystack(candidate);
+  if (!haystack) return false;
+  const pattern = rule.pattern ? String(rule.pattern).toLowerCase() : "";
+  if (!pattern) return false;
+  return haystack.includes(pattern);
+}
+
+async function resolveAutoCategoryIdForCandidate(candidate, options = {}) {
+  const report = await resolveAutoCategoryMatchReportForCandidate(
+    candidate,
+    options,
+  );
+  return report && report.categoryId ? report.categoryId : "";
+}
+
+function buildAutoCategoryCandidate(input) {
+  const safeInput = input && typeof input === "object" ? input : {};
+  const rawUrl = safeInput.url ? String(safeInput.url) : "";
+  const normalizedUrl = normalizeUrl(rawUrl) || rawUrl;
+  return {
+    url: normalizedUrl,
+    title: safeInput.title ? normalizeExtractedTitle(safeInput.title) : "",
+    siteName: safeInput.siteName
+      ? String(safeInput.siteName)
+      : siteNameFromUrl(normalizedUrl),
+  };
+}
+
+function buildAiCategoryPromptCategoryHints(categories, rules) {
+  const safeCategories = Array.isArray(categories) ? categories : [];
+  const normalizedRules = normalizeCategoryAutoRuleList(rules);
+  let promptRules = normalizedRules.slice();
+  if (
+    categoryAutoRuleCore &&
+    typeof categoryAutoRuleCore.generateStarterRules === "function"
+  ) {
+    try {
+      const starterReport = categoryAutoRuleCore.generateStarterRules(
+        safeCategories,
+        normalizedRules,
+      );
+      if (starterReport && Array.isArray(starterReport.rules)) {
+        promptRules = normalizeCategoryAutoRuleList(starterReport.rules);
+      }
+    } catch (err) {
+      promptRules = normalizedRules.slice();
+    }
+  }
+
+  const hintsByCategory = new Map();
+  promptRules.forEach((rule) => {
+    if (!rule || !rule.category || !rule.pattern) return;
+    const key = normalizeCategoryNameForMatch(rule.category);
+    if (!key) return;
+    if (!hintsByCategory.has(key)) {
+      hintsByCategory.set(key, []);
+    }
+    const hints = hintsByCategory.get(key);
+    const pattern = String(rule.pattern).trim();
+    if (!pattern || hints.includes(pattern)) return;
+    hints.push(pattern);
+  });
+
+  return safeCategories.map((category) => {
+    const name = category && category.name ? String(category.name).trim() : "";
+    const key = normalizeCategoryNameForMatch(name);
+    const hints = key && hintsByCategory.has(key)
+      ? hintsByCategory.get(key).slice(0, 3)
+      : [];
+    return { name, hints };
+  });
+}
+
+function buildAiCategoryTopCandidateHints(rankedMatches) {
+  const list = Array.isArray(rankedMatches) ? rankedMatches : [];
+  return list.slice(0, 5).map((entry) => ({
+    category: entry && entry.category ? String(entry.category) : "",
+    score: entry && Number.isFinite(entry.score) ? Number(entry.score) : 0,
+    explicitScore:
+      entry && Number.isFinite(entry.explicitScore)
+        ? Number(entry.explicitScore)
+        : 0,
+    contextScore:
+      entry && Number.isFinite(entry.contextScore)
+        ? Number(entry.contextScore)
+        : 0,
+  }));
+}
+
+function buildAiCategorySessionId() {
+  return `${prefix}${Date.now().toString(36)}-${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
+}
+
+async function resolveAutoCategoryMatchReportForCandidate(candidate, options = {}) {
+  const safeOptions = options && typeof options === "object" ? options : {};
+  const settings =
+    safeOptions.settings && typeof safeOptions.settings === "object"
+      ? safeOptions.settings
+      : await getSettings();
+  const autoCategoryRulesEnabled =
+    !settings || settings.categoryAutoRulesEnabled !== false;
+  const rules = normalizeCategoryAutoRuleList(
+    autoCategoryRulesEnabled && settings ? settings.categoryAutoRules : [],
+  );
+
+  const categories = Array.isArray(safeOptions.categories)
+    ? safeOptions.categories
+    : coerceArray((await lpStoreGet(CATEGORY_KEY))[CATEGORY_KEY]);
+  if (!autoCategoryRulesEnabled) {
+    return {
+      categoryId: "",
+      categoryName: "",
+      categories,
+      rules,
+      settings,
+      rankedMatches: [],
+      topMatch: null,
+    };
+  }
+  if (!categories.length) {
+    return {
+      categoryId: "",
+      categoryName: "",
+      categories: [],
+      rules,
+      settings,
+      rankedMatches: [],
+      topMatch: null,
+    };
+  }
+
+  const categoryNameMap = new Map();
+  categories.forEach((cat) => {
+    if (!cat || !cat.id) return;
+    const normalizedName = normalizeCategoryNameForMatch(cat.name);
+    if (!normalizedName || categoryNameMap.has(normalizedName)) return;
+    categoryNameMap.set(normalizedName, String(cat.id));
+  });
+  if (!categoryNameMap.size) {
+    return {
+      categoryId: "",
+      categoryName: "",
+      categories,
+      rules,
+      settings,
+      rankedMatches: [],
+      topMatch: null,
+    };
+  }
+
+  let rankedMatches = [];
+  if (
+    categoryAutoRuleCore &&
+    typeof categoryAutoRuleCore.rankResolvedCategoryMatches === "function"
+  ) {
+    rankedMatches = categoryAutoRuleCore.rankResolvedCategoryMatches(
+      rules,
+      categories,
+      candidate,
+    ).map((entry) => {
+      const categoryName = entry && entry.category ? String(entry.category) : "";
+      const categoryId = categoryNameMap.get(
+        normalizeCategoryNameForMatch(categoryName),
+      ) || "";
+      return {
+        ...entry,
+        category: categoryName,
+        categoryId,
+      };
+    });
+  }
+  const topMatch = rankedMatches.length ? rankedMatches[0] : null;
+  if (topMatch && topMatch.categoryId) {
+    return {
+      categoryId: topMatch.categoryId,
+      categoryName: topMatch.category,
+      categories,
+      rules,
+      settings,
+      rankedMatches,
+      topMatch,
+    };
+  }
+
+  if (
+    categoryAutoRuleCore &&
+    typeof categoryAutoRuleCore.findResolvedCategoryMatch === "function"
+  ) {
+    const matchedCategory = categoryAutoRuleCore.findResolvedCategoryMatch(
+      rules,
+      categories,
+      candidate,
+    );
+    if (matchedCategory && matchedCategory.category) {
+      const categoryId = categoryNameMap.get(
+        normalizeCategoryNameForMatch(matchedCategory.category),
+      );
+      if (categoryId) {
+        return {
+          categoryId,
+          categoryName: matchedCategory.category,
+          categories,
+          rules,
+          settings,
+          rankedMatches,
+          topMatch:
+            topMatch ||
+            Object.assign({}, matchedCategory, {
+              categoryId,
+            }),
+        };
+      }
+    }
+    return {
+      categoryId: "",
+      categoryName: "",
+      categories,
+      rules,
+      settings,
+      rankedMatches,
+      topMatch,
+    };
+  }
+
+  if (
+    categoryAutoRuleCore &&
+    typeof categoryAutoRuleCore.findMatchingRule === "function"
+  ) {
+    const matchedRule = categoryAutoRuleCore.findMatchingRule(rules, candidate);
+    if (matchedRule && matchedRule.category) {
+      const categoryId = categoryNameMap.get(
+        normalizeCategoryNameForMatch(matchedRule.category),
+      );
+      if (categoryId) {
+        return {
+          categoryId,
+          categoryName: matchedRule.category,
+          categories,
+          rules,
+          settings,
+          rankedMatches,
+          topMatch,
+        };
+      }
+    }
+    return {
+      categoryId: "",
+      categoryName: "",
+      categories,
+      rules,
+      settings,
+      rankedMatches,
+      topMatch,
+    };
+  }
+
+  for (const rule of rules) {
+    if (!rule || !rule.pattern || !rule.category) continue;
+    if (!matchesAutoCategoryRuleCandidate(rule, candidate)) continue;
+    const categoryId = categoryNameMap.get(
+      normalizeCategoryNameForMatch(rule.category),
+    );
+    if (categoryId) {
+      return {
+        categoryId,
+        categoryName: rule.category,
+        categories,
+        rules,
+        settings,
+        rankedMatches,
+        topMatch,
+      };
+    }
+  }
+  return {
+    categoryId: "",
+    categoryName: "",
+    categories,
+    rules,
+    settings,
+    rankedMatches,
+    topMatch,
+  };
+}
+
+function clearAiCategoryQueueTimer() {
+  if (!aiCategoryQueueTimer) return;
+  clearTimeout(aiCategoryQueueTimer);
+  aiCategoryQueueTimer = null;
+}
+
+function scheduleAiCategoryQueue(delayMs = 600) {
+  clearAiCategoryQueueTimer();
+  aiCategoryQueueTimer = setTimeout(() => {
+    aiCategoryQueueTimer = null;
+    processAiCategoryQueue().catch(() => { });
+  }, Number.isFinite(delayMs) ? delayMs : 600);
+}
+
+function closeAiCategorySessionTab(session) {
+  const tabId =
+    session && typeof session.tabId === "number" ? session.tabId : null;
+  if (tabId === null || !lpApi.tabs || !lpApi.tabs.remove) {
+    return Promise.resolve(false);
+  }
+  return Promise.resolve(lpApi.tabs.remove(tabId))
+    .then(() => true)
+    .catch(() => false);
+}
+
+function finalizeAiCategorySession(sessionId, options = {}) {
+  const key = sessionId ? String(sessionId) : "";
+  if (!key) return;
+  const session = pendingAiCategorySessionsById.get(key);
+  if (!session) return;
+  pendingAiCategorySessionsById.delete(key);
+  if (session.timeoutTimer) {
+    clearTimeout(session.timeoutTimer);
+  }
+  if (activeAiCategorySessionId === key) {
+    activeAiCategorySessionId = "";
+  }
+  if (
+    pendingSidebarPromptData
+    && pendingSidebarPromptData.sessionId
+    && String(pendingSidebarPromptData.sessionId) === key
+  ) {
+    clearPendingSidebarPromptData();
+    clearPendingSidebarProviderOverride();
+  }
+  if (options.closeTab !== false) {
+    closeAiCategorySessionTab(session).catch(() => { });
+  }
+  scheduleAiCategoryQueue(250);
+}
+
+async function applyAiCategoryResultToItem(session, parsedResult) {
+  if (!session || !parsedResult || parsedResult.ok !== true) return false;
+  if (!parsedResult.category) return false;
+  if (
+    parsedResult.confidence <
+    Number(session.minConfidence || DEFAULT_SETTINGS.aiAutoCategoryMinConfidence)
+  ) {
+    return false;
+  }
+  const categories = Array.isArray(session.categories) ? session.categories : [];
+  const targetCategory = categories.find((entry) => (
+    entry
+    && entry.id
+    && normalizeCategoryNameForMatch(entry.name)
+    === normalizeCategoryNameForMatch(parsedResult.category)
+  ));
+  if (!targetCategory || !targetCategory.id) return false;
+
+  const items = await getItems();
+  const itemIndex = items.findIndex((entry) => entry && entry.id === session.itemId);
+  if (itemIndex < 0) return false;
+  const item = items[itemIndex];
+  const currentCategoryId = item && item.categoryId ? String(item.categoryId) : "";
+  if (currentCategoryId !== String(session.initialCategoryId || "")) {
+    return false;
+  }
+  const nextCategoryId = String(targetCategory.id);
+  if (currentCategoryId === nextCategoryId) {
+    return false;
+  }
+  const manualOrder = computeManualOrderForCategory(
+    items,
+    nextCategoryId,
+    "prepend",
+  );
+  const nextItem = withManualOrder(
+    {
+      ...item,
+      categoryId: nextCategoryId,
+    },
+    manualOrder,
+  );
+  const nextItems = items.slice();
+  nextItems[itemIndex] = nextItem;
+  await setItems(nextItems, { previousItems: items });
+  return true;
+}
+
+async function handleAiCategoryClassificationResultMessage(payload) {
+  const safePayload = payload && typeof payload === "object" ? payload : {};
+  const sessionId = safePayload.sessionId ? String(safePayload.sessionId) : "";
+  if (!sessionId || !pendingAiCategorySessionsById.has(sessionId)) {
+    return { ok: false, reason: "unknown-session" };
+  }
+  const session = pendingAiCategorySessionsById.get(sessionId);
+  const categories = Array.isArray(session.categories) ? session.categories : [];
+  const parsedResult = { ok: false, reason: "core-unavailable" };
+
+  let applied = false;
+  if (parsedResult && parsedResult.ok === true) {
+    try {
+      applied = await applyAiCategoryResultToItem(session, parsedResult);
+    } catch (err) {
+      applied = false;
+    }
+  }
+  finalizeAiCategorySession(sessionId);
+  return {
+    ok: true,
+    applied,
+    parsed: parsedResult,
+  };
+}
+
+function handleAiCategoryClassificationErrorMessage(payload) {
+  const safePayload = payload && typeof payload === "object" ? payload : {};
+  const sessionId = safePayload.sessionId ? String(safePayload.sessionId) : "";
+  if (!sessionId || !pendingAiCategorySessionsById.has(sessionId)) {
+    return { ok: false, reason: "unknown-session" };
+  }
+  finalizeAiCategorySession(sessionId);
+  return { ok: true };
+}
+
+function enqueueAiCategoryClassification(input) {
+  const safeInput = input && typeof input === "object" ? input : {};
+  pendingAiCategoryQueue.push(safeInput);
+  scheduleAiCategoryQueue(120);
+}
+
+function queueAiCategoryClassificationFromReport(input) {
+  const safeInput = input && typeof input === "object" ? input : {};
+  const report =
+    safeInput.report && typeof safeInput.report === "object"
+      ? safeInput.report
+      : null;
+  const itemId = safeInput.itemId ? String(safeInput.itemId) : "";
+  if (!report || !itemId) return false;
+  return maybeQueueAiCategoryClassification({
+    itemId,
+    initialCategoryId: safeInput.initialCategoryId || "",
+    candidate: safeInput.candidate,
+    categories: Array.isArray(report.categories) ? report.categories : [],
+    rules: Array.isArray(report.rules) ? report.rules : [],
+    rankedMatches: Array.isArray(report.rankedMatches)
+      ? report.rankedMatches
+      : [],
+    settings:
+      report.settings && typeof report.settings === "object"
+        ? report.settings
+        : safeInput.settings,
+  });
+}
+
+async function processAiCategoryQueue() {
+  if (activeAiCategorySessionId) return false;
+  if (!pendingAiCategoryQueue.length) return false;
+  if (pendingSidebarPromptData) {
+    scheduleAiCategoryQueue(1200);
+    return false;
+  }
+
+  const next = pendingAiCategoryQueue.shift();
+  if (!next || !next.itemId || !next.settings || !next.candidate) {
+    scheduleAiCategoryQueue(60);
+    return false;
+  }
+  const provider = normalizeSummaryAiProvider(
+    next.settings && next.settings.sidebarAiProvider
+      ? next.settings.sidebarAiProvider
+      : "chatgpt",
+  );
+  const sessionId = buildAiCategorySessionId();
+  const promptText = "";
+  if (!promptText.trim()) {
+    scheduleAiCategoryQueue(60);
+    return false;
+  }
+
+  activeAiCategorySessionId = sessionId;
+  const timeoutTimer = setTimeout(() => {
+    finalizeAiCategorySession(sessionId);
+  }, AI_CATEGORY_TAB_TIMEOUT_MS);
+
+  pendingAiCategorySessionsById.set(sessionId, {
+    sessionId,
+    itemId: String(next.itemId),
+    initialCategoryId: String(next.initialCategoryId || ""),
+    candidate: next.candidate,
+    categories: Array.isArray(next.categories) ? next.categories.slice() : [],
+    provider,
+    minConfidence:
+      next.settings && next.settings.aiAutoCategoryMinConfidence
+        ? next.settings.aiAutoCategoryMinConfidence
+        : DEFAULT_SETTINGS.aiAutoCategoryMinConfidence,
+    timeoutTimer,
+    tabId: null,
+  });
+
+  try {
+    await setPendingSidebarPromptData({
+      text: promptText,
+      sessionId,
+      provider,
+    });
+    const targetUrl = buildSummaryAiPromptUrl(provider, "", {
+      includeSidebarFlag: true,
+    });
+    const created = await lpApi.tabs.create({
+      url: targetUrl,
+      active: false,
+    });
+    const session = pendingAiCategorySessionsById.get(sessionId);
+    if (session) {
+      session.tabId = created && created.id ? created.id : null;
+    }
+  } catch (err) {
+    await clearPendingSidebarPromptData();
+    finalizeAiCategorySession(sessionId);
+    return false;
+  }
+  return true;
+}
+
+function maybeQueueAiCategoryClassification(input) {
+  const safeInput = input && typeof input === "object" ? input : {};
+  const settings =
+    safeInput.settings && typeof safeInput.settings === "object"
+      ? safeInput.settings
+      : null;
+  if (
+    !settings
+    || settings.aiAutoCategoryEnabled !== true
+    || settings.categoryAutoRulesEnabled === false
+  ) {
+    return false;
+  }
+  return false;
+}
+
+function clearPendingContextMenuCategory(tabId) {
+  if (!Number.isInteger(tabId) && typeof tabId !== "number") return;
+  pendingContextMenuCategoryByTabId.delete(tabId);
+  const timer = pendingContextMenuCategoryCleanupTimers.get(tabId);
+  if (timer) {
+    clearTimeout(timer);
+    pendingContextMenuCategoryCleanupTimers.delete(tabId);
+  }
+}
+
+function setPendingContextMenuCategory(tabId, categoryId) {
+  if (!Number.isInteger(tabId) && typeof tabId !== "number") return;
+  clearPendingContextMenuCategory(tabId);
+  pendingContextMenuCategoryByTabId.set(tabId, String(categoryId || ""));
+  const timer = setTimeout(() => {
+    clearPendingContextMenuCategory(tabId);
+  }, CONTEXT_MENU_CATEGORY_OVERRIDE_TTL_MS);
+  pendingContextMenuCategoryCleanupTimers.set(tabId, timer);
+}
+
+function consumePendingContextMenuCategory(tabId) {
+  if (!Number.isInteger(tabId) && typeof tabId !== "number") {
+    return { hasForcedCategory: false, forcedCategoryId: "" };
+  }
+  if (!pendingContextMenuCategoryByTabId.has(tabId)) {
+    return { hasForcedCategory: false, forcedCategoryId: "" };
+  }
+  const forcedCategoryId = String(
+    pendingContextMenuCategoryByTabId.get(tabId) || "",
+  );
+  clearPendingContextMenuCategory(tabId);
+  return { hasForcedCategory: true, forcedCategoryId };
+}
+
+function coerceArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value && typeof value === "object") return Object.values(value);
+  return [];
+}
+
+async function buildBackupPayload() {
+  const [itemsData, data, fullSettings, commands, summaryHistoryBundle] = await Promise.all([
+    getItems(),
+    lpStoreGet([
+      CATEGORY_KEY,
+      SELECTED_CATEGORY_KEY,
+      SIDEBAR_NOTES_KEY,
+      SIDEBAR_NOTE_FOLDERS_KEY,
+      SIDEBAR_NOTES_UI_KEY,
+      TRASH_KEY,
+      PROMPT_TEMPLATES_KEY,
+      CATEGORY_PICKER_LAST_LOCATION_KEY,
+      SUMMARY_MODE_PREFERENCE_KEY,
+      ATTACHMENTS_KEY,
+      "sidebarNotesTrash",
+      "pomodoroState",
+      "pomodoroHistory",
+      "summaryHistoryIndex",
+      "sidebarAiEnabled",
+      "lpPickerWidth",
+      "lpPickerHeight",
+      "lpPickerOpacity",
+      "floatingSizeOverride",
+      "__lpSelectionSearchPopupPosition",
+      "cloud_auto_sync",
+      "cloud_sync_notification",
+      "summaryTonePreference",
+        "summaryPromptHistory",
+        "jarvisSessions",
+        "jarvisConversations",
+        "jarvisLearnedCommands",
+        "jarvisElementMemory",
+        "jarvisElementHintsCache",
+        "jarvisMacros",
+        "jarvisBottomHidden",
+        "jarvisFontPrefs",
+        "jarvisPromptTemplates",
+        "lp_jarvis_cari_suffix"
+      ]),
+    getSettings(),
+    lpApi.commands && typeof lpApi.commands.getAll === "function"
+      ? lpApi.commands.getAll()
+      : Promise.resolve([]),
+    _gatherSummaryHistoryForBackup(),
+  ]);
+  return {
+    items: itemsData,
+    categories: coerceArray(data[CATEGORY_KEY]),
+    selectedCategory: data[SELECTED_CATEGORY_KEY]
+      ? data[SELECTED_CATEGORY_KEY]
+      : "none",
+    notes: coerceArray(data[SIDEBAR_NOTES_KEY]),
+    noteFolders: coerceArray(data[SIDEBAR_NOTE_FOLDERS_KEY]),
+    notesUi:
+      data[SIDEBAR_NOTES_UI_KEY] && typeof data[SIDEBAR_NOTES_UI_KEY] === "object"
+        ? data[SIDEBAR_NOTES_UI_KEY]
+        : null,
+    trash: coerceArray(data[TRASH_KEY]),
+    notesTrash: Array.isArray(data.sidebarNotesTrash) ? data.sidebarNotesTrash : [],
+      promptTemplates: Array.isArray(data[PROMPT_TEMPLATES_KEY]) ? data[PROMPT_TEMPLATES_KEY] : null,
+      jarvisCariSuffix: data.lp_jarvis_cari_suffix !== undefined ? data.lp_jarvis_cari_suffix : null,
+    categoryPickerLastLocation: data[CATEGORY_PICKER_LAST_LOCATION_KEY] && typeof data[CATEGORY_PICKER_LAST_LOCATION_KEY] === "object"
+      ? data[CATEGORY_PICKER_LAST_LOCATION_KEY]
+      : null,
+    summaryModePreference: data[SUMMARY_MODE_PREFERENCE_KEY] || null,
+    summaryHistoryIndex: data.summaryHistoryIndex || null,
+    attachments: data[ATTACHMENTS_KEY] && typeof data[ATTACHMENTS_KEY] === "object"
+      ? data[ATTACHMENTS_KEY]
+      : null,
+    pomodoroState: data.pomodoroState && typeof data.pomodoroState === "object" ? data.pomodoroState : null,
+    pomodoroHistory: Array.isArray(data.pomodoroHistory) ? data.pomodoroHistory : [],
+    sidebarAiEnabled: data.sidebarAiEnabled !== undefined ? data.sidebarAiEnabled : false,
+    uiPrefs: {
+      lpPickerWidth: data.lpPickerWidth || null,
+      lpPickerHeight: data.lpPickerHeight || null,
+      lpPickerOpacity: data.lpPickerOpacity !== undefined ? data.lpPickerOpacity : null,
+      floatingSizeOverride: data.floatingSizeOverride || null,
+      selectionPopupPosition: data['__lpSelectionSearchPopupPosition'] || null,
+    },
+    cloudAutoSync: data.cloud_auto_sync !== undefined ? data.cloud_auto_sync : true,
+    cloudSyncNotification: data.cloud_sync_notification !== undefined ? data.cloud_sync_notification : true,
+    summaryTonePreference: data.summaryTonePreference || null,
+    // Summary history — packed to match gatherBackupData()/restoreBackupPayload()
+    // so the manual JSON export round-trips with cloud backup and import.
+    summaryHistory: summaryHistoryBundle.summaryHistory,
+    summaryHistoryFlat: Array.isArray(summaryHistoryBundle.summaryHistoryFlat)
+      ? summaryHistoryBundle.summaryHistoryFlat
+      : [],
+    promptHistory: Array.isArray(data.summaryPromptHistory) ? data.summaryPromptHistory : [],
+    jarvis: {
+      sessions: data.jarvisSessions && typeof data.jarvisSessions === "object" ? data.jarvisSessions : null,
+      conversations: Array.isArray(data.jarvisConversations) ? data.jarvisConversations : null,
+      learnedCommands: Array.isArray(data.jarvisLearnedCommands) ? data.jarvisLearnedCommands : null,
+      elementMemory: data.jarvisElementMemory && typeof data.jarvisElementMemory === "object" ? data.jarvisElementMemory : null,
+      elementHintsCache: data.jarvisElementHintsCache && typeof data.jarvisElementHintsCache === "object" ? data.jarvisElementHintsCache : null,
+      macros: data.jarvisMacros && typeof data.jarvisMacros === "object" ? data.jarvisMacros : null,
+      // ── Fields previously missing from JARVIS backup (Bug: jarvis export gaps) ─
+      bottomHidden: data.jarvisBottomHidden !== undefined ? data.jarvisBottomHidden : null,
+      fontPrefs: data.jarvisFontPrefs && typeof data.jarvisFontPrefs === "object" ? data.jarvisFontPrefs : null,
+      promptTemplates: Array.isArray(data.jarvisPromptTemplates) ? data.jarvisPromptTemplates : null
+    },
+    settings: fullSettings,
+    shortcuts: commands.map((c) => ({ name: c.name, shortcut: c.shortcut })),
+    meta: { exportedAt: new Date().toISOString(), version: 3 },
+  };
+}
+
+// Gather summary_history_* entries (dynamic keys) + the flat summaryHistory array
+// for inclusion in the manual JSON backup payload.
+async function _gatherSummaryHistoryForBackup() {
+  const result = { summaryHistory: {}, summaryHistoryFlat: [] };
+  try {
+    let keys = null;
+    if (typeof lpApi.storage.local.getKeys === "function") {
+      keys = await new Promise((resolve) => lpApi.storage.local.getKeys((k) => resolve(k || [])));
+    } else {
+      const all = await lpStoreGet(null);
+      keys = Object.keys(all || {});
+    }
+    const histKeys = (keys || []).filter((k) => k.indexOf("summary_history_") === 0);
+    if (histKeys.length) {
+      const values = await lpStoreGet(histKeys);
+      histKeys.forEach((k) => {
+        if (values && values[k]) result.summaryHistory[k] = values[k];
+      });
+    }
+    const flat = await lpStoreGet("summaryHistory");
+    if (Array.isArray(flat.summaryHistory)) result.summaryHistoryFlat = flat.summaryHistory;
+  } catch (_) {
+    /* best-effort */
+  }
+  return result;
+}
+
+async function restoreBackupPayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("Invalid backup payload");
+  }
+  const nextItems = coerceArray(payload.items);
+  const nextCategories = coerceArray(payload.categories);
+  const nextSelected = payload.selectedCategory
+    ? String(payload.selectedCategory)
+    : payload.selected
+      ? String(payload.selected)
+      : "none";
+  const nextNotes = Object.prototype.hasOwnProperty.call(payload, "notes")
+    ? coerceArray(payload.notes)
+    : Object.prototype.hasOwnProperty.call(payload, SIDEBAR_NOTES_KEY)
+      ? coerceArray(payload[SIDEBAR_NOTES_KEY])
+      : null;
+  const nextNoteFolders = Object.prototype.hasOwnProperty.call(payload, "noteFolders")
+    ? coerceArray(payload.noteFolders)
+    : Object.prototype.hasOwnProperty.call(payload, SIDEBAR_NOTE_FOLDERS_KEY)
+      ? coerceArray(payload[SIDEBAR_NOTE_FOLDERS_KEY])
+      : null;
+  const nextNotesUi = Object.prototype.hasOwnProperty.call(payload, "notesUi")
+    ? (payload.notesUi && typeof payload.notesUi === "object" ? payload.notesUi : null)
+    : Object.prototype.hasOwnProperty.call(payload, SIDEBAR_NOTES_UI_KEY)
+      ? (payload[SIDEBAR_NOTES_UI_KEY] && typeof payload[SIDEBAR_NOTES_UI_KEY] === "object"
+        ? payload[SIDEBAR_NOTES_UI_KEY]
+        : null)
+      : null;
+  const nextSettings =
+    payload.settings && typeof payload.settings === "object"
+      ? mergeSettings(payload.settings)
+      : null;
+  const incomingShortcuts = payload.shortcuts
+    ? coerceArray(payload.shortcuts)
+    : null;
+  const nextTrash = Object.prototype.hasOwnProperty.call(payload, "trash")
+    ? coerceArray(payload.trash)
+    : Object.prototype.hasOwnProperty.call(payload, TRASH_KEY)
+      ? coerceArray(payload[TRASH_KEY])
+      : null;
+  const nextPromptTemplates = Object.prototype.hasOwnProperty.call(payload, "promptTemplates")
+    ? coerceArray(payload.promptTemplates)
+    : Object.prototype.hasOwnProperty.call(payload, PROMPT_TEMPLATES_KEY)
+      ? coerceArray(payload[PROMPT_TEMPLATES_KEY])
+      : null;
+
+  const nextPromptHistory = Object.prototype.hasOwnProperty.call(payload, "promptHistory")
+    ? coerceArray(payload.promptHistory)
+    : Object.prototype.hasOwnProperty.call(payload, "summaryPromptHistory")
+      ? coerceArray(payload.summaryPromptHistory)
+      : null;
+  const nextPickerLastLocation = Object.prototype.hasOwnProperty.call(payload, "categoryPickerLastLocation")
+    ? (payload.categoryPickerLastLocation && typeof payload.categoryPickerLastLocation === "object" ? payload.categoryPickerLastLocation : null)
+    : Object.prototype.hasOwnProperty.call(payload, CATEGORY_PICKER_LAST_LOCATION_KEY)
+      ? (payload[CATEGORY_PICKER_LAST_LOCATION_KEY] && typeof payload[CATEGORY_PICKER_LAST_LOCATION_KEY] === "object"
+        ? payload[CATEGORY_PICKER_LAST_LOCATION_KEY]
+        : null)
+      : null;
+  const nextSummaryModePreference = Object.prototype.hasOwnProperty.call(payload, "summaryModePreference")
+    ? payload.summaryModePreference
+    : Object.prototype.hasOwnProperty.call(payload, SUMMARY_MODE_PREFERENCE_KEY)
+      ? payload[SUMMARY_MODE_PREFERENCE_KEY]
+      : null;
+  const nextAttachments = Object.prototype.hasOwnProperty.call(payload, "attachments")
+    ? (payload.attachments && typeof payload.attachments === "object" ? payload.attachments : null)
+    : Object.prototype.hasOwnProperty.call(payload, ATTACHMENTS_KEY)
+      ? (payload[ATTACHMENTS_KEY] && typeof payload[ATTACHMENTS_KEY] === "object"
+        ? payload[ATTACHMENTS_KEY]
+        : null)
+      : null;
+
+  // ── Fields missing from original restore (Bug C fix) ──────────────────
+  const nextNotesTrash = Object.prototype.hasOwnProperty.call(payload, "notesTrash")
+    ? coerceArray(payload.notesTrash)
+    : Object.prototype.hasOwnProperty.call(payload, "sidebarNotesTrash")
+      ? coerceArray(payload.sidebarNotesTrash)
+      : null;
+
+  const nextPomodoroState = Object.prototype.hasOwnProperty.call(payload, "pomodoroState")
+    ? (payload.pomodoroState && typeof payload.pomodoroState === "object" ? payload.pomodoroState : null)
+    : null;
+
+  const nextPomodoroHistory = Object.prototype.hasOwnProperty.call(payload, "pomodoroHistory")
+    ? coerceArray(payload.pomodoroHistory)
+    : null;
+
+  const nextSummaryHistoryIndex = Object.prototype.hasOwnProperty.call(payload, "summaryHistoryIndex")
+    ? payload.summaryHistoryIndex
+    : null;
+
+  const nextSidebarAiEnabled = Object.prototype.hasOwnProperty.call(payload, "sidebarAiEnabled")
+    ? payload.sidebarAiEnabled
+    : undefined;
+
+  const nextSummaryTonePreference = Object.prototype.hasOwnProperty.call(payload, "summaryTonePreference")
+    ? payload.summaryTonePreference
+    : null;
+
+  const nextSummaryCustomPrompt = Object.prototype.hasOwnProperty.call(payload, "summaryCustomPrompt")
+    ? (typeof payload.summaryCustomPrompt === "string" ? payload.summaryCustomPrompt : null)
+    : null;
+
+  // uiPrefs — packed object (supabaseBackupCore format) or flat keys
+  const rawUiPrefs = payload.uiPrefs && typeof payload.uiPrefs === "object" ? payload.uiPrefs : {};
+  const nextLpPickerWidth = rawUiPrefs.lpPickerWidth || payload.lpPickerWidth || null;
+  const nextLpPickerHeight = rawUiPrefs.lpPickerHeight || payload.lpPickerHeight || null;
+  const nextLpPickerOpacity = rawUiPrefs.lpPickerOpacity !== undefined ? rawUiPrefs.lpPickerOpacity
+    : payload.lpPickerOpacity !== undefined ? payload.lpPickerOpacity : null;
+  const nextFloatingSizeOverride = rawUiPrefs.floatingSizeOverride || payload.floatingSizeOverride || null;
+
+  const toSet = {
+    [CATEGORY_KEY]: nextCategories,
+    [SELECTED_CATEGORY_KEY]: nextSelected,
+  };
+  if (nextSettings) {
+    toSet[SETTINGS_KEY] = nextSettings;
+  }
+  if (nextNotes !== null) {
+    toSet[SIDEBAR_NOTES_KEY] = nextNotes;
+  }
+  if (nextNoteFolders !== null) {
+    toSet[SIDEBAR_NOTE_FOLDERS_KEY] = nextNoteFolders;
+  }
+  if (nextNotesUi !== null) {
+    toSet[SIDEBAR_NOTES_UI_KEY] = nextNotesUi;
+  }
+  if (nextTrash !== null) {
+    toSet[TRASH_KEY] = nextTrash;
+  }
+  if (nextPromptTemplates !== null) {
+    toSet[PROMPT_TEMPLATES_KEY] = nextPromptTemplates;
+  }
+  if (nextPromptHistory !== null) {
+    toSet["summaryPromptHistory"] = nextPromptHistory;
+  }
+  if (nextPickerLastLocation !== null) {
+    toSet[CATEGORY_PICKER_LAST_LOCATION_KEY] = nextPickerLastLocation;
+  }
+  if (nextSummaryModePreference !== null) {
+    toSet[SUMMARY_MODE_PREFERENCE_KEY] = nextSummaryModePreference;
+  }
+  if (nextAttachments !== null) {
+    toSet[ATTACHMENTS_KEY] = nextAttachments;
+  }
+  // Restore previously-missing fields
+  if (nextNotesTrash !== null) {
+    toSet["sidebarNotesTrash"] = nextNotesTrash;
+  }
+  if (nextPomodoroState !== null) {
+    toSet["pomodoroState"] = nextPomodoroState;
+  }
+  if (nextPomodoroHistory !== null) {
+    toSet["pomodoroHistory"] = nextPomodoroHistory;
+  }
+  if (nextSummaryHistoryIndex !== null) {
+    toSet["summaryHistoryIndex"] = nextSummaryHistoryIndex;
+  }
+  if (nextSidebarAiEnabled !== undefined) {
+    toSet["sidebarAiEnabled"] = nextSidebarAiEnabled;
+  }
+  if (nextLpPickerWidth !== null) toSet["lpPickerWidth"] = nextLpPickerWidth;
+  if (nextLpPickerHeight !== null) toSet["lpPickerHeight"] = nextLpPickerHeight;
+  if (nextLpPickerOpacity !== null) toSet["lpPickerOpacity"] = nextLpPickerOpacity;
+  if (nextFloatingSizeOverride !== null) toSet["floatingSizeOverride"] = nextFloatingSizeOverride;
+  if (nextSummaryTonePreference !== null) toSet["summaryTonePreference"] = nextSummaryTonePreference;
+  // Backward-compat: older backups stored summaryCustomPrompt as a standalone key.
+  // Its true home is settings.summaryCustomPrompt, so fold any legacy value into
+  // the settings object (only when the settings blob doesn't already carry it).
+  if (nextSummaryCustomPrompt !== null && nextSettings && typeof nextSettings === "object"
+      && typeof nextSettings.summaryCustomPrompt !== "string") {
+    nextSettings.summaryCustomPrompt = nextSummaryCustomPrompt;
+  }
+
+  // Restore summary_history_* entries (previously dropped on background restore)
+  if (payload.summaryHistory && typeof payload.summaryHistory === "object") {
+    for (const _shKey in payload.summaryHistory) {
+      if (_shKey.indexOf("summary_history_") === 0 && payload.summaryHistory[_shKey]) {
+        toSet[_shKey] = payload.summaryHistory[_shKey];
+      }
+    }
+  }
+
+  // Restore selection popup position dan cloud auto sync
+  const rawUiPrefsSelPos = rawUiPrefs.selectionPopupPosition || payload['__lpSelectionSearchPopupPosition'] || null;
+  if (rawUiPrefsSelPos && typeof rawUiPrefsSelPos === "object") {
+    toSet["__lpSelectionSearchPopupPosition"] = rawUiPrefsSelPos;
+  }
+  const nextCloudAutoSync = Object.prototype.hasOwnProperty.call(payload, "cloudAutoSync")
+    ? payload.cloudAutoSync
+    : Object.prototype.hasOwnProperty.call(payload, "cloud_auto_sync")
+      ? payload.cloud_auto_sync
+      : undefined;
+  if (nextCloudAutoSync !== undefined) toSet["cloud_auto_sync"] = nextCloudAutoSync;
+
+  const nextCloudSyncNotification = Object.prototype.hasOwnProperty.call(payload, "cloudSyncNotification")
+    ? payload.cloudSyncNotification
+    : Object.prototype.hasOwnProperty.call(payload, "cloud_sync_notification")
+      ? payload.cloud_sync_notification
+      : undefined;
+  if (nextCloudSyncNotification !== undefined) toSet["cloud_sync_notification"] = nextCloudSyncNotification;
+
+  // Restore JARVIS memory + conversation history
+  if (payload.jarvis && typeof payload.jarvis === "object") {
+    const jv = payload.jarvis;
+    if (jv.sessions && typeof jv.sessions === "object") toSet["jarvisSessions"] = jv.sessions;
+    if (Array.isArray(jv.conversations)) toSet["jarvisConversations"] = jv.conversations;
+    if (Array.isArray(jv.learnedCommands)) toSet["jarvisLearnedCommands"] = jv.learnedCommands;
+    if (jv.elementMemory && typeof jv.elementMemory === "object") toSet["jarvisElementMemory"] = jv.elementMemory;
+    if (jv.elementHintsCache && typeof jv.elementHintsCache === "object") toSet["jarvisElementHintsCache"] = jv.elementHintsCache;
+    if (jv.macros && typeof jv.macros === "object") toSet["jarvisMacros"] = jv.macros;
+    // ── Fields previously missing from JARVIS restore (Bug: jarvis export gaps) ─
+    if (jv.bottomHidden !== undefined) toSet["jarvisBottomHidden"] = jv.bottomHidden;
+    if (jv.fontPrefs && typeof jv.fontPrefs === "object") toSet["jarvisFontPrefs"] = jv.fontPrefs;
+    if (Array.isArray(jv.promptTemplates)) toSet["jarvisPromptTemplates"] = jv.promptTemplates;
+  }
+
+  // Restore JARVIS "cari" suffix (standalone key, not part of settings/jarvis blob)
+  const rawIncomingCariSuffix = Object.prototype.hasOwnProperty.call(payload, "jarvisCariSuffix")
+    ? payload.jarvisCariSuffix
+    : Object.prototype.hasOwnProperty.call(payload, "lp_jarvis_cari_suffix")
+      ? payload.lp_jarvis_cari_suffix
+      : undefined;
+  if (rawIncomingCariSuffix !== undefined) toSet["lp_jarvis_cari_suffix"] = rawIncomingCariSuffix;
+
+  await lpStoreSet(toSet);
+
+  const previousItems = await getFreshItemsFromStore();
+  await setItems(nextItems, { previousItems });
+
+  if (incomingShortcuts && lpApi.commands && lpApi.commands.update) {
+    for (const s of incomingShortcuts) {
+      try {
+        if (s && s.name && typeof s.shortcut === "string") {
+          await lpApi.commands.update({ name: s.name, shortcut: s.shortcut });
+        }
+      } catch (err) {
+        // continue restoring others
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    counts: {
+      items: nextItems.length,
+      categories: nextCategories.length,
+      notes: nextNotes ? nextNotes.length : 0,
+      noteFolders: nextNoteFolders ? nextNoteFolders.length : 0,
+    },
+    selected: nextSelected,
+    settings: nextSettings,
+  };
+}
+
+function normalizeCategoryIdForOrder(categoryId) {
+  return categoryId ? String(categoryId) : "";
+}
+
+function getItemCategoryIdForOrder(item) {
+  if (!item || !item.categoryId) return "";
+  return String(item.categoryId);
+}
+
+function getManualOrderValue(item) {
+  if (!item) return null;
+  const raw = item.manualOrder;
+  const value = typeof raw === "number" ? raw : Number(raw);
+  return Number.isFinite(value) ? value : null;
+}
+
+function getFavoriteOrderValue(item) {
+  if (!item) return null;
+  const raw = item.favoriteOrder;
+  const value = typeof raw === "number" ? raw : Number(raw);
+  return Number.isFinite(value) ? value : null;
+}
+
+const boundsCacheByItems = new WeakMap();
+
+function getManualOrderBounds(items, categoryId) {
+  const normalizedCategoryId = normalizeCategoryIdForOrder(categoryId);
+
+  if (items && typeof items === 'object') {
+    let cacheForItems = boundsCacheByItems.get(items);
+    if (!cacheForItems) {
+      cacheForItems = new Map();
+      boundsCacheByItems.set(items, cacheForItems);
+    }
+    if (cacheForItems.has(normalizedCategoryId)) {
+      return cacheForItems.get(normalizedCategoryId);
+    }
+  }
+
+  let min = Infinity;
+  let max = -Infinity;
+  let count = 0;
+  for (const item of items || []) {
+    if (!item) continue;
+    if (getItemCategoryIdForOrder(item) !== normalizedCategoryId) continue;
+    const order = getManualOrderValue(item);
+    if (order === null) continue;
+    if (order < min) min = order;
+    if (order > max) max = order;
+    count += 1;
+  }
+  
+  const result = count ? { count, min, max } : { count: 0, min: 0, max: 0 };
+  
+  if (items && typeof items === 'object') {
+    boundsCacheByItems.get(items).set(normalizedCategoryId, result);
+  }
+  
+  return result;
+}
+
+function computeManualOrderForCategory(items, categoryId, position) {
+  const safeCatId = normalizeCategoryIdForOrder(categoryId);
+  const bounds = getManualOrderBounds(items, safeCatId);
+  const offset = volatileManualOrderOffsetByCategoryId.get(safeCatId) || 0;
+
+  if (!bounds.count) {
+    volatileManualOrderOffsetByCategoryId.set(safeCatId, offset + 1);
+    return offset;
+  }
+
+  if (position === "prepend") {
+    volatileManualOrderOffsetByCategoryId.set(safeCatId, offset - 1);
+    return bounds.min + offset - 1;
+  }
+  volatileManualOrderOffsetByCategoryId.set(safeCatId, offset + 1);
+  return bounds.max + offset + 1;
+}
+
+function withManualOrder(item, manualOrder) {
+  if (!item) return item;
+  if (typeof manualOrder === "number" && Number.isFinite(manualOrder)) {
+    if (getManualOrderValue(item) === manualOrder) return item;
+    return { ...item, manualOrder };
+  }
+  if (Object.prototype.hasOwnProperty.call(item, "manualOrder")) {
+    const next = { ...item };
+    delete next.manualOrder;
+    return next;
+  }
+  return item;
+}
+
+function sortCategories(categories) {
+  return categories.slice().sort((a, b) => {
+    const aName = a && a.name ? a.name : "";
+    const bName = b && b.name ? b.name : "";
+    return aName.localeCompare(bName, undefined, { sensitivity: "base" });
+  });
+}
+
+function buildCategoryCycle(categories, settings) {
+  const cycle = [];
+  const includeAll = settings ? settings.cycleIncludeAll !== false : true;
+  const includeUncategorized = settings
+    ? settings.cycleIncludeUncategorized !== false
+    : true;
+  const showHidden = settings ? settings.showHiddenCategories : 0;
+  if (includeAll) cycle.push("all");
+  if (includeUncategorized) {
+    if (showHidden === 2) {
+      cycle.push("hidden_none");
+    } else {
+      cycle.push("none");
+      if (showHidden === 1) cycle.push("hidden_none");
+    }
+  }
+  for (const cat of categories) {
+    if (cat && cat.id) {
+      if (showHidden === 2 && cat.hidden) {
+        cycle.push(cat.id);
+      } else if (showHidden === 1) {
+        cycle.push(cat.id);
+      } else if (!showHidden && !cat.hidden) {
+        cycle.push(cat.id);
+      }
+    }
+  }
+  return cycle;
+}
+
+function getCategoryLabel(categoryId, categories) {
+  if (!categoryId || categoryId === "none") return "Uncategorized";
+  if (categoryId === "hidden_none") return "Uncategorize (hidden)";
+  if (categoryId === "all") return "All categories";
+  if (categoryId === "hidden_all" || categoryId === "all_hidden") return "All categories (hidden)";
+  const match = categories.find((cat) => cat && cat.id === categoryId);
+  return match && match.name ? match.name : "Unknown category";
+}
+
+function buildCategoryCounts(items, categories, options = {}) {
+  let showHidden = options.showHiddenCategories;
+  if (showHidden === true) showHidden = 1;
+  if (showHidden === false || typeof showHidden === "undefined") showHidden = 0;
+
+  const hiddenCategoryIds = new Set();
+  for (const cat of categories || []) {
+    if (cat && cat.id && cat.hidden) {
+      hiddenCategoryIds.add(String(cat.id));
+    }
+  }
+  const counts = { all: 0, none: 0, hiddenNone: 0, hiddenAll: 0, byId: {} };
+  for (const item of items || []) {
+    if (!item) continue;
+    const catId = item.categoryId ? String(item.categoryId) : "";
+
+    if (!catId) {
+      counts.none += 1;
+      if (showHidden !== 2) {
+        counts.all += 1;
+      }
+    } else if (catId === "hidden_none") {
+      counts.hiddenNone += 1;
+      counts.hiddenAll += 1;
+      if (showHidden === 2 || showHidden === 1) {
+        counts.all += 1;
+      }
+    } else {
+      counts.byId[catId] = (counts.byId[catId] || 0) + 1;
+      const isHidden = hiddenCategoryIds.has(catId);
+      if (isHidden) {
+        counts.hiddenAll += 1;
+      }
+      if (showHidden === 2) {
+        if (isHidden) counts.all += 1;
+      } else if (showHidden || !isHidden) {
+        counts.all += 1;
+      }
+    }
+  }
+  for (const cat of categories || []) {
+    if (!cat || !cat.id) continue;
+    if (typeof counts.byId[cat.id] !== "number") {
+      counts.byId[cat.id] = 0;
+    }
+  }
+  return counts;
+}
+
+function getCategoryCount(categoryId, counts) {
+  if (!counts) return null;
+  if (!categoryId || categoryId === "none") return counts.none;
+  if (categoryId === "hidden_none") return counts.hiddenNone;
+  if (categoryId === "all") return counts.all;
+  if (categoryId === "hidden_all" || categoryId === "all_hidden") return counts.hiddenAll || 0;
+  return typeof counts.byId[categoryId] === "number"
+    ? counts.byId[categoryId]
+    : 0;
+}
+
+function formatCategoryToast(label, count) {
+  if (typeof count === "number") {
+    return `${label} (${count})`;
+  }
+  return label;
+}
+
+function flashCategoryBadge(label) {
+  if (!lpApi.browserAction || !lpApi.browserAction.setBadgeText) return;
+  const raw = label ? label.trim() : "";
+  const text = raw ? raw.slice(0, 4).toUpperCase() : "CAT";
+  lpApi.browserAction.setBadgeBackgroundColor({ color: "#e84c4f" });
+  lpApi.browserAction.setBadgeText({ text });
+  if (categoryBadgeTimer) {
+    clearTimeout(categoryBadgeTimer);
+  }
+  categoryBadgeTimer = setTimeout(() => updateBadgeFromStorage(), 2000);
+}
+
+function stringToHue(str) {
+  if (!str) return 142;
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = str.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  return ((hash % 360) + 360) % 360;
+}
+
+function buildToastScript(message, subtext, accentColor, durationMs, counterText) {
+  const safeMessage = JSON.stringify(message || "");
+  const safeSubtext = subtext ? JSON.stringify(subtext) : "null";
+  const safeCounter = counterText ? JSON.stringify(counterText) : "null";
+  const color = accentColor || "#48d597";
+  const hideAfterMs = typeof durationMs === "number" && durationMs > 0 ? durationMs : 2500;
+  return `(function () {
+    const text = ${safeMessage};
+    const sub = ${safeSubtext};
+    const counter = ${safeCounter};
+    ${subtext ? `
+    const outer = document.createElement("div");
+    outer.style.display = "flex";
+    outer.style.alignItems = "center";
+    outer.style.gap = "0";
+    const iconWrap = document.createElement("div");
+    iconWrap.textContent = "\\u2713";
+    iconWrap.style.display = "flex";
+    iconWrap.style.alignItems = "center";
+    iconWrap.style.justifyContent = "center";
+    iconWrap.style.width = counter !== null ? "52px" : "40px";
+    iconWrap.style.height = counter !== null ? "52px" : "40px";
+    iconWrap.style.borderRadius = "50%";
+    iconWrap.style.background = "${color}";
+    iconWrap.style.color = "#fff";
+    iconWrap.style.fontSize = counter !== null ? "28px" : "22px";
+    iconWrap.style.fontWeight = "700";
+    iconWrap.style.flexShrink = "0";
+    iconWrap.style.marginRight = "16px";
+    outer.appendChild(iconWrap);
+    const innerWrap = document.createElement("div");
+    innerWrap.style.display = "flex";
+    innerWrap.style.flexDirection = "column";
+    ${safeCounter !== "null" ? `
+    const counterLine = document.createElement("div");
+    counterLine.textContent = counter;
+    counterLine.style.color = "${color}";
+    counterLine.style.fontSize = "40px";
+    counterLine.style.fontWeight = "800";
+    counterLine.style.lineHeight = "1.1";
+    counterLine.style.letterSpacing = "1px";
+    innerWrap.appendChild(counterLine);
+    ` : ""}
+    const msgLine = document.createElement("div");
+    msgLine.textContent = text;
+    msgLine.style.color = "rgba(255,255,255,0.85)";
+    msgLine.style.fontSize = counter !== null ? "16px" : "18px";
+    msgLine.style.fontWeight = "500";
+    msgLine.style.marginTop = counter !== null ? "2px" : "0";
+    innerWrap.appendChild(msgLine);
+    const subLine = document.createElement("div");
+    subLine.textContent = sub;
+    subLine.style.color = "${color}";
+    subLine.style.fontSize = "26px";
+    subLine.style.fontWeight = "700";
+    subLine.style.marginTop = "4px";
+    innerWrap.appendChild(subLine);
+    outer.appendChild(innerWrap);
+    ` : `
+    const outer = document.createElement("div");
+    const iconWrap = document.createElement("span");
+    iconWrap.textContent = "\\u2713 ";
+    iconWrap.style.color = "${color}";
+    iconWrap.style.fontSize = "28px";
+    iconWrap.style.fontWeight = "700";
+    iconWrap.style.marginRight = "8px";
+    outer.appendChild(iconWrap);
+    const msgSpan = document.createElement("span");
+    msgSpan.textContent = text;
+    outer.appendChild(msgSpan);
+    `}
+    const id = "__local_pocket_category_toast";
+    const root = document.getElementById(id) || document.createElement("div");
+    root.id = id;
+    root.textContent = "";
+    root.appendChild(outer);
+    root.style.position = "fixed";
+    root.style.left = "50%";
+    root.style.top = "40%";
+    root.style.transform = "translate(-50%, -50%) translateY(-20px)";
+    root.style.padding = "20px 32px";
+    root.style.borderRadius = "18px";
+    root.style.borderLeft = "5px solid ${color}";
+    root.style.background = "linear-gradient(135deg, rgba(22,22,28,0.94) 0%, rgba(30,30,40,0.94) 100%)";
+    root.style.color = "#fff";
+    root.style.fontSize = "18px";
+    root.style.fontWeight = "500";
+    root.style.fontFamily = "Segoe UI, Arial, sans-serif";
+    root.style.letterSpacing = "0.3px";
+    root.style.textAlign = "left";
+    root.style.maxWidth = "70vw";
+    root.style.boxShadow = "0 16px 48px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255,255,255,0.06)";
+    root.style.backdropFilter = "blur(10px)";
+    root.style.zIndex = "2147483647";
+    root.style.pointerEvents = "none";
+    root.style.opacity = "0";
+    root.style.transition = "opacity 280ms ease, transform 280ms ease";
+    if (!root.parentNode) {
+      (document.body || document.documentElement).appendChild(root);
+    }
+    const timerKey = "__localPocketToastTimer";
+    if (window[timerKey]) {
+      clearTimeout(window[timerKey]);
+    }
+    requestAnimationFrame(() => {
+      root.style.opacity = "1";
+      root.style.transform = "translate(-50%, -50%) translateY(0)";
+    });
+    window[timerKey] = setTimeout(() => {
+      root.style.opacity = "0";
+      root.style.transform = "translate(-50%, -50%) translateY(-12px)";
+      setTimeout(() => {
+        if (root && root.parentNode) root.parentNode.removeChild(root);
+      }, 300);
+    }, ${hideAfterMs});
+  })();`;
+}
+
+/**
+ * Build a small sync status toast injected at bottom-right of the page.
+ * Used exclusively by AutoSync — smaller and less intrusive than the main toast.
+ */
+function buildSyncToastScript(message, isError, durationMs) {
+  const color = isError ? '#ff5252' : '#48d597';
+  const icon = isError ? '✕' : '✓';
+  const hideAfterMs = typeof durationMs === 'number' && durationMs > 0 ? durationMs : 3000;
+  return `(function () {
+    const id = "__lp_sync_toast";
+    let root = document.getElementById(id);
+    if (!root) {
+      root = document.createElement("div");
+      root.id = id;
+      root.style.cssText = [
+        "position:fixed",
+        "bottom:18px",
+        "right:18px",
+        "z-index:2147483647",
+        "display:flex",
+        "align-items:center",
+        "gap:8px",
+        "padding:9px 14px",
+        "border-radius:10px",
+        "background:rgba(18,18,24,0.92)",
+        "border:1px solid rgba(255,255,255,0.08)",
+        "box-shadow:0 4px 20px rgba(0,0,0,0.4)",
+        "backdrop-filter:blur(8px)",
+        "pointer-events:none",
+        "font-family:Segoe UI,Arial,sans-serif",
+        "font-size:13px",
+        "color:#f3f4f6",
+        "opacity:0",
+        "transform:translateY(8px)",
+        "transition:opacity 220ms ease,transform 220ms ease",
+        "max-width:260px"
+      ].join(";");
+      (document.body || document.documentElement).appendChild(root);
+    }
+    root.innerHTML = "";
+    const dot = document.createElement("span");
+    dot.textContent = "${icon}";
+    dot.style.cssText = "color:${color};font-size:14px;font-weight:700;flex-shrink:0;";
+    const label = document.createElement("span");
+    label.textContent = ${JSON.stringify(message)};
+    label.style.cssText = "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+    root.appendChild(dot);
+    root.appendChild(label);
+    const tk = "__lpSyncToastTimer";
+    if (window[tk]) clearTimeout(window[tk]);
+    requestAnimationFrame(() => {
+      root.style.opacity = "1";
+      root.style.transform = "translateY(0)";
+    });
+    window[tk] = setTimeout(() => {
+      root.style.opacity = "0";
+      root.style.transform = "translateY(8px)";
+      setTimeout(() => { if (root && root.parentNode) root.parentNode.removeChild(root); }, 250);
+    }, ${hideAfterMs});
+  })();`;
+}
+
+/**
+ * Show a small sync notification at bottom-right — checks user preference first.
+ * @param {string} message
+ * @param {boolean} isError
+ * @param {number} [durationMs]
+ */
+async function showSyncToast(message, isError, durationMs) {
+  try {
+    const api = typeof browser !== 'undefined' ? browser : chrome;
+    const pref = await new Promise(resolve => {
+      api.storage.local.get('cloud_sync_notification', r => resolve(r));
+    });
+    // Default enabled; only skip if explicitly set to false
+    if (pref.cloud_sync_notification === false) return;
+
+    if (!lpApi.tabs || !lpApi.tabs.query) return;
+    const tabs = await lpApi.tabs.query({ active: true, currentWindow: true });
+    if (!tabs || !tabs[0] || !tabs[0].id) return;
+    const code = buildSyncToastScript(message, isError, durationMs);
+    await lpApi.tabs.executeScript(tabs[0].id, { code });
+  } catch (_) {}
+}
+
+async function showInPageToast(message, subtext, accentColor, targetTabId, durationMs, counterText) {
+  if (!lpApi.tabs || !lpApi.tabs.executeScript) return false;
+  let tabId = targetTabId;
+  if (!tabId && tabId !== 0) {
+    if (!lpApi.tabs || !lpApi.tabs.query) return false;
+    try {
+      const tabs = await lpApi.tabs.query({ active: true, currentWindow: true });
+      if (!tabs || !tabs[0] || !tabs[0].id) return false;
+      tabId = tabs[0].id;
+    } catch (err) {
+      return false;
+    }
+  }
+  try {
+    const code = buildToastScript(message, subtext, accentColor, durationMs, counterText);
+    await lpApi.tabs.executeScript(tabId, { code });
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+async function showSavedToast(categoryName, categoryId) {
+  const hue = stringToHue(categoryId || categoryName || "");
+  const color = "hsl(" + hue + ", 70%, 58%)";
+  return showInPageToast("Disimpan ke", categoryName || "Local Pocket", color);
+}
+
+
+function buildCommandPaletteScript() {
+  return `(function(){"use strict";
+var a=typeof browser!=="undefined"?browser:chrome;
+var o=document.getElementById("__lp_cmd_palette");
+if(o){o.remove();return}
+o=document.createElement("div");
+o.id="__lp_cmd_palette";
+var s=o.style;
+s.cssText="all:initial;position:fixed;top:0;left:0;width:100%;height:100%;z-index:2147483647;display:flex;align-items:flex-start;justify-content:center;background:rgba(0,0,0,0.35);font-family:-apple-system,BlinkMacSystemFont,sans-serif";
+var w=document.createElement("div");
+w.style.cssText="margin-top:12vh;width:860px;max-width:98vw;background:#1a1a2e;border-radius:14px;border:1px solid rgba(255,255,255,0.1);box-shadow:0 16px 48px rgba(0,0,0,0.45);overflow:hidden";
+var inp=document.createElement("input");
+inp.type="text";
+inp.placeholder="Cari link...";
+inp.autofocus=true;
+inp.spellcheck=false;
+inp.style.cssText="width:100%;padding:14px 18px;font-size:16px;background:rgba(255,255,255,0.06);border:none;color:#f3f4f6;outline:none;box-sizing:border-box";
+inp.style.fontFamily="inherit";
+var lst=document.createElement("div");
+lst.style.cssText="max-height:420px;overflow-y:auto";
+var noRes=document.createElement("div");
+noRes.style.cssText="padding:20px;text-align:center;color:#9ca3af;font-size:13px";
+noRes.textContent="Taip untuk mula mencari...";
+lst.appendChild(noRes);
+var foot=document.createElement("div");
+foot.style.cssText="padding:6px 14px;font-size:11px;color:rgba(255,255,255,0.3);border-top:1px solid rgba(255,255,255,0.06);display:flex;gap:14px";
+foot.textContent="Enter: tab ini · Ctrl+Enter: tab baru";
+w.append(inp,lst,foot);
+o.appendChild(w);
+document.body.appendChild(o);
+var results=[],activeIdx=-1;
+function renderItems(items){
+  lst.textContent="";
+  results=items||[];
+  activeIdx=results.length?-1:-1;
+  if(!results.length){
+    var e=document.createElement("div");
+    e.style.cssText="padding:20px;text-align:center;color:#9ca3af;font-size:13px";
+    e.textContent=inp.value.trim()?"Tiada hasil":"Taip untuk mula mencari...";
+    lst.appendChild(e);
+    return
+  }
+  results.forEach(function(r,i){
+    var row=document.createElement("div");
+    row.style.cssText="display:flex;align-items:center;gap:10px;padding:8px 12px;cursor:pointer;border-bottom:1px solid rgba(255,255,255,0.04);transition:background 0.1s";
+    row.dataset.idx=i;
+    var fav=document.createElement("img");
+    fav.src=r.faviconUrl||"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16'%3E%3Crect width='16' height='16' rx='4' fill='rgba(255,255,255,0.15)'/%3E%3C/svg%3E";
+    fav.style.cssText="width:18px;height:18px;border-radius:4px;flex:0 0 auto";
+    fav.onerror=function(){fav.style.display="none"};
+    var tx=document.createElement("div");
+    tx.style.cssText="flex:1;min-width:0";
+    var t=document.createElement("div");
+    t.textContent=r.label;
+    t.style.cssText="font-size:13px;font-weight:600;color:#f3f4f6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+    var d=document.createElement("div");
+    d.style.cssText="font-size:11px;color:#9ca3af;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+    d.textContent=r.meta||r.url||"";
+    tx.append(t,d);
+    var cat=document.createElement("span");
+    cat.textContent=r.categoryName||"";
+    cat.style.cssText="font-size:10px;padding:2px 6px;border-radius:4px;background:rgba(255,255,255,0.08);color:#9ca3af;white-space:nowrap;flex:0 0 auto";
+    row.append(fav,tx,cat);
+    row.onclick=function(e){
+      a.runtime.sendMessage({type:"command-palette-open",url:r.url,currentTab:!e.ctrlKey&&!e.metaKey}).catch(function(){})
+    };
+    row.onmouseenter=function(){setActive(i)};
+    lst.appendChild(row)
+  });
+  if(results.length>0)setActive(0)
+}
+function setActive(i){
+  if(activeIdx>=0&&activeIdx<lst.children.length){
+    var prev=lst.children[activeIdx];
+    if(prev)prev.style.background="transparent"
+  }
+  activeIdx=i;
+  if(i>=0&&i<lst.children.length){
+    var cur=lst.children[i];
+    if(cur){cur.style.background="rgba(255,255,255,0.08)";cur.scrollIntoView({block:"nearest"})}
+  }
+}
+var searchTimer;
+inp.addEventListener("input",function(){
+  clearTimeout(searchTimer);
+  searchTimer=setTimeout(function(){
+    var q=inp.value.trim();
+    if(!q){renderItems([]);return}
+    a.runtime.sendMessage({type:"command-palette-search",query:q},function(resp){
+      if(resp&&resp.items)renderItems(resp.items)
+    })
+  },200)
+});
+inp.addEventListener("keydown",function(e){
+  if(e.key==="Escape"){o.remove();return}
+  if(e.key==="ArrowDown"&&results.length){e.preventDefault();setActive(Math.min(activeIdx+1,results.length-1))}
+  if(e.key==="ArrowUp"&&results.length){e.preventDefault();setActive(Math.max(activeIdx-1,0))}
+  if(e.key==="Enter"&&activeIdx>=0&&results[activeIdx]){
+    e.preventDefault();
+    a.runtime.sendMessage({type:"command-palette-open",url:results[activeIdx].url,currentTab:!e.ctrlKey&&!e.metaKey}).catch(function(){})
+  }
+});
+o.addEventListener("click",function(e){if(e.target===o)o.remove()});
+setTimeout(function(){inp.focus()},50)
+})();`;
+}
+
+async function showCommandPalette(tabId) {
+  if (!lpApi.tabs || !lpApi.tabs.executeScript) {
+    throw new Error("tabs.executeScript unavailable");
+  }
+  const targetId = tabId || (await getActiveTabId());
+  if (!targetId) return false;
+  const script = buildCommandPaletteScript();
+  try {
+    await executeScriptSafe(targetId, { code: script });
+    return true;
+  } catch (err) {
+    lpWarn("[LocalPocket] showCommandPalette failed", err);
+    return false;
+  }
+}
+
+async function getActiveTabId() {
+  try {
+    const tabs = await lpApi.tabs.query({ active: true, currentWindow: true });
+    return tabs && tabs[0] && tabs[0].id ? tabs[0].id : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function showCategoryPicker(payload, tabId) {
+  if (!lpApi.tabs || !lpApi.tabs.executeScript) {
+    throw new Error("tabs.executeScript unavailable");
+  }
+  let targetId = tabId;
+  let targetTab = null;
+  if (targetId && lpApi.tabs.get) {
+    try {
+      targetTab = await promisifyTabsGet(targetId);
+    } catch (err) {
+      targetTab = null;
+    }
+  }
+  if (!targetId && lpApi.tabs.query) {
+    const tabs = await promisifyTabsQuery({
+      active: true,
+      currentWindow: true,
+    });
+    targetTab = tabs && tabs[0] ? tabs[0] : null;
+    targetId = targetTab && targetTab.id ? targetTab.id : null;
+  }
+  if (!targetId) {
+    throw new Error("no-target-tab");
+  }
+  if (!targetTab && lpApi.tabs.get) {
+    try {
+      targetTab = await promisifyTabsGet(targetId);
+    } catch (err) {
+      targetTab = null;
+    }
+  }
+  if (targetTab && !isScriptableTab(targetTab)) {
+    await notifyCategoryPickerBlocked(targetTab);
+    return false;
+  }
+  if (targetTab) {
+    const filePermission = await ensureFilePermissionForTab(
+      targetTab,
+      "buka Category Picker pada fail lokal",
+    );
+    if (!filePermission.ok) {
+      return false;
+    }
+  }
+
+  // Optimize: single IPC hop injection using a cached base script.
+  // The actual payload data will be sent via message immediately after.
+  if (!cachedPickerBaseScript) {
+    cachedPickerBaseScript = buildPickerScript({
+      ...payload,
+      items: [],
+      categories: []
+    });
+  }
+
+  const injectorCode = `
+    (function() {
+      "use strict";
+      if (document.getElementById('__local_pocket_category_picker')) {
+        return false; // Already exists
+      }
+      ${cachedPickerBaseScript}
+      return true; // Newly injected
+    })();
+  `;
+
+  let injectedNew = false;
+  try {
+    const results = await executeScriptSafe(targetId, { code: injectorCode });
+    injectedNew = Array.isArray(results) ? !!results[0] : !!results;
+    debugLog("showCategoryPicker injectedNew:", injectedNew);
+  } catch (err) {
+    lpWarn("Category picker inject/check failed", err);
+    throw err;
+  }
+
+  // Fresh injections request their own payload via category-picker-ready, which
+  // avoids a Firefox race where tabs.sendMessage can run before the new
+  // receiver is visible.
+  if (injectedNew) {
+    debugLog("showCategoryPicker waiting for picker ready handshake");
+    return true;
+  }
+
+  // Reused picker instance: push the latest payload directly.
+  try {
+    // Baca saved dimensions untuk reused picker
+    try {
+      const savedData = await new Promise((resolve) => {
+        lpStoreGet(["lpPickerWidth", "lpPickerHeight", "lpPickerOpacity"], function (data) {
+          resolve(data || {});
+        });
+      });
+      if (savedData.lpPickerWidth) payload.savedWidth = savedData.lpPickerWidth;
+      if (savedData.lpPickerHeight) payload.savedHeight = savedData.lpPickerHeight;
+      if (savedData.lpPickerOpacity) payload.savedOpacity = savedData.lpPickerOpacity;
+    } catch (_) {}
+
+    await lpApi.tabs.sendMessage(targetId, {
+      type: "category-picker-data",
+      payload,
+    });
+    debugLog("showCategoryPicker sent fresh payload data");
+  } catch (err) {
+    if (isMissingMessageReceiverError(err)) {
+      debugLog("showCategoryPicker update skipped; receiver missing", err);
+    } else {
+      lpWarn("showCategoryPicker update message failed", err);
+    }
+  }
+  return true;
+}
+
+async function showCategoryNotification(categoryId, categories, counts) {
+  const label = getCategoryLabel(categoryId, categories);
+  const count = getCategoryCount(categoryId, counts);
+  const message = formatCategoryToast(label, count);
+  const shown = await showInPageToast(message);
+  if (shown) return;
+  if (!lpApi.notifications || !lpApi.notifications.create) {
+    flashCategoryBadge(message);
+    return;
+  }
+  const iconUrl =
+    lpApi.runtime && lpApi.runtime.getURL
+      ? lpApi.runtime.getURL("icons/icon-default-32.png")
+      : "icons/icon-default-32.png";
+  const options = {
+    type: "basic",
+    title: "Category selected",
+    message,
+    iconUrl,
+  };
+
+  const fallback = () => flashCategoryBadge(message);
+  try {
+    const maybePromise = lpApi.notifications.create(
+      CATEGORY_NOTIFICATION_ID,
+      options,
+      () => {
+        if (lpApi.runtime && lpApi.runtime.lastError) {
+          fallback();
+        }
+      },
+    );
+    if (maybePromise && typeof maybePromise.then === "function") {
+      maybePromise.catch(fallback);
+    }
+  } catch (err) {
+    fallback();
+    return;
+  }
+
+  if (categoryNotificationTimer) {
+    clearTimeout(categoryNotificationTimer);
+  }
+  categoryNotificationTimer = setTimeout(() => {
+    try {
+      const maybePromise = lpApi.notifications.clear(CATEGORY_NOTIFICATION_ID);
+      if (maybePromise && typeof maybePromise.then === "function") {
+        maybePromise.catch(() => { });
+      }
+    } catch (err) {
+      // ignore
+    }
+  }, 2200);
+}
+
+function sendSidebarChatMessage(sessionId, role, text, html, turnId) {
+  const payload = {
+    type: "summary-sidebar-chat",
+    payload: {
+      sessionId: sessionId || "",
+      role: role || "assistant",
+      text: text || "",
+      html: html || "",
+      turnId: turnId || ""
+    },
+  };
+  // Send to injected panel (in-tab) if available
+  if (summarySidebarTabId && lpApi.tabs && lpApi.tabs.sendMessage) {
+    try {
+      lpApi.tabs.sendMessage(summarySidebarTabId, payload, () => { });
+    } catch (err) {
+      // ignore
+    }
+  }
+  // Broadcast to sidebar page
+  try {
+    lpApi.runtime.sendMessage({ type: "sidebar-page-chat", payload });
+  } catch (err) {
+    // ignore
+  }
+}
+
+function buildSummarySidebarScript(initialData = {}) {
+  const safe =
+    initialData && typeof initialData === "object" ? initialData : {};
+  const injected = JSON.stringify(safe);
+  return `(function () {
+    "use strict";
+    var lpApi = typeof browser !== "undefined" ? browser : chrome;
+    var SIDEBAR_ID = "__local_pocket_summary_sidebar";
+    var BACKDROP_ID = "__local_pocket_summary_backdrop";
+    var baseData = ${injected};
+    var sessionId = baseData.sessionId || "";
+
+    var existing = document.getElementById(SIDEBAR_ID);
+    if (existing && existing.__lpSummaryUpdate) {
+      existing.__lpSummaryUpdate(baseData);
+      existing.style.transform = "translateX(0)";
+      existing.style.opacity = "1";
+      var backdropEl = document.getElementById(BACKDROP_ID);
+      if (backdropEl) backdropEl.style.opacity = "1";
+      return;
+    }
+
+    var backdrop = document.createElement("div");
+    backdrop.id = BACKDROP_ID;
+    backdrop.style.cssText = "position:fixed; inset:0; background:rgba(0,0,0,0.35); backdrop-filter:blur(2px); z-index:2147483645; opacity:0; transition:opacity 160ms ease;";
+
+    var root = document.createElement("aside");
+    root.id = SIDEBAR_ID;
+    var maxWidth = Math.min(440, Math.max(320, Math.floor(window.innerWidth * 0.38)));
+    root.style.cssText = "position:fixed; top:0; right:0; height:100%; width:" + maxWidth + "px; max-width:94vw; background:linear-gradient(180deg,#0b1220 0%,#0a1226 44%,#0d1729 100%); color:#e5e7eb; z-index:2147483646; box-shadow:-18px 0 46px rgba(0,0,0,0.45); border-left:1px solid rgba(255,255,255,0.06); display:flex; flex-direction:column; gap:12px; padding:18px 16px 14px; transform:translateX(22px); opacity:0; transition:transform 200ms ease, opacity 160ms ease; font-family:'Sora','Segoe UI','Helvetica Neue',sans-serif; box-sizing:border-box; user-select:text;";
+
+    var header = document.createElement("div");
+    header.style.display = "flex";
+    header.style.alignItems = "center";
+    header.style.justifyContent = "space-between";
+    header.style.gap = "10px";
+
+    var left = document.createElement("div");
+    left.style.display = "flex";
+    left.style.alignItems = "center";
+    left.style.gap = "10px";
+
+    var badge = document.createElement("div");
+    badge.textContent = "LP";
+    badge.style.cssText = "width:34px;height:34px;border-radius:11px;background:linear-gradient(135deg,#22d3ee,#2563eb);color:#0b1220;font-weight:800;display:flex;align-items:center;justify-content:center;letter-spacing:0.04em;box-shadow:0 10px 30px rgba(34,211,238,0.35);";
+
+    var titleWrap = document.createElement("div");
+    titleWrap.style.display = "flex";
+    titleWrap.style.flexDirection = "column";
+    titleWrap.style.gap = "4px";
+
+    var heading = document.createElement("div");
+    heading.textContent = "Ringkasan";
+    heading.style.fontSize = "16px";
+    heading.style.fontWeight = "700";
+
+    var subtitle = document.createElement("div");
+    subtitle.textContent = "";
+    subtitle.style.fontSize = "12px";
+    subtitle.style.color = "rgba(255,255,255,0.72)";
+    subtitle.style.overflow = "hidden";
+    subtitle.style.textOverflow = "ellipsis";
+    subtitle.style.whiteSpace = "nowrap";
+
+    var modePill = document.createElement("span");
+    modePill.textContent = "Deep";
+    modePill.style.cssText = "padding:5px 10px;border-radius:999px;border:1px solid rgba(125,211,252,0.45);background:rgba(56,189,248,0.12);color:#7dd3fc;font-weight:700;font-size:11px;letter-spacing:0.02em;";
+
+    var closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.textContent = "×";
+    closeBtn.title = "Tutup (Esc)";
+    closeBtn.style.cssText = "width:34px;height:34px;border-radius:10px;border:1px solid rgba(255,255,255,0.08);background:rgba(255,255,255,0.04);color:#f8fafc;font-size:18px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background 120ms ease,border-color 120ms ease;";
+    closeBtn.onmouseenter = function() { closeBtn.style.background = "rgba(255,255,255,0.08)"; closeBtn.style.borderColor = "rgba(255,255,255,0.16)"; };
+    closeBtn.onmouseleave = function() { closeBtn.style.background = "rgba(255,255,255,0.04)"; closeBtn.style.borderColor = "rgba(255,255,255,0.08)"; };
+
+    left.append(badge, titleWrap);
+    header.append(left, modePill, closeBtn);
+
+    // Meta bar slim
+    var meta = document.createElement("div");
+    meta.style.cssText = "display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:8px; padding:10px 12px; border:1px solid rgba(255,255,255,0.07); border-radius:12px; background:rgba(255,255,255,0.03);";
+
+    function buildMeta(labelText) {
+      var wrap = document.createElement("div");
+      wrap.style.display = "flex";
+      wrap.style.flexDirection = "column";
+      wrap.style.gap = "4px";
+      var label = document.createElement("div");
+      label.textContent = labelText;
+      label.style.fontSize = "11px";
+      label.style.color = "rgba(255,255,255,0.55)";
+      var value = document.createElement("div");
+      value.textContent = "-";
+      value.style.fontSize = "13px";
+      value.style.fontWeight = "700";
+      value.style.color = "#e5e7eb";
+      wrap.append(label, value);
+      return { wrap: wrap, value: value };
+    }
+
+    var metaTitle = buildMeta("Judul");
+    var metaHost = buildMeta("Host");
+    var metaMode = buildMeta("Mode");
+    var metaCategory = buildMeta("Kategori");
+    meta.append(metaTitle.wrap, metaHost.wrap, metaMode.wrap, metaCategory.wrap);
+
+    var chatWrap = document.createElement("div");
+    chatWrap.style.cssText = "flex:1; min-height:320px; border:1px solid rgba(255,255,255,0.06); border-radius:14px; background:linear-gradient(180deg,#0b1220 0%,#0c1326 100%); overflow:auto; position:relative; box-shadow:0 16px 40px rgba(0,0,0,0.35); padding:0 0 10px 0; display:flex; flex-direction:column;";
+
+    var chatList = document.createElement("div");
+    chatList.style.display = "flex";
+    chatList.style.flexDirection = "column";
+    chatList.style.gap = "6px";
+    chatList.style.padding = "12px 12px 18px 12px";
+    chatWrap.appendChild(chatList);
+
+    function sanitizeHtml(dirty) {
+      if (typeof DOMPurify !== "undefined") {
+        return DOMPurify.sanitize(dirty || "", {
+          ALLOWED_TAGS: ["p","br","strong","b","em","i","u","ul","ol","li",
+                         "blockquote","code","pre","h1","h2","h3","h4","span",
+                         "a","img","div","table","thead","tbody","tr","th","td"],
+          ALLOWED_ATTR: ["class","href","src","alt","title","colspan","rowspan"],
+          ALLOW_DATA_ATTR: false
+        });
+      }
+      var allowedTags = new Set(["p","br","strong","b","em","i","ul","ol","li","blockquote","code","pre","h1","h2","h3","h4","span"]);
+      var allowedAttrs = new Set(["class"]);
+      var doc = new DOMParser().parseFromString(dirty || "", "text/html");
+      var tmp = doc.body;
+      var walker = function(node) {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          if (!allowedTags.has(node.tagName.toLowerCase())) {
+            var parent = node.parentNode;
+            while (node.firstChild) parent.insertBefore(node.firstChild, node);
+            parent.removeChild(node);
+            return;
+          }
+          for (var i = node.attributes.length - 1; i >= 0; i--) {
+            var attr = node.attributes[i];
+            var name = attr.name.toLowerCase();
+            if (name.startsWith("on") || name === "style" || !allowedAttrs.has(name)) {
+              node.removeAttribute(attr.name);
+              continue;
+            }
+            var val = attr.value.toLowerCase();
+            if (/^\s*(?:javascript|data|vbscript|file):/i.test(val)) {
+              node.removeAttribute(attr.name);
+            }
+          }
+        }
+        for (var j = 0; j < node.childNodes.length; j++) {
+          walker(node.childNodes[j]);
+        }
+      };
+      for (var k = 0; k < tmp.childNodes.length; k++) {
+        walker(tmp.childNodes[k]);
+      }
+      return tmp.innerHTML;
+    }
+
+    function renderMessage(role, text, html, turnId) {
+      var card = turnId ? document.getElementById("lp-msg-" + turnId) : null;
+      var body = card ? card.querySelector(".msg-body") : null;
+
+      if (!card) {
+        card = document.createElement("div");
+        if (turnId) { card.id = "lp-msg-" + turnId; }
+        card.style.background = "rgba(255,255,255,0.02)";
+        card.style.border = "1px solid rgba(255,255,255,0.04)";
+        card.style.borderRadius = "12px";
+        card.style.padding = "10px 12px";
+        card.style.color = "#e5e7eb";
+        card.style.userSelect = "text";
+        card.style.webkitUserSelect = "text";
+
+        var head = document.createElement("div");
+        head.style.display = "flex";
+        head.style.justifyContent = "space-between";
+        head.style.alignItems = "center";
+        head.style.marginBottom = "6px";
+
+        var labelAndBtnCont = document.createElement("div");
+        labelAndBtnCont.style.display = "flex";
+        labelAndBtnCont.style.alignItems = "center";
+        labelAndBtnCont.style.gap = "8px";
+
+        var label = document.createElement("span");
+        label.textContent = role === "assistant" ? "ChatGPT" : "Anda";
+        label.style.fontWeight = "700";
+        label.style.fontSize = "12px";
+        label.style.color = role === "assistant" ? "#7dd3fc" : "rgba(255,255,255,0.65)";
+
+        // ADD COPY BUTTON (Option 5 feature)
+        var copyBtn = document.createElement("button");
+        copyBtn.textContent = "Copy";
+        copyBtn.style.padding = "2px 6px";
+        copyBtn.style.fontSize = "10px";
+        copyBtn.style.background = "rgba(255,255,255,0.1)";
+        copyBtn.style.border = "none";
+        copyBtn.style.borderRadius = "4px";
+        copyBtn.style.color = "#ccc";
+        copyBtn.style.cursor = "pointer";
+        copyBtn.onclick = function() {
+          navigator.clipboard.writeText(body ? body.innerText : text)
+            .then(function() {
+              copyBtn.textContent = "Copied!";
+              setTimeout(function() { copyBtn.textContent = "Copy"; }, 2000);
+            }).catch(function() {});
+        };
+
+        labelAndBtnCont.append(label, copyBtn);
+
+        var time = document.createElement("span");
+        time.textContent = new Date().toLocaleTimeString();
+        time.style.fontSize = "11px";
+        time.style.color = "rgba(255,255,255,0.45)";
+        head.append(labelAndBtnCont, time);
+
+        body = document.createElement("div");
+        body.className = "msg-body";
+        body.style.fontSize = "14px";
+        body.style.lineHeight = "1.65";
+        body.style.whiteSpace = "normal";
+        body.style.userSelect = "text";
+        body.style.webkitUserSelect = "text";
+
+        card.append(head, body);
+        chatList.appendChild(card);
+      }
+
+      var safeHtml = html ? sanitizeHtml(html) : "";
+      if (safeHtml) {
+        body.innerHTML = safeHtml;
+      } else {
+        body.textContent = text || "";
+      }
+      chatList.scrollTop = chatList.scrollHeight;
+    }
+
+    var footer = document.createElement("div");
+    footer.style.display = "flex";
+    footer.style.justifyContent = "space-between";
+    footer.style.alignItems = "center";
+    footer.style.gap = "10px";
+    footer.style.fontSize = "11px";
+    footer.style.color = "rgba(255,255,255,0.55)";
+    var hint = document.createElement("div");
+    hint.textContent = "Tip: tekan Esc untuk tutup panel.";
+    footer.appendChild(hint);
+
+    titleWrap.append(heading, subtitle);
+    root.append(header, meta, chatWrap, footer);
+
+    function formatHost(url) {
+      try { return new URL(url).hostname.replace(/^www\\./, ""); } catch (err) { return ""; }
+    }
+
+    var initialRendered = false;
+
+    function update(data) {
+      var d = data && typeof data === "object" ? data : {};
+      heading.textContent = d.title && d.title.trim() ? d.title.trim() : "Ringkasan";
+      subtitle.textContent = d.url ? (formatHost(d.url) || d.url) : "";
+      modePill.textContent = d.modeLabel || d.summaryMode || "Deep";
+      metaTitle.value.textContent = heading.textContent;
+      metaHost.value.textContent = subtitle.textContent || "-";
+      metaMode.value.textContent = modePill.textContent;
+      metaCategory.value.textContent = d.categoryName || "-";
+      if (!initialRendered && Array.isArray(d.initialMessages) && d.initialMessages.length) {
+        d.initialMessages.forEach(function(m) {
+          renderMessage(m.role || "assistant", m.text || "", m.html || "");
+        });
+        initialRendered = true;
+      }
+    }
+
+    function close() {
+      document.removeEventListener("keydown", onKeyDown, true);
+      if (root.parentNode) root.parentNode.removeChild(root);
+      var backdropEl = document.getElementById(BACKDROP_ID);
+      if (backdropEl && backdropEl.parentNode) {
+        backdropEl.parentNode.removeChild(backdropEl);
+      }
+      if (lpApi.runtime && lpApi.runtime.onMessage && listenerAdded) {
+        try { lpApi.runtime.onMessage.removeListener(onMessage); } catch (err) {}
+      }
+    }
+
+    function onKeyDown(event) {
+      event.stopPropagation();
+      event.preventDefault();
+      if (event.key === "Escape") {
+        close();
+      }
+    }
+
+    backdrop.addEventListener("click", close);
+    closeBtn.addEventListener("click", close);
+    document.addEventListener("keydown", onKeyDown, true);
+
+    var listenerAdded = false;
+    function onMessage(message) {
+      if (!message) return;
+      if (message.type === "summary-sidebar-data") {
+        update(message.payload || {});
+        return { ok: true };
+      }
+      if (message.type === "summary-sidebar-chat") {
+        renderMessage(message.payload.role || "assistant", message.payload.text || "", message.payload.html || "", message.payload.turnId || "");
+        return { ok: true };
+      }
+    }
+    if (lpApi.runtime && lpApi.runtime.onMessage && lpApi.runtime.onMessage.addListener) {
+      lpApi.runtime.onMessage.addListener(onMessage);
+      listenerAdded = true;
+    }
+
+    root.__lpSummaryUpdate = update;
+    backdrop.__lpSummaryClose = close;
+
+    document.body.appendChild(backdrop);
+    document.body.appendChild(root);
+    requestAnimationFrame(function() {
+      root.style.transform = "translateX(0)";
+      root.style.opacity = "1";
+      backdrop.style.opacity = "1";
+    });
+    update(baseData);
+  })();`;
+}
+
+async function showSummarySidebar(initialData, tabId) {
+  if (!lpApi.tabs) return { ok: false, reason: "tabs-unavailable" };
+  // Use one consistent sidebar path via sidebar.html.
+  if (lpApi.sidebarAction && lpApi.sidebarAction.open) {
+    let targetWindowId = null;
+    if (typeof tabId === "number" && lpApi.tabs && lpApi.tabs.get) {
+      try {
+        const tab = await lpApi.tabs.get(tabId);
+        if (tab && typeof tab.windowId === "number") {
+          targetWindowId = tab.windowId;
+        }
+      } catch (err) {
+        targetWindowId = null;
+      }
+    }
+    const opened = await ensureSidebarOpen(targetWindowId);
+    if (opened) {
+      return { ok: true, remoteSidebar: true };
+    }
+  }
+  return { ok: false, reason: "sidebar-open-failed" };
+}
+
+async function cycleCategory(direction) {
+  const settings = await getSettings();
+  const data = await lpStoreGet([
+    ITEM_KEY,
+    CATEGORY_KEY,
+    SELECTED_CATEGORY_KEY,
+    CATEGORY_PICKER_LAST_LOCATION_KEY,
+  ]);
+  const items = coerceArray(data[ITEM_KEY]);
+  const categories = sortCategories(coerceArray(data[CATEGORY_KEY]));
+  const counts = buildCategoryCounts(items, categories, {
+    showHiddenCategories: settings.showHiddenCategories,
+  });
+  const cycle = buildCategoryCycle(categories, settings);
+  if (!cycle.length) return;
+  let current = data[SELECTED_CATEGORY_KEY] ? data[SELECTED_CATEGORY_KEY] : "";
+  if (!cycle.includes(current)) {
+    current = cycle[0];
+  }
+  const step = typeof direction === "number" && direction < 0 ? -1 : 1;
+  const currentIndex = cycle.indexOf(current);
+  const nextIndex = (currentIndex + step + cycle.length) % cycle.length;
+  const next = cycle[nextIndex];
+  await lpStoreSet({ [SELECTED_CATEGORY_KEY]: next });
+  await showCategoryNotification(next, categories, counts);
+}
+
+function serializeCategoryCountsForPicker(counts) {
+  const safeCounts = counts && typeof counts === "object" ? counts : {};
+  const rawById = safeCounts.byId && typeof safeCounts.byId === "object"
+    ? safeCounts.byId
+    : {};
+  const byId = {};
+  Object.keys(rawById).forEach((key) => {
+    const value = Number(rawById[key]);
+    byId[key] = Number.isFinite(value) ? Math.max(0, value) : 0;
+  });
+  const all = Number(safeCounts.all);
+  const none = Number(safeCounts.none);
+  const hiddenNone = Number(safeCounts.hiddenNone);
+  return {
+    all: Number.isFinite(all) ? Math.max(0, all) : 0,
+    none: Number.isFinite(none) ? Math.max(0, none) : 0,
+    hiddenNone: Number.isFinite(hiddenNone) ? Math.max(0, hiddenNone) : 0,
+    byId,
+  };
+}
+
+function mapItemToPickerPayload(item) {
+  if (!item || typeof item !== "object") return null;
+  const youtubeThumbnailUrl = item.youtubeThumbnailUrl
+    ? String(item.youtubeThumbnailUrl)
+    : buildYouTubeThumbnailUrl(item.url || "");
+  return {
+    id: item.id ? String(item.id) : "",
+    url: item.url ? String(item.url) : "",
+    title: item.title ? String(item.title) : "",
+    siteName: item.siteName ? String(item.siteName) : "",
+    categoryId: item.categoryId ? String(item.categoryId) : "",
+    savedAt: item.savedAt ? String(item.savedAt) : "",
+    favorite: item.favorite === true,
+    faviconUrl: item.faviconUrl ? String(item.faviconUrl) : "",
+    thumbnailUrl: item.thumbnailUrl ? String(item.thumbnailUrl) : "",
+    youtubeThumbnailUrl,
+    manualOrder: getManualOrderValue(item),
+    favoriteOrder: getFavoriteOrderValue(item),
+    linkHealth: item.linkHealth ? item.linkHealth : null,
+  };
+}
+
+function buildPickerScopeKey(options = {}) {
+  const categoryId = options.categoryId ? String(options.categoryId) : "none";
+  const itemFilter = options.itemFilter === "fav" ? "fav" : "all";
+  let showHidden = options.showHiddenCategories;
+  if (showHidden === true) showHidden = 1;
+  if (showHidden === false || typeof showHidden === "undefined") showHidden = 0;
+  return `${categoryId}|${itemFilter}|${showHidden}`;
+}
+
+function filterItemsForPickerScope(items, categories, options = {}) {
+  const safeItems = coerceArray(items);
+  const safeCategories = coerceArray(categories);
+  let showHiddenCategories = options.showHiddenCategories;
+  if (showHiddenCategories === true) showHiddenCategories = 1;
+  if (showHiddenCategories === false || typeof showHiddenCategories === "undefined") showHiddenCategories = 0;
+
+  const categoryId = options.categoryId ? String(options.categoryId) : "none";
+  const itemFilter = options.itemFilter === "fav" ? "fav" : "all";
+  const hiddenCategoryIds = new Set(
+    safeCategories
+      .filter((cat) => cat && cat.id && cat.hidden === true)
+      .map((cat) => String(cat.id)),
+  );
+
+  let list = safeItems.slice();
+  if (showHiddenCategories === 2) {
+    if (categoryId === "hidden_none") {
+      list = list.filter((item) => item && item.categoryId === "hidden_none");
+    } else {
+      list = list.filter((item) => {
+        const itemCategoryId = item && item.categoryId ? String(item.categoryId) : "";
+        if (itemCategoryId === "hidden_none") return true;
+        return itemCategoryId && hiddenCategoryIds.has(itemCategoryId);
+      });
+    }
+  } else if (showHiddenCategories === 0) {
+    list = list.filter((item) => {
+      const itemCatId = item && item.categoryId ? String(item.categoryId) : "";
+      if (itemCatId === "hidden_none") return false;
+      return !itemCatId || !hiddenCategoryIds.has(itemCatId);
+    });
+  }
+
+  if (categoryId === "all") {
+    // keep all
+  } else if (categoryId === "hidden_none") {
+    list = list.filter((item) => item && item.categoryId === "hidden_none");
+  } else if (!categoryId || categoryId === "none") {
+    list = list.filter((item) => !item || !item.categoryId);
+  } else {
+    list = list.filter((item) => item && String(item.categoryId || "") === categoryId);
+  }
+
+  if (itemFilter === "fav") {
+    list = list.filter((item) => item && item.favorite === true);
+  }
+  return list;
+}
+
+function countVisibleFavoriteItemsForPicker(items, categories, showHiddenCategories) {
+  const safeItems = coerceArray(items);
+  const safeCategories = coerceArray(categories);
+  const hiddenCategoryIds = new Set(
+    safeCategories
+      .filter((cat) => cat && cat.id && cat.hidden === true)
+      .map((cat) => String(cat.id)),
+  );
+  return safeItems.reduce((count, item) => {
+    if (!item || item.favorite !== true) return count;
+    const itemCategoryId = item.categoryId ? String(item.categoryId) : "";
+    const isHidden = itemCategoryId && hiddenCategoryIds.has(itemCategoryId);
+    if (showHiddenCategories === 2) {
+      if (!isHidden) return count;
+    } else if (!showHiddenCategories && isHidden) {
+      return count;
+    }
+    return count + 1;
+  }, 0);
+}
+
+async function buildCategoryPickerItemsPayload(request, options = {}) {
+  const settings = await getSettings();
+  const [data, itemsFromCache] = await Promise.all([
+    lpApi.storage.local.get([CATEGORY_KEY]),
+    getItems(),
+  ]);
+  let items = coerceArray(itemsFromCache);
+  const filled = ensureManualOrderDefaults(items);
+  if (filled.changed) {
+    items = filled.items;
+    await setItems(items);
+  }
+  const categories = sortCategories(coerceArray(data[CATEGORY_KEY]));
+  let showHiddenCategories = request && typeof request.showHiddenCategories !== "undefined"
+    ? request.showHiddenCategories
+    : settings.showHiddenCategories;
+
+  if (showHiddenCategories === true) showHiddenCategories = 1;
+  if (showHiddenCategories === false || typeof showHiddenCategories === "undefined") showHiddenCategories = 0;
+  const categoryId = request && typeof request.categoryId !== "undefined"
+    ? String(request.categoryId || "none")
+    : "none";
+  const itemFilter = request && request.itemFilter === "fav" ? "fav" : "all";
+  const counts = buildCategoryCounts(items, categories, { showHiddenCategories });
+  const scopedItems = filterItemsForPickerScope(items, categories, {
+    categoryId,
+    itemFilter,
+    showHiddenCategories,
+  });
+  const tabUrl = options && options.tabUrl ? String(options.tabUrl) : "";
+  const currentItemSummary = tabUrl
+    ? mapItemToPickerPayload(
+      items.find((item) => urlsMatchForSave(tabUrl, item && item.url ? item.url : "")) || null,
+    )
+    : null;
+  return {
+    items: scopedItems.map((item) => mapItemToPickerPayload(item)).filter(Boolean),
+    allItems: items.map((item) => mapItemToPickerPayload(item)).filter(Boolean),
+    counts: serializeCategoryCountsForPicker(counts),
+    favoriteCountVisible: countVisibleFavoriteItemsForPicker(items, categories, showHiddenCategories),
+    currentItemSummary,
+    loadedItemsScopeKey: buildPickerScopeKey({
+      categoryId,
+      itemFilter,
+      showHiddenCategories,
+    }),
+  };
+}
+
+async function buildCategoryPickerPayload(options) {
+  const [settings, data, pickerToggleShortcut] = await Promise.all([
+    currentSettings ? Promise.resolve(currentSettings) : getSettings(),
+    lpApi.storage.local.get([
+      ITEM_KEY,
+      CATEGORY_KEY,
+      SELECTED_CATEGORY_KEY,
+      CATEGORY_PICKER_LAST_LOCATION_KEY,
+    ]),
+    getCommandShortcut("open-category-picker"),
+  ]);
+  let items = coerceArray(data[ITEM_KEY]);
+  const filled = ensureManualOrderDefaults(items);
+  if (filled.changed) {
+    items = filled.items;
+    await setItems(items);
+  }
+  const categories = sortCategories(coerceArray(data[CATEGORY_KEY]));
+  const counts = buildCategoryCounts(items, categories, {
+    showHiddenCategories: settings.showHiddenCategories,
+  });
+  let currentTabUrl = "";
+  let currentTabTitle = "";
+  let currentTabId = options && options.tabId ? options.tabId : null;
+  try {
+    if (options && options.tabUrl) {
+      currentTabUrl = options.tabUrl;
+    }
+    if (options && options.tabTitle) {
+      currentTabTitle = options.tabTitle;
+    }
+    if (
+      (!currentTabUrl || !currentTabTitle) &&
+      options &&
+      options.tabId &&
+      lpApi.tabs &&
+      lpApi.tabs.get
+    ) {
+      const tab = await promisifyTabsGet(options.tabId);
+      if (tab && tab.id) {
+        currentTabId = tab.id;
+      }
+      if (!currentTabUrl) {
+        currentTabUrl = tab && tab.url ? tab.url : "";
+      }
+      if (!currentTabTitle) {
+        currentTabTitle = tab && tab.title ? tab.title : "";
+      }
+    } else if (
+      (!currentTabUrl || !currentTabTitle) &&
+      lpApi.tabs &&
+      lpApi.tabs.query
+    ) {
+      const tabs = await promisifyTabsQuery({
+        active: true,
+        currentWindow: true,
+      });
+      if (!currentTabId) {
+        currentTabId = tabs && tabs[0] && tabs[0].id ? tabs[0].id : null;
+      }
+      if (!currentTabUrl) {
+        currentTabUrl = tabs && tabs[0] && tabs[0].url ? tabs[0].url : "";
+      }
+      if (!currentTabTitle) {
+        currentTabTitle = tabs && tabs[0] && tabs[0].title ? tabs[0].title : "";
+      }
+    }
+  } catch (err) {
+    if (!currentTabUrl) currentTabUrl = "";
+    if (!currentTabTitle) currentTabTitle = "";
+  }
+  if (
+    currentTabId &&
+    (looksLikeUrlText(
+      normalizeExtractedTitle(currentTabTitle),
+      currentTabUrl,
+    ) ||
+      isGenericFallbackTitleText(currentTabTitle)) &&
+    lpApi.tabs &&
+    lpApi.tabs.executeScript
+  ) {
+    try {
+      const scriptResult = await executeScriptSafe(currentTabId, {
+        code: "(function () { return document && document.title ? document.title : ''; })();",
+      });
+      const pageTitle = Array.isArray(scriptResult)
+        ? scriptResult[0]
+        : scriptResult;
+      const normalizedPageTitle = normalizeExtractedTitle(pageTitle);
+      if (
+        normalizedPageTitle &&
+        !looksLikeUrlText(normalizedPageTitle, currentTabUrl)
+      ) {
+        currentTabTitle = normalizedPageTitle;
+      }
+    } catch (err) {
+      // ignore pages that block script execution
+    }
+  }
+  const matchedCurrentIndex = currentTabUrl
+    ? items.findIndex((item) =>
+      urlsMatchForSave(currentTabUrl, item && item.url ? item.url : ""),
+    )
+    : -1;
+  const matchedCurrentItem =
+    matchedCurrentIndex >= 0 ? items[matchedCurrentIndex] : null;
+  const matchedCurrentItemId =
+    matchedCurrentItem && matchedCurrentItem.id
+      ? String(matchedCurrentItem.id)
+      : "";
+  const matchedCurrentUrl =
+    matchedCurrentItem && matchedCurrentItem.url
+      ? String(matchedCurrentItem.url)
+      : "";
+  if (matchedCurrentUrl) {
+    currentTabUrl = matchedCurrentUrl;
+  }
+
+  const normalizedCurrentTabTitle = normalizeExtractedTitle(currentTabTitle);
+  const normalizedStoredCurrentTitle =
+    matchedCurrentItem && matchedCurrentItem.title
+      ? normalizeExtractedTitle(matchedCurrentItem.title)
+      : "";
+  const titleReferenceUrl = matchedCurrentUrl || currentTabUrl;
+  let resolvedCurrentTitle = "";
+  if (
+    normalizedCurrentTabTitle &&
+    !looksLikeUrlText(normalizedCurrentTabTitle, titleReferenceUrl) &&
+    !isGenericFallbackTitleText(normalizedCurrentTabTitle)
+  ) {
+    resolvedCurrentTitle = normalizedCurrentTabTitle;
+  } else if (
+    normalizedStoredCurrentTitle &&
+    !looksLikeUrlText(normalizedStoredCurrentTitle, titleReferenceUrl) &&
+    !isGenericFallbackTitleText(normalizedStoredCurrentTitle)
+  ) {
+    resolvedCurrentTitle = normalizedStoredCurrentTitle;
+  } else if (currentTabUrl) {
+    // Skip remote fetch to keep picker opening instant; rely on tab/stored titles
+    resolvedCurrentTitle = "";
+  }
+  if (resolvedCurrentTitle) {
+    currentTabTitle = resolvedCurrentTitle;
+  }
+  if (
+    matchedCurrentIndex >= 0 &&
+    currentTabTitle &&
+    !looksLikeUrlText(currentTabTitle, matchedCurrentUrl || currentTabUrl) &&
+    normalizeExtractedTitle(matchedCurrentItem.title) !== currentTabTitle
+  ) {
+    items = items.slice();
+    items[matchedCurrentIndex] = {
+      ...matchedCurrentItem,
+      title: currentTabTitle,
+    };
+    // Persist update lazily to avoid blocking picker open
+    updateStoredItemByIdentity(
+      matchedCurrentItemId,
+      matchedCurrentUrl || currentTabUrl,
+      (currentItem) => {
+        const liveTitle =
+          currentItem && currentItem.title
+            ? normalizeExtractedTitle(currentItem.title)
+            : "";
+        if (liveTitle === currentTabTitle) {
+          return currentItem;
+        }
+        return { ...currentItem, title: currentTabTitle };
+      },
+    ).catch(() => { });
+  }
+  const selectedCategoryId = data[SELECTED_CATEGORY_KEY]
+    ? data[SELECTED_CATEGORY_KEY]
+    : "none";
+  // Baca storedLastLocation tanpa mengira pickerStartMode — untuk highlight "last opened"
+  // yang perlu berfungsi walau apa mode pun (termasuk "home").
+  const storedLastLocation = data[CATEGORY_PICKER_LAST_LOCATION_KEY] &&
+    typeof data[CATEGORY_PICKER_LAST_LOCATION_KEY] === "object"
+      ? data[CATEGORY_PICKER_LAST_LOCATION_KEY]
+      : null;
+  const rawLastLocation = (settings.pickerStartMode === "last" || settings.pickerStartMode === "last-category" || settings.pickerStartMode === "last-page" || settings.pickerStartMode === "last-link") &&
+    storedLastLocation
+      ? storedLastLocation
+      : null;
+  // Jika kategori terpilih (dari mini picker atau luar) berbeza dari lokasi terakhir picker,
+  // override lokasi supaya picker buka dengan kategori yang betul.
+  // PENTING: Kekalkan lastOpenedItemId dan lastOpenedAt supaya highlight "last opened" tidak hilang.
+  const resolvedLastLocation = rawLastLocation && rawLastLocation.categoryId &&
+    String(rawLastLocation.categoryId) !== String(selectedCategoryId)
+      ? { ...rawLastLocation, categoryId: selectedCategoryId, itemId: "", url: "" }
+      : rawLastLocation;
+  // Pastikan lastOpenedItemId tidak hilang walaupun categoryId di-override
+  if (resolvedLastLocation && rawLastLocation &&
+      resolvedLastLocation !== rawLastLocation &&
+      rawLastLocation.lastOpenedItemId) {
+    resolvedLastLocation.lastOpenedItemId = rawLastLocation.lastOpenedItemId;
+    resolvedLastLocation.lastOpenedAt = rawLastLocation.lastOpenedAt || 0;
+  }
+  const payload = {
+    selected: selectedCategoryId,
+    includeAll: settings.cycleIncludeAll !== false,
+    includeUncategorized: settings.cycleIncludeUncategorized !== false,
+    counts: serializeCategoryCountsForPicker(counts),
+    favoriteCountVisible: countVisibleFavoriteItemsForPicker(
+      items,
+      categories,
+      settings.showHiddenCategories,
+    ),
+    showHiddenCategories: settings.showHiddenCategories,
+    categoryPickerLastLocation: resolvedLastLocation || (storedLastLocation && storedLastLocation.lastOpenedItemId ? {
+      mode: "items",
+      categoryId: selectedCategoryId,
+      page: 1,
+      itemId: "",
+      url: "",
+      itemFilter: "all",
+      sortDir: "manual",
+      lastOpenedItemId: String(storedLastLocation.lastOpenedItemId),
+      lastOpenedAt: storedLastLocation.lastOpenedAt || 0,
+    } : null),
+    categories: categories.map((cat) => ({
+      id: cat.id,
+      name: cat.name,
+      count: typeof counts.byId[cat.id] === "number" ? counts.byId[cat.id] : 0,
+      hidden: !!cat.hidden,
+      icon: cat.icon ? String(cat.icon) : "",
+    })),
+    items: [],
+    currentItemSummary: mapItemToPickerPayload(matchedCurrentItem),
+    clearLoadedItems: true,
+    currentTabUrl,
+    currentTabTitle,
+    pageSize: settings.pageSize,
+    pickerAnimation: settings.pickerAnimation || "fade",
+    pickerAnimationDuration: settings.pickerAnimationDuration || 200,
+    pickerLayout: settings.pickerLayout || "cozy",
+    pickerYoutubeThumbnails: settings.pickerYoutubeThumbnails !== false,
+    favoritesSortMode: settings.favoritesSortMode || "manual",
+    hoverSoundEnabled: settings.pickerHoverSound === true,
+    hoverSoundUrl: (() => {
+      const sounds = Array.isArray(settings.pickerHoverSounds)
+        ? settings.pickerHoverSounds
+        : [];
+      const activeId = settings.activePickerHoverSoundId || "";
+      const match = sounds.find((s) => s && s.id === activeId);
+      if (match && match.dataUrl) return match.dataUrl;
+      // Legacy fallback
+      return settings.pickerHoverSoundUrl || "";
+    })(),
+    themePreset: settings.themePreset || "classic",
+    customThemeColors: settings.customThemeColors || null,
+    pickerHighlightColor: settings.pickerHighlightColor || "#48d597",
+    pickerStartMode: settings.pickerStartMode || "home",
+    navigationFavoritesOnly: settings.navigationFavoritesOnly === true,
+    youtubeAutoNext: settings.youtubeAutoNext === true,
+    youtubeAutoRandom: settings.youtubeAutoRandom === true,
+    deleteAfterOpen: settings.deleteAfterOpen === true,
+    randomAcrossAllCategories: settings.randomAcrossAllCategories === true,
+    enableDedupeButton: settings.enableDedupeButton !== false,
+    sidebarAiProvider: settings.sidebarAiProvider || "chatgpt",
+
+    categoryPaletteShortcut: settings.categoryPaletteShortcut || "M",
+    pickerNextPageShortcut: settings.pickerNextPageShortcut || "",
+    pickerToggleDeleteAfterOpenShortcut: settings.pickerToggleDeleteAfterOpenShortcut || "",
+    pickerToggleShowHiddenShortcut: settings.pickerToggleShowHiddenShortcut || "",
+    pickerImportShortcut: settings.pickerImportShortcut || "",
+    pickerExportShortcut: settings.pickerExportShortcut || "",
+    pickerClearFavShortcut: settings.pickerClearFavShortcut || "",
+    pickerRestoreFavShortcut: settings.pickerRestoreFavShortcut || "",
+    pickerAutoNextShortcut: settings.pickerAutoNextShortcut || "",
+    pickerAutoRandomShortcut: settings.pickerAutoRandomShortcut || "",
+    pickerSelectPageShortcut: settings.pickerSelectPageShortcut || "",
+    pickerClearSelectionShortcut: settings.pickerClearSelectionShortcut || "",
+    pickerBulkDeleteShortcut: settings.pickerBulkDeleteShortcut || "",
+    pickerBulkFavShortcut: settings.pickerBulkFavShortcut || "",
+    pickerRenameCategoryShortcut: settings.pickerRenameCategoryShortcut || "",
+    pickerScanDupShortcut: settings.pickerScanDupShortcut || "",
+    pickerFavShortcut: settings.pickerFavShortcut || "F",
+    pickerToggleFavShortcut: settings.pickerToggleFavShortcut || "",
+    pickerTrashShortcut: settings.pickerTrashShortcut || "",
+    pickerPinShortcut: settings.pickerPinShortcut || "",
+    pickerToggleSelfShortcut: pickerToggleShortcut || "",
+  };
+  if (options && options.forceCategories) {
+    payload.forceCategories = true;
+    payload.pickerStartMode = "home";
+  }
+  if (options && options.openTrash) {
+    payload.openTrash = true;
+  }
+  return { payload, tabId: currentTabId };
+}
+
+async function openCategoryPicker(options) {
+  try {
+    const settings = currentSettings || await getSettings();
+    if (settings.enableCategoryPicker === false) {
+      debugLog("openCategoryPicker skipped: enableCategoryPicker is disabled");
+      return false;
+    }
+    const { payload, tabId } = await buildCategoryPickerPayload(options);
+    if (tabId) {
+      pendingPickerPayloads.set(String(tabId), {
+        payload,
+        timestamp: Date.now()
+      });
+    }
+    const result = await showCategoryPicker(payload, tabId);
+    // Track state picker supaya toggle boleh close walaupun DOM query gagal (contoh: YouTube)
+    if (result !== false) {
+      setCategoryPickerOpenState(tabId, true);
+    }
+    return result;
+  } catch (err) {
+    lpErr("openCategoryPicker failed", err);
+    throw err;
+  }
+}
+
+// Debounce toggle per-tab: elak double-toggle apabila YouTube (atau mana-mana domain)
+// menghantar event keyboard dua kali dalam masa singkat (contoh: Alt+Q ditekan sekali tapi
+// browser fires command dua kali kerana YouTube intercept/replay keyboard events).
+const _toggleCategoryPickerLastAt = new Map();
+const TOGGLE_CATEGORY_PICKER_DEBOUNCE_MS = 600;
+
+// Track state picker per-tab sebagai fallback apabila DOM query gagal (contoh: YouTube CSP).
+// true = picker sedang terbuka, false/absent = picker tutup.
+const _categoryPickerOpenByTabId = new Map();
+
+function setCategoryPickerOpenState(tabId, isOpen) {
+  if (!tabId) return;
+  const key = String(tabId);
+  if (isOpen) {
+    _categoryPickerOpenByTabId.set(key, true);
+  } else {
+    _categoryPickerOpenByTabId.delete(key);
+  }
+}
+
+function getCategoryPickerOpenState(tabId) {
+  if (!tabId) return false;
+  return _categoryPickerOpenByTabId.get(String(tabId)) === true;
+}
+
+async function toggleCategoryPicker(options) {
+  debugLog("toggleCategoryPicker triggered with options:", options);
+  // Try to close if picker is already open in the target tab; otherwise open.
+  let targetTabId = options && options.tabId ? options.tabId : null;
+  if (!targetTabId && lpApi.tabs && lpApi.tabs.query) {
+    try {
+      const tabs = await lpApi.tabs.query({ active: true, currentWindow: true });
+      targetTabId = tabs && tabs[0] && tabs[0].id ? tabs[0].id : null;
+    } catch (err) {
+      lpWarn("tabs.query failed", err);
+      targetTabId = null;
+    }
+  }
+
+  debugLog("toggleCategoryPicker targetTabId:", targetTabId);
+
+  // Debounce: elak double-trigger open dalam masa singkat.
+  // PENTING: Debounce HANYA apply untuk open (bukan close) supaya user boleh
+  // close picker walaupun baru dibuka. Kalau picker sudah terbuka, skip debounce.
+  const debounceKey = String(targetTabId || "no-tab");
+  const now = Date.now();
+  const lastAt = _toggleCategoryPickerLastAt.get(debounceKey) || 0;
+  const pickerIsOpen = getCategoryPickerOpenState(targetTabId);
+  if (!pickerIsOpen && (now - lastAt < TOGGLE_CATEGORY_PICKER_DEBOUNCE_MS)) {
+    debugLog("toggleCategoryPicker debounced for tab:", debounceKey);
+    return false;
+  }
+  _toggleCategoryPickerLastAt.set(debounceKey, now);
+  // Buang entry lama untuk elak memory leak
+  if (_toggleCategoryPickerLastAt.size > 50) {
+    const oldestKey = _toggleCategoryPickerLastAt.keys().next().value;
+    _toggleCategoryPickerLastAt.delete(oldestKey);
+  }
+
+  if (targetTabId && lpApi.tabs && lpApi.tabs.executeScript) {
+    let messageSuccessful = false;
+    try {
+      // Fast close via content script if picker is present.
+      const maybeClosed = await lpApi.tabs.sendMessage(targetTabId, {
+        type: "close-category-picker-direct",
+      });
+      messageSuccessful = true;
+      if (maybeClosed && maybeClosed.closed) {
+        debugLog("toggleCategoryPicker closed via message");
+        setCategoryPickerOpenState(targetTabId, false);
+        return true;
+      }
+      // sendMessage berjaya tapi picker tiada di DOM — bersihkan state yang mungkin basi.
+      // Kalau state kata picker terbuka tapi DOM kata tidak, erti picker ditutup dari dalam
+      // (ESC/butang tutup) tanpa memberitahu background. Clear state dan buka semula.
+      setCategoryPickerOpenState(targetTabId, false);
+    } catch (err) {
+      debugWarn("toggleCategoryPicker close via message failed", err);
+    }
+    if (!messageSuccessful) {
+      try {
+        const result = await executeScriptSafe(targetTabId, {
+          code: "(function(){ \"use strict\"; var el=document.getElementById('__local_pocket_category_picker');if(el){el.remove();return 'closed';}return 'absent';})();",
+        });
+        const status = Array.isArray(result) ? result[0] : result;
+        if (status === "closed") {
+          debugLog("toggleCategoryPicker closed via script");
+          setCategoryPickerOpenState(targetTabId, false);
+          return true; // toggled off
+        }
+        // executeScriptSafe berjaya tapi picker tiada — clear state basi dan terus buka
+        setCategoryPickerOpenState(targetTabId, false);
+      } catch (err) {
+        lpWarn("toggleCategoryPicker fast close check failed", err);
+        // DOM query gagal — gunakan state tracking sebagai fallback
+        if (getCategoryPickerOpenState(targetTabId)) {
+          debugLog("toggleCategoryPicker: DOM query failed but state says picker is open — treating as close");
+          setCategoryPickerOpenState(targetTabId, false);
+          // Cuba paksa close melalui executeScript dengan cara lain
+          try {
+            await executeScriptSafe(targetTabId, {
+              code: "(function(){ var el=document.getElementById('__local_pocket_category_picker');if(el)el.remove(); })();",
+            });
+          } catch (_) {}
+          return true;
+        }
+      }
+    }
+  }
+
+  // If not found or close failed, open picker.
+  debugLog("toggleCategoryPicker calling openCategoryPicker");
+  return openCategoryPicker(options);
+}
+
+function extractYouTubeVideoId(rawUrl) {
+  if (!rawUrl) return "";
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
+    let candidate = "";
+    if (host === "youtu.be") {
+      candidate = parsed.pathname.replace(/^\/+/, "").split("/")[0];
+    } else if (
+      host.endsWith("youtube.com") ||
+      host.endsWith("youtube-nocookie.com")
+    ) {
+      if (parsed.pathname.startsWith("/watch")) {
+        candidate = parsed.searchParams.get("v") || "";
+      } else {
+        const shortsMatch = parsed.pathname.match(/^\/shorts\/([^/?#]+)/);
+        const liveMatch = parsed.pathname.match(/^\/live\/([^/?#]+)/);
+        const embedMatch = parsed.pathname.match(/^\/embed\/([^/?#]+)/);
+        candidate =
+          (shortsMatch && shortsMatch[1]) ||
+          (liveMatch && liveMatch[1]) ||
+          (embedMatch && embedMatch[1]) ||
+          "";
+      }
+    }
+    const normalized = String(candidate || "").trim();
+    if (!/^[A-Za-z0-9_-]{6,}$/.test(normalized)) return "";
+    return normalized;
+  } catch (err) {
+    return "";
+  }
+}
+
+function buildYouTubeTranscriptExtractionScript(
+  requestId,
+  expectedVideoId,
+  options = {},
+) {
+  const safeRequestId = JSON.stringify(requestId || "");
+  const safeExpectedVideoId = JSON.stringify(expectedVideoId || "");
+  const safeAllowDomFallback =
+    options && options.allowDomFallback === true ? "true" : "false";
+  return `(function () {
+    "use strict";
+    var lpApi = typeof browser !== "undefined" ? browser : chrome;
+    var requestId = ${safeRequestId};
+    var expectedVideoId = ${safeExpectedVideoId};
+    var allowDomFallback = ${safeAllowDomFallback};
+
+    function send(result) {
+      try {
+        var payload = {
+          type: "youtube-transcript-result",
+          requestId: requestId,
+          result: result && typeof result === "object" ? result : { ok: false, reason: "invalid-result" }
+        };
+        var maybePromise = lpApi.runtime.sendMessage(payload);
+        if (maybePromise && typeof maybePromise.then === "function") {
+          maybePromise.catch(function() {});
+        }
+      } catch (err) {
+        // ignore
+      }
+    }
+
+    function extractVideoId(url) {
+      if (!url) return "";
+      try {
+        const parsed = new URL(url);
+        const host = (parsed.hostname || "").toLowerCase();
+        if (host === "youtu.be") {
+          return parsed.pathname.replace(/^\\/+/, "").split("/")[0] || "";
+        }
+        if (host.endsWith("youtube.com") || host.endsWith("youtube-nocookie.com")) {
+          if (parsed.pathname.indexOf("/watch") === 0) {
+            return parsed.searchParams.get("v") || "";
+          }
+          const shorts = parsed.pathname.match(/^\\/shorts\\/([^/?#]+)/);
+          if (shorts && shorts[1]) return shorts[1];
+          const live = parsed.pathname.match(/^\\/live\\/([^/?#]+)/);
+          if (live && live[1]) return live[1];
+          const embed = parsed.pathname.match(/^\\/embed\\/([^/?#]+)/);
+          if (embed && embed[1]) return embed[1];
+        }
+      } catch (err) {
+        return "";
+      }
+      return "";
+    }
+
+    function compactWhitespace(text) {
+      return String(text || "").replace(/\\s+/g, " ").trim();
+    }
+
+    function decodeHtmlEntities(text) {
+      if (!text) return "";
+      const el = document.createElement("textarea");
+      el.innerHTML = String(text);
+      return el.value;
+    }
+
+    function formatTimestampFromSeconds(seconds) {
+      const safe = Number(seconds);
+      if (!Number.isFinite(safe) || safe < 0) return "";
+      const total = Math.max(0, Math.floor(safe));
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      if (h > 0) {
+        return h + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+      }
+      return m + ":" + String(s).padStart(2, "0");
+    }
+
+    function buildTranscriptBundleFromSegments(segments) {
+      if (!Array.isArray(segments) || !segments.length) {
+        return { transcript: "", timestampedTranscript: "", totalSegments: 0, timestampedSegments: 0 };
+      }
+      var parts = [];
+      var timestampedParts = [];
+      var totalSegments = 0;
+      var timestampedSegments = 0;
+      var prev = "";
+      for (var i = 0; i < segments.length; i++) {
+        var segment = segments[i];
+        var text = compactWhitespace(segment && segment.text ? segment.text : "");
+        if (!text) continue;
+        if (text === prev) continue;
+        prev = text;
+        totalSegments += 1;
+        parts.push(text);
+        var time = compactWhitespace(segment && segment.time ? segment.time : "");
+        if (time) {
+          timestampedSegments += 1;
+          timestampedParts.push("[" + time + "] " + text);
+        }
+      }
+      return {
+        transcript: compactWhitespace(parts.join(" ")),
+        timestampedTranscript: timestampedParts.join("\\n"),
+        totalSegments: totalSegments,
+        timestampedSegments: timestampedSegments
+      };
+    }
+
+    function parseTranscriptFromJson3(jsonText) {
+      if (!jsonText) return { transcript: "", timestampedTranscript: "", totalSegments: 0, timestampedSegments: 0 };
+      try {
+        var payload = JSON.parse(jsonText);
+        var events = Array.isArray(payload && payload.events) ? payload.events : [];
+        var segments = [];
+        for (var i = 0; i < events.length; i++) {
+          var event = events[i];
+          var segs = Array.isArray(event && event.segs) ? event.segs : [];
+          var startMs = event && typeof event.tStartMs === "number"
+            ? event.tStartMs
+            : Number.parseFloat(event && event.tStartMs ? event.tStartMs : "");
+          var time = Number.isFinite(startMs) ? formatTimestampFromSeconds(startMs / 1000) : "";
+          for (var j = 0; j < segs.length; j++) {
+            var seg = segs[j];
+            if (!seg || !seg.utf8) continue;
+            var text = compactWhitespace(decodeHtmlEntities(seg.utf8));
+            if (!text) continue;
+            segments.push({ time: time, text: text });
+          }
+        }
+        return buildTranscriptBundleFromSegments(segments);
+      } catch (err) {
+        return { transcript: "", timestampedTranscript: "", totalSegments: 0, timestampedSegments: 0 };
+      }
+    }
+
+    function parseTranscriptFromSrv3(xmlText) {
+      if (!xmlText) return { transcript: "", timestampedTranscript: "", totalSegments: 0, timestampedSegments: 0 };
+      var segments = [];
+      var pattern = /<text\\b([^>]*)>([\\s\\S]*?)<\\/text>/g;
+      var match;
+      while ((match = pattern.exec(xmlText)) !== null) {
+        var attrs = match[1] ? String(match[1]) : "";
+        var raw = match[2] ? String(match[2]) : "";
+        var text = compactWhitespace(decodeHtmlEntities(raw.replace(/<[^>]+>/g, " ")));
+        if (!text) continue;
+        var startMatch = attrs.match(/\\bstart=\"([^\"]+)\"/i);
+        var startSeconds = startMatch && startMatch[1] ? Number.parseFloat(startMatch[1]) : NaN;
+        var time = Number.isFinite(startSeconds) ? formatTimestampFromSeconds(startSeconds) : "";
+        segments.push({ time, text });
+      }
+      return buildTranscriptBundleFromSegments(segments);
+    }
+
+    function extractJsonObjectAfterMarker(text, marker) {
+      if (!text || !marker) return "";
+      const markerIndex = text.indexOf(marker);
+      if (markerIndex < 0) return "";
+      const start = text.indexOf("{", markerIndex + marker.length);
+      if (start < 0) return "";
+      let depth = 0;
+      let inString = false;
+      let escaped = false;
+      for (let i = start; i < text.length; i += 1) {
+        const ch = text[i];
+        const charCode = ch.charCodeAt(0);
+        if (inString) {
+          if (escaped) {
+            escaped = false;
+          } else if (charCode === 92) {
+            escaped = true;
+          } else if (charCode === 34) {
+            inString = false;
+          }
+          continue;
+        }
+        if (charCode === 34) {
+          inString = true;
+          continue;
+        }
+        if (ch === "{") {
+          depth += 1;
+          continue;
+        }
+        if (ch === "}") {
+          depth -= 1;
+          if (depth === 0) {
+            return text.slice(start, i + 1);
+          }
+        }
+      }
+      return "";
+    }
+
+    function getPlayerResponse() {
+      if (window.ytInitialPlayerResponse) {
+        return window.ytInitialPlayerResponse;
+      }
+      var scripts = Array.from(document.querySelectorAll("script"));
+      for (var i = 0; i < scripts.length; i++) {
+        var script = scripts[i];
+        var text = script && script.textContent ? String(script.textContent) : "";
+        if (!text || text.indexOf("ytInitialPlayerResponse") < 0) continue;
+        var raw = extractJsonObjectAfterMarker(text, "ytInitialPlayerResponse");
+        if (!raw) continue;
+        try {
+          var parsed = JSON.parse(raw);
+          if (parsed) return parsed;
+        } catch (err) {
+          // try next block
+        }
+      }
+      return null;
+    }
+
+    function choosePreferredCaptionTrack(tracks) {
+      if (!Array.isArray(tracks) || !tracks.length) return null;
+      var languageOrder = ["ms", "id", "en", "en-us", "en-gb"];
+      var ranked = tracks
+        .filter(function(track) { return track && typeof track.baseUrl === "string" && track.baseUrl; })
+        .map(function(track) {
+          var code = String(track.languageCode || "").toLowerCase();
+          var langRank = 999;
+          for (var i = 0; i < languageOrder.length; i += 1) {
+            var preferred = languageOrder[i];
+            if (code === preferred || code.startsWith(preferred + "-")) {
+              langRank = i;
+              break;
+            }
+          }
+          var asrPenalty = track.kind === "asr" ? 1 : 0;
+          return { track: track, score: langRank * 10 + asrPenalty };
+        })
+        .sort(function(a, b) { return a.score - b.score; });
+      return ranked.length ? ranked[0].track : null;
+    }
+
+    async function fetchText(url) {
+      if (!url) return "";
+      var controller = null;
+      var timeoutId = null;
+      try {
+        if (typeof AbortController === "function") {
+          controller = new AbortController();
+          timeoutId = setTimeout(function() {
+            try {
+              controller.abort();
+            } catch (err) {}
+          }, 1800);
+        }
+        var response = await fetch(url, {
+          credentials: "include",
+          cache: "no-store",
+          signal: controller ? controller.signal : undefined,
+        });
+        if (!response.ok) return "";
+        return await response.text();
+      } catch (err) {
+        return "";
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+      }
+    }
+
+    async function tryCaptionTracks() {
+      const playerResponse = getPlayerResponse();
+      const tracks = playerResponse
+        && playerResponse.captions
+        && playerResponse.captions.playerCaptionsTracklistRenderer
+        && Array.isArray(playerResponse.captions.playerCaptionsTracklistRenderer.captionTracks)
+        ? playerResponse.captions.playerCaptionsTracklistRenderer.captionTracks
+        : [];
+      if (!tracks.length) {
+        return { ok: false, reason: "no-caption-tracks" };
+      }
+      const selectedTrack = choosePreferredCaptionTrack(tracks) || tracks[0];
+      if (!selectedTrack || !selectedTrack.baseUrl) {
+        return { ok: false, reason: "invalid-caption-track" };
+      }
+
+      let candidates = [];
+      try {
+        const json3 = new URL(selectedTrack.baseUrl);
+        json3.searchParams.set("fmt", "json3");
+        candidates.push({ url: json3.toString(), parser: "json3" });
+        const srv3 = new URL(selectedTrack.baseUrl);
+        srv3.searchParams.set("fmt", "srv3");
+        candidates.push({ url: srv3.toString(), parser: "srv3" });
+      } catch (err) {
+        candidates.push({ url: selectedTrack.baseUrl, parser: "srv3" });
+      }
+
+      for (const candidate of candidates) {
+        const body = await fetchText(candidate.url);
+        if (!body) continue;
+        const bundle = candidate.parser === "json3"
+          ? parseTranscriptFromJson3(body)
+          : parseTranscriptFromSrv3(body);
+        if (bundle && bundle.transcript) {
+          return {
+            ok: true,
+            transcript: bundle.transcript,
+            timestampedTranscript: bundle.timestampedTranscript || "",
+            totalSegments: bundle.totalSegments || 0,
+            timestampedSegments: bundle.timestampedSegments || 0,
+            languageCode: selectedTrack.languageCode || "",
+            autoGenerated: selectedTrack.kind === "asr",
+            source: "caption-track"
+          };
+        }
+      }
+      return { ok: false, reason: "empty-caption-track" };
+    }
+
+    function collectTranscriptSegmentsFromDom() {
+      const rows = Array.from(document.querySelectorAll("ytd-transcript-segment-renderer"));
+      const segments = [];
+      if (rows.length) {
+        for (const row of rows) {
+          const textNode = row.querySelector("#segment-text")
+            || row.querySelector(".segment-text")
+            || row.querySelector("yt-formatted-string.segment-text");
+          const timeNode = row.querySelector("#start")
+            || row.querySelector(".segment-timestamp")
+            || row.querySelector("yt-formatted-string.segment-timestamp");
+          const text = compactWhitespace(textNode && textNode.textContent ? textNode.textContent : "");
+          const time = compactWhitespace(timeNode && timeNode.textContent ? timeNode.textContent : "");
+          if (!text) continue;
+          segments.push({
+            time,
+            text,
+            key: (time ? time + "|" : "") + text
+          });
+        }
+        return segments;
+      }
+
+      const fallbackSelectors = [
+        "ytd-transcript-segment-renderer #segment-text",
+        "ytd-transcript-segment-renderer .segment-text",
+        "ytd-transcript-segment-renderer yt-formatted-string.segment-text"
+      ];
+      for (const selector of fallbackSelectors) {
+        const nodes = Array.from(document.querySelectorAll(selector));
+        if (!nodes.length) continue;
+        let index = 0;
+        for (const node of nodes) {
+          const text = compactWhitespace(node && node.textContent ? node.textContent : "");
+          if (!text) continue;
+          segments.push({ time: "", text, key: index + "|" + text });
+          index += 1;
+        }
+        if (segments.length) return segments;
+      }
+      return segments;
+    }
+
+    function segmentsToTranscript(segments) {
+      if (!Array.isArray(segments) || !segments.length) return "";
+      const parts = [];
+      let prev = "";
+      for (const segment of segments) {
+        const text = compactWhitespace(segment && segment.text ? segment.text : "");
+        if (!text) continue;
+        if (text === prev) continue;
+        parts.push(text);
+        prev = text;
+      }
+      return compactWhitespace(parts.join(" "));
+    }
+
+    function collectTranscriptFromDom() {
+      return buildTranscriptBundleFromSegments(collectTranscriptSegmentsFromDom());
+    }
+
+    function clickElement(target) {
+      if (!target) return false;
+      try {
+        target.click();
+        return true;
+      } catch (err) {
+        return false;
+      }
+    }
+
+    function isVisible(el) {
+      if (!el) return false;
+      const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+      if (!rect) return true;
+      return rect.width > 0 && rect.height > 0;
+    }
+
+    function findTranscriptMenuEntry() {
+      const candidates = Array.from(document.querySelectorAll("ytd-menu-service-item-renderer, tp-yt-paper-item, button, a"));
+      for (const el of candidates) {
+        const text = compactWhitespace(el && el.textContent ? el.textContent : "").toLowerCase();
+        if (!text) continue;
+        if (!/(transcript|transkrip)/i.test(text)) continue;
+        const clickable = el.closest("ytd-menu-service-item-renderer, tp-yt-paper-item, button, a") || el;
+        if (clickable && isVisible(clickable)) {
+          return clickable;
+        }
+      }
+      return null;
+    }
+
+    function findMoreActionsButton() {
+      const selectors = [
+        "button[aria-label*='More actions']",
+        "button[aria-label*='more actions']",
+        "button[aria-label*='Tindakan']",
+        "button[aria-label*='Lagi']",
+        "button[aria-label*='Aksi']",
+        "ytd-watch-metadata ytd-menu-renderer yt-icon-button button",
+        "ytd-menu-renderer yt-icon-button button"
+      ];
+      for (const selector of selectors) {
+        const nodes = Array.from(document.querySelectorAll(selector));
+        for (const node of nodes) {
+          if (node && isVisible(node)) return node;
+        }
+      }
+      return null;
+    }
+
+    function findTranscriptScrollContainer() {
+      const selectors = [
+        "ytd-transcript-segment-list-renderer #segments-container",
+        "ytd-transcript-segment-list-renderer",
+        "ytd-engagement-panel-section-list-renderer[target-id='engagement-panel-searchable-transcript'] #content",
+        "ytd-engagement-panel-section-list-renderer[target-id='engagement-panel-searchable-transcript'] #contents",
+        "ytd-engagement-panel-section-list-renderer[target-id='engagement-panel-searchable-transcript']"
+      ];
+      for (const selector of selectors) {
+        const el = document.querySelector(selector);
+        if (!el) continue;
+        const canScroll = typeof el.scrollTop === "number"
+          && typeof el.scrollHeight === "number"
+          && typeof el.clientHeight === "number";
+        if (!canScroll) continue;
+        if (el.scrollHeight > el.clientHeight + 8) return el;
+      }
+      return null;
+    }
+
+    function wait(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    async function collectFullTranscriptFromDom(timeoutMs) {
+      const collected = [];
+      const seen = new Set();
+      let stableRounds = 0;
+      const deadline = Date.now() + timeoutMs;
+      const initialContainer = findTranscriptScrollContainer();
+      if (initialContainer) {
+        initialContainer.scrollTop = 0;
+        initialContainer.dispatchEvent(new Event("scroll", { bubbles: true }));
+        await wait(180);
+      }
+
+      while (Date.now() < deadline) {
+        const segments = collectTranscriptSegmentsFromDom();
+        let added = 0;
+        for (const segment of segments) {
+          const key = segment && segment.key ? segment.key : "";
+          if (!key || seen.has(key)) continue;
+          seen.add(key);
+          collected.push(segment);
+          added += 1;
+        }
+        if (added === 0) {
+          stableRounds += 1;
+        } else {
+          stableRounds = 0;
+        }
+
+        const container = findTranscriptScrollContainer();
+        if (!container) {
+          if (stableRounds >= 2) break;
+          await wait(220);
+          continue;
+        }
+
+        const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
+        if (maxScroll <= 1) {
+          if (stableRounds >= 2) break;
+          await wait(220);
+          continue;
+        }
+
+        const before = container.scrollTop;
+        const step = Math.max(180, Math.floor(container.clientHeight * 0.8));
+        const next = Math.min(maxScroll, before + step);
+        container.scrollTop = next;
+        container.dispatchEvent(new Event("scroll", { bubbles: true }));
+        await wait(260);
+
+        const reachedEnd = container.scrollTop >= maxScroll - 2 || next >= maxScroll;
+        if (reachedEnd && stableRounds >= 2) {
+          break;
+        }
+      }
+
+      return buildTranscriptBundleFromSegments(collected);
+    }
+
+    async function waitForTranscriptDom(timeoutMs) {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const existing = collectTranscriptFromDom();
+        if (existing && existing.transcript) {
+          const full = await collectFullTranscriptFromDom(8000);
+          if (full && full.transcript) {
+            return full;
+          }
+          return existing;
+        }
+        await wait(220);
+      }
+      return { transcript: "", timestampedTranscript: "", totalSegments: 0, timestampedSegments: 0 };
+    }
+
+    async function tryTranscriptPanelDom() {
+      const current = await collectFullTranscriptFromDom(2500);
+      if (current && current.transcript) {
+        return {
+          ok: true,
+          transcript: current.transcript,
+          timestampedTranscript: current.timestampedTranscript || "",
+          totalSegments: current.totalSegments || 0,
+          timestampedSegments: current.timestampedSegments || 0,
+          source: "transcript-dom-existing"
+        };
+      }
+
+      const direct = findTranscriptMenuEntry();
+      if (direct) {
+        clickElement(direct);
+        const transcriptBundle = await waitForTranscriptDom(7000);
+        if (transcriptBundle && transcriptBundle.transcript) {
+          return {
+            ok: true,
+            transcript: transcriptBundle.transcript,
+            timestampedTranscript: transcriptBundle.timestampedTranscript || "",
+            totalSegments: transcriptBundle.totalSegments || 0,
+            timestampedSegments: transcriptBundle.timestampedSegments || 0,
+            source: "transcript-dom-direct"
+          };
+        }
+      }
+
+      const moreActions = findMoreActionsButton();
+      if (moreActions) {
+        clickElement(moreActions);
+        await wait(380);
+        const entry = findTranscriptMenuEntry();
+        if (entry) {
+          clickElement(entry);
+          const transcriptBundle = await waitForTranscriptDom(8000);
+          if (transcriptBundle && transcriptBundle.transcript) {
+            return {
+              ok: true,
+              transcript: transcriptBundle.transcript,
+              timestampedTranscript: transcriptBundle.timestampedTranscript || "",
+              totalSegments: transcriptBundle.totalSegments || 0,
+              timestampedSegments: transcriptBundle.timestampedSegments || 0,
+              source: "transcript-dom-menu"
+            };
+          }
+        }
+      }
+
+      return { ok: false, reason: "transcript-dom-unavailable" };
+    }
+
+    (async () => {
+      const activeVideoId = extractVideoId(window.location.href);
+      if (expectedVideoId && activeVideoId && expectedVideoId !== activeVideoId) {
+        send({ ok: false, reason: "different-video" });
+        return;
+      }
+
+      const fromTracks = await tryCaptionTracks();
+      if (fromTracks && fromTracks.ok && fromTracks.transcript) {
+        send(fromTracks);
+        return;
+      }
+
+      if (!allowDomFallback) {
+        send({
+          ok: false,
+          reason:
+            fromTracks && fromTracks.reason
+              ? fromTracks.reason
+              : "tab-transcript-unavailable"
+        });
+        return;
+      }
+
+      const fromDom = await tryTranscriptPanelDom();
+      if (fromDom && fromDom.ok && fromDom.transcript) {
+        send(fromDom);
+        return;
+      }
+
+      const reason = fromDom && fromDom.reason
+        ? fromDom.reason
+        : (fromTracks && fromTracks.reason ? fromTracks.reason : "tab-transcript-unavailable");
+      send({ ok: false, reason });
+    })().catch(() => {
+      send({ ok: false, reason: "tab-transcript-unhandled-error" });
+    });
+  })();`;
+}
+
+async function fetchYouTubeTranscriptFromTab(tabId, expectedVideoId, options = {}) {
+  if (!tabId) return { ok: false, reason: "missing-tab-id" };
+  const requestId =
+    "yttr-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      if (
+        lpApi.runtime &&
+        lpApi.runtime.onMessage &&
+        lpApi.runtime.onMessage.removeListener
+      ) {
+        try {
+          lpApi.runtime.onMessage.removeListener(onMessage);
+        } catch (err) {
+          // ignore
+        }
+      }
+    };
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+    const onMessage = (message) => {
+      if (!message || message.type !== "youtube-transcript-result") return;
+      if (message.requestId !== requestId) return;
+      const result =
+        message.result && typeof message.result === "object"
+          ? message.result
+          : { ok: false, reason: "invalid-transcript-result" };
+      if (result.ok && result.transcript) {
+        const totalSegments = Number.parseInt(result.totalSegments, 10);
+        const timestampedSegments = Number.parseInt(
+          result.timestampedSegments,
+          10,
+        );
+        finish({
+          ok: true,
+          transcript: String(result.transcript),
+          timestampedTranscript: result.timestampedTranscript
+            ? String(result.timestampedTranscript)
+            : "",
+          totalSegments: Number.isFinite(totalSegments) ? totalSegments : 0,
+          timestampedSegments: Number.isFinite(timestampedSegments)
+            ? timestampedSegments
+            : 0,
+          languageCode: result.languageCode ? String(result.languageCode) : "",
+          autoGenerated: result.autoGenerated === true,
+          source: result.source ? String(result.source) : "tab",
+        });
+        return;
+      }
+      finish(
+        result && result.reason
+          ? result
+          : { ok: false, reason: "tab-transcript-unavailable" },
+      );
+    };
+
+    if (
+      lpApi.runtime &&
+      lpApi.runtime.onMessage &&
+      lpApi.runtime.onMessage.addListener
+    ) {
+      lpApi.runtime.onMessage.addListener(onMessage);
+    }
+    timer = setTimeout(
+      () => finish({ ok: false, reason: "tab-transcript-timeout" }),
+      3500,
+    );
+
+    const code = buildYouTubeTranscriptExtractionScript(
+      requestId,
+      expectedVideoId,
+      options,
+    );
+    executeScriptWithRetries(tabId, { code }, {
+      timeoutMs: SUMMARY_TAB_SCRIPT_RETRY_TIMEOUT_MS,
+      intervalMs: SUMMARY_TAB_SCRIPT_RETRY_INTERVAL_MS,
+    })
+      .then(() => {
+        // wait for async runtime message from tab script
+      })
+      .catch(() => {
+        finish({ ok: false, reason: "tab-transcript-inject-failed" });
+      });
+  });
+}
+
+async function fetchYouTubeTranscriptViaTemporaryTab(url, expectedVideoId) {
+  if (!url || !lpApi.tabs || !lpApi.tabs.create || !lpApi.tabs.remove) {
+    return { ok: false, reason: "temporary-tab-unavailable" };
+  }
+  let tabId = null;
+  try {
+    const created = await lpApi.tabs.create({ url, active: false });
+    tabId = created && created.id ? created.id : null;
+    if (!tabId) {
+      return { ok: false, reason: "temporary-tab-create-failed" };
+    }
+    return fetchYouTubeTranscriptFromTab(tabId, expectedVideoId);
+  } catch (err) {
+    return { ok: false, reason: "temporary-tab-transcript-failed" };
+  } finally {
+    if (tabId) {
+      try {
+        await lpApi.tabs.remove(tabId);
+      } catch (err) {
+        // ignore cleanup error
+      }
+    }
+  }
+}
+
+function extractJsonArrayAfterMarker(text, marker) {
+  if (!text || !marker) return "";
+  const markerIndex = text.indexOf(marker);
+  if (markerIndex < 0) return "";
+  const start = text.indexOf("[", markerIndex + marker.length);
+  if (start < 0) return "";
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "[") {
+      depth += 1;
+      continue;
+    }
+    if (ch === "]") {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(start, i + 1);
+      }
+    }
+  }
+  return "";
+}
+
+function extractCaptionTracksFromWatchHtml(html) {
+  const rawArray = extractJsonArrayAfterMarker(html || "", '"captionTracks":');
+  if (!rawArray) return [];
+  try {
+    const parsed = JSON.parse(rawArray);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (err) {
+    return [];
+  }
+}
+
+function choosePreferredCaptionTrack(tracks) {
+  if (!Array.isArray(tracks) || !tracks.length) return null;
+  const languageOrder = ["ms", "id", "en", "en-us", "en-gb"];
+  const ranked = tracks
+    .filter(
+      (track) => track && typeof track.baseUrl === "string" && track.baseUrl,
+    )
+    .map((track) => {
+      const code = String(track.languageCode || "").toLowerCase();
+      let langRank = 999;
+      for (let i = 0; i < languageOrder.length; i += 1) {
+        const preferred = languageOrder[i];
+        if (code === preferred || code.startsWith(preferred + "-")) {
+          langRank = i;
+          break;
+        }
+      }
+      const asrPenalty = track.kind === "asr" ? 1 : 0;
+      return { track, score: langRank * 10 + asrPenalty };
+    })
+    .sort((a, b) => a.score - b.score);
+  return ranked.length ? ranked[0].track : null;
+}
+
+function decodeHtmlEntities(text) {
+  if (!text) return "";
+  return String(text)
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_, dec) => {
+      const code = Number.parseInt(dec, 10);
+      return Number.isFinite(code) ? String.fromCharCode(code) : "";
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => {
+      const code = Number.parseInt(hex, 16);
+      return Number.isFinite(code) ? String.fromCharCode(code) : "";
+    });
+}
+
+function compactWhitespace(text) {
+  return String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function formatTimestampFromSeconds(seconds) {
+  const safe = Number(seconds);
+  if (!Number.isFinite(safe) || safe < 0) return "";
+  const total = Math.max(0, Math.floor(safe));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) {
+    return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  }
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function buildTranscriptBundleFromSegments(segments) {
+  if (!Array.isArray(segments) || !segments.length) {
+    return {
+      text: "",
+      timestampedText: "",
+      totalSegments: 0,
+      timestampedSegments: 0,
+    };
+  }
+
+  const parts = [];
+  const timestampedParts = [];
+  let totalSegments = 0;
+  let timestampedSegments = 0;
+  let prev = "";
+
+  for (const segment of segments) {
+    const text = compactWhitespace(segment && segment.text ? segment.text : "");
+    if (!text) continue;
+    if (text === prev) continue;
+    prev = text;
+    totalSegments += 1;
+    parts.push(text);
+
+    const time = compactWhitespace(segment && segment.time ? segment.time : "");
+    if (time) {
+      timestampedSegments += 1;
+      timestampedParts.push(`[${time}] ${text}`);
+    }
+  }
+
+  return {
+    text: compactWhitespace(parts.join(" ")),
+    timestampedText: timestampedParts.join("\n"),
+    totalSegments,
+    timestampedSegments,
+  };
+}
+
+function parseTranscriptSegmentsFromSrv3(xmlText) {
+  const segments = [];
+  if (!xmlText) return segments;
+  const pattern = /<text\b([^>]*)>([\s\S]*?)<\/text>/g;
+  let match;
+  while ((match = pattern.exec(xmlText)) !== null) {
+    const attrs = match[1] ? String(match[1]) : "";
+    const raw = match[2] ? String(match[2]) : "";
+    const text = compactWhitespace(
+      decodeHtmlEntities(raw.replace(/<[^>]+>/g, " ")),
+    );
+    if (!text) continue;
+    const startMatch = attrs.match(/\bstart="([^"]+)"/i);
+    const startSeconds =
+      startMatch && startMatch[1] ? Number.parseFloat(startMatch[1]) : NaN;
+    const time = Number.isFinite(startSeconds)
+      ? formatTimestampFromSeconds(startSeconds)
+      : "";
+    segments.push({ time, text });
+  }
+  return segments;
+}
+
+function parseTranscriptSegmentsFromJson3(jsonText) {
+  const segments = [];
+  if (!jsonText) return segments;
+  try {
+    const payload = JSON.parse(jsonText);
+    const events = Array.isArray(payload && payload.events)
+      ? payload.events
+      : [];
+    for (const event of events) {
+      const segs = Array.isArray(event && event.segs) ? event.segs : [];
+      const startMs =
+        event && typeof event.tStartMs === "number"
+          ? event.tStartMs
+          : Number.parseFloat(event && event.tStartMs ? event.tStartMs : "");
+      const time = Number.isFinite(startMs)
+        ? formatTimestampFromSeconds(startMs / 1000)
+        : "";
+      for (const seg of segs) {
+        if (!seg || !seg.utf8) continue;
+        const text = compactWhitespace(decodeHtmlEntities(seg.utf8));
+        if (!text) continue;
+        segments.push({ time, text });
+      }
+    }
+  } catch (err) {
+    return [];
+  }
+  return segments;
+}
+
+function parseTranscriptBundleFromSrv3(xmlText) {
+  return buildTranscriptBundleFromSegments(
+    parseTranscriptSegmentsFromSrv3(xmlText),
+  );
+}
+
+function parseTranscriptBundleFromJson3(jsonText) {
+  return buildTranscriptBundleFromSegments(
+    parseTranscriptSegmentsFromJson3(jsonText),
+  );
+}
+
+function parseTranscriptFromSrv3(xmlText) {
+  return parseTranscriptBundleFromSrv3(xmlText).text;
+}
+
+function parseTranscriptFromJson3(jsonText) {
+  return parseTranscriptBundleFromJson3(jsonText).text;
+}
+
+async function fetchTextWithTimeout(url, timeoutMs, options = {}) {
+  if (!url) return "";
+  let controller = null;
+  let timeoutId = null;
+  try {
+    if (typeof AbortController === "function" && Number.isFinite(timeoutMs)) {
+      controller = new AbortController();
+      timeoutId = setTimeout(() => {
+        try {
+          controller.abort();
+        } catch (err) {
+          // ignore
+        }
+      }, Math.max(1, timeoutMs));
+    }
+    const response = await fetch(url, {
+      cache: "no-store",
+      credentials:
+        options && Object.prototype.hasOwnProperty.call(options, "credentials")
+          ? options.credentials
+          : "omit",
+      redirect: "follow",
+      signal: controller ? controller.signal : undefined,
+    });
+    if (!response || !response.ok) {
+      return "";
+    }
+    return await response.text();
+  } catch (err) {
+    return "";
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+async function fetchCaptionText(baseUrl) {
+  if (!baseUrl) return null;
+  const tryUrls = [];
+  try {
+    const srv3 = new URL(baseUrl);
+    srv3.searchParams.set("fmt", "srv3");
+    tryUrls.push({ url: srv3.toString(), parser: "srv3" });
+    const json3 = new URL(baseUrl);
+    json3.searchParams.set("fmt", "json3");
+    tryUrls.push({ url: json3.toString(), parser: "json3" });
+  } catch (err) {
+    tryUrls.push({ url: baseUrl, parser: "srv3" });
+  }
+
+  for (const target of tryUrls) {
+    try {
+      const body = await fetchTextWithTimeout(
+        target.url,
+        SUMMARY_YOUTUBE_CAPTION_FETCH_TIMEOUT_MS,
+        { credentials: "omit" },
+      );
+      if (!body) continue;
+      const bundle =
+        target.parser === "json3"
+          ? parseTranscriptBundleFromJson3(body)
+          : parseTranscriptBundleFromSrv3(body);
+      if (bundle && bundle.text) return bundle;
+    } catch (err) {
+      // try next format
+    }
+  }
+  return null;
+}
+
+function cloneYouTubeTranscriptResult(result, options = {}) {
+  if (!result || typeof result !== "object") {
+    return { ok: false, reason: "invalid-transcript-result" };
+  }
+  const source = result.source
+    ? String(result.source).replace(/\+cache\b/g, "")
+    : "";
+  const cloned = {
+    ok: result.ok === true,
+    reason: result.reason ? String(result.reason) : "",
+    transcript: result.transcript ? String(result.transcript) : "",
+    timestampedTranscript: result.timestampedTranscript
+      ? String(result.timestampedTranscript)
+      : "",
+    totalSegments: Number.isFinite(result.totalSegments)
+      ? Number(result.totalSegments)
+      : 0,
+    timestampedSegments: Number.isFinite(result.timestampedSegments)
+      ? Number(result.timestampedSegments)
+      : 0,
+    languageCode: result.languageCode ? String(result.languageCode) : "",
+    autoGenerated: result.autoGenerated === true,
+    source:
+      options && options.appendCacheMarker && source
+        ? source + "+cache"
+        : source,
+  };
+  if (!cloned.ok && !cloned.reason) {
+    cloned.reason = "transcript-unavailable";
+  }
+  return cloned;
+}
+
+function getCachedYouTubeTranscript(videoId) {
+  const key = videoId ? String(videoId) : "";
+  if (!key) return null;
+  const entry = cachedYouTubeTranscriptByVideoId.get(key);
+  if (!entry) return null;
+  if (
+    !entry.savedAt
+    || Date.now() - Number(entry.savedAt) > SUMMARY_YOUTUBE_TRANSCRIPT_CACHE_TTL_MS
+  ) {
+    cachedYouTubeTranscriptByVideoId.delete(key);
+    return null;
+  }
+  return cloneYouTubeTranscriptResult(entry.result, {
+    appendCacheMarker: true,
+  });
+}
+
+function setCachedYouTubeTranscript(videoId, result) {
+  const key = videoId ? String(videoId) : "";
+  const normalized = cloneYouTubeTranscriptResult(result);
+  if (!key || !normalized.ok || !normalized.transcript) return normalized;
+  cachedYouTubeTranscriptByVideoId.set(key, {
+    savedAt: Date.now(),
+    result: normalized,
+  });
+  return normalized;
+}
+
+function loadYouTubeTranscriptWithCache(videoId, loader) {
+  const key = videoId ? String(videoId) : "";
+  const cached = getCachedYouTubeTranscript(key);
+  if (cached) {
+    return Promise.resolve(cached);
+  }
+  if (key && inFlightYouTubeTranscriptByVideoId.has(key)) {
+    return inFlightYouTubeTranscriptByVideoId.get(key);
+  }
+  const pending = Promise.resolve()
+    .then(() => loader())
+    .then((result) => setCachedYouTubeTranscript(key, result))
+    .catch(() => ({ ok: false, reason: "transcript-fetch-error" }))
+    .finally(() => {
+      if (key) {
+        inFlightYouTubeTranscriptByVideoId.delete(key);
+      }
+    });
+  if (key) {
+    inFlightYouTubeTranscriptByVideoId.set(key, pending);
+  }
+  return pending;
+}
+
+async function fetchYouTubeTranscript(videoId) {
+  if (!videoId) return { ok: false, reason: "missing-video-id" };
+  try {
+    const watchUrl =
+      "https://www.youtube.com/watch?v=" +
+      encodeURIComponent(videoId) +
+      "&hl=ms";
+    const html = await fetchTextWithTimeout(
+      watchUrl,
+      SUMMARY_YOUTUBE_WATCH_FETCH_TIMEOUT_MS,
+      { credentials: "omit" },
+    );
+    if (!html) {
+      return { ok: false, reason: "watch-fetch-failed" };
+    }
+    const tracks = extractCaptionTracksFromWatchHtml(html);
+    if (!tracks.length) {
+      return { ok: false, reason: "no-caption-tracks" };
+    }
+    const selectedTrack = choosePreferredCaptionTrack(tracks) || tracks[0];
+    if (!selectedTrack || !selectedTrack.baseUrl) {
+      return { ok: false, reason: "invalid-caption-track" };
+    }
+    const transcriptBundle = await fetchCaptionText(selectedTrack.baseUrl);
+    if (!transcriptBundle || !transcriptBundle.text) {
+      return { ok: false, reason: "empty-transcript" };
+    }
+    return {
+      ok: true,
+      transcript: transcriptBundle.text,
+      timestampedTranscript: transcriptBundle.timestampedText || "",
+      totalSegments: transcriptBundle.totalSegments || 0,
+      timestampedSegments: transcriptBundle.timestampedSegments || 0,
+      languageCode: selectedTrack.languageCode || "",
+      autoGenerated: selectedTrack.kind === "asr",
+      source: "caption-track-watch",
+    };
+  } catch (err) {
+    return { ok: false, reason: "transcript-fetch-error" };
+  }
+}
+
+async function resolveFirstSuccessfulAsyncResult(candidates, fallbackReason) {
+  const pendingCandidates = Array.isArray(candidates)
+    ? candidates.filter(Boolean)
+    : [];
+  if (!pendingCandidates.length) {
+    return { ok: false, reason: fallbackReason || "no-candidate" };
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let pendingCount = pendingCandidates.length;
+    let lastFailure = { ok: false, reason: fallbackReason || "no-candidate" };
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    pendingCandidates.forEach((candidate) => {
+      Promise.resolve(candidate)
+        .then((result) => {
+          const normalized =
+            result && typeof result === "object"
+              ? result
+              : { ok: false, reason: fallbackReason || "invalid-result" };
+          if (normalized.ok) {
+            finish(normalized);
+            return;
+          }
+          lastFailure = normalized;
+          pendingCount -= 1;
+          if (pendingCount <= 0) {
+            finish(lastFailure);
+          }
+        })
+        .catch(() => {
+          pendingCount -= 1;
+          if (pendingCount <= 0) {
+            finish(lastFailure);
+          }
+        });
+    });
+  });
+}
+
+async function waitForAsyncResultWithTimeout(promise, timeoutMs, fallbackValue = null) {
+  const limit = Number.isFinite(timeoutMs) ? Math.max(0, timeoutMs) : 0;
+  if (!promise || limit <= 0) {
+    return fallbackValue;
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve(fallbackValue);
+    }, limit);
+    Promise.resolve(promise)
+      .then((result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+      })
+      .catch(() => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(fallbackValue);
+      });
+  });
+}
+
+function clampNumber(value, min, max) {
+  const safe = Number(value);
+  if (!Number.isFinite(safe)) return min;
+  return Math.min(Math.max(safe, min), max);
+}
+
+function normalizeSummaryMode(value) {
+  if (
+    summaryPromptCore &&
+    typeof summaryPromptCore.normalizeSummaryMode === "function"
+  ) {
+    return summaryPromptCore.normalizeSummaryMode(value);
+  }
+  const mode = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (
+    mode === "quick" ||
+    mode === "deep" ||
+    mode === "action" ||
+    mode === "study" ||
+    mode === "research" ||
+    mode === "auto"
+  ) {
+    return mode;
+  }
+  return "auto";
+}
+
+async function getSummaryModePreference() {
+  try {
+    const data = await lpStoreGet(SUMMARY_MODE_PREFERENCE_KEY);
+    return normalizeSummaryMode(
+      data &&
+        Object.prototype.hasOwnProperty.call(data, SUMMARY_MODE_PREFERENCE_KEY)
+        ? data[SUMMARY_MODE_PREFERENCE_KEY]
+        : "auto",
+    );
+  } catch (err) {
+    return "auto";
+  }
+}
+
+async function setSummaryModePreference(mode) {
+  const normalizedMode = normalizeSummaryMode(mode);
+  try {
+    await lpStoreSet({
+      [SUMMARY_MODE_PREFERENCE_KEY]: normalizedMode,
+    });
+  } catch (err) {
+    // ignore preference write failure
+  }
+  return normalizedMode;
+}
+
+function getSummaryModeLabel(mode) {
+  if (
+    summaryPromptCore &&
+    typeof summaryPromptCore.getSummaryModeLabel === "function"
+  ) {
+    return summaryPromptCore.getSummaryModeLabel(mode);
+  }
+  if (mode === "auto") return "Auto";
+  if (mode === "quick") return "Quick";
+  if (mode === "action") return "Action Items";
+  if (mode === "study") return "Study Notes";
+  if (mode === "research") return "Research";
+  return "Deep";
+}
+
+function resolveCategorySummaryPreset(categoryName, modePreference) {
+  const normalizedCategory = String(categoryName || "")
+    .trim()
+    .toLowerCase();
+  const modeFromSetting = normalizeSummaryMode(modePreference);
+
+  const presets = [
+    {
+      id: "tutorial",
+      label: "Tutorial/How-To",
+      mode: "action",
+      pattern:
+        /(tutorial|how[\s-]?to|guide|langkah|cara|setup|konfigurasi|coding|programming|devops|belajar)/i,
+      focus:
+        "Fokus pada langkah praktikal, urutan kerja, prasyarat, dan kesilapan lazim.",
+    },
+    {
+      id: "podcast",
+      label: "Podcast/Perbincangan",
+      mode: "deep",
+      pattern:
+        /(podcast|interview|wawancara|sembang|borak|talk|discussion|panel|dialog)/i,
+      focus:
+        "Fokus pada hujah utama, perspektif berbeza, dan nuansa perbincangan.",
+    },
+    {
+      id: "research",
+      label: "Research/Ilmiah",
+      mode: "research",
+      pattern:
+        /(research|kajian|ilmiah|jurnal|paper|whitepaper|thesis|tesis|disertasi|evidence|meta[\s-]?analysis|systematic review|literature review)/i,
+      focus:
+        "Fokus pada soalan kajian, metodologi, dapatan utama, tahap bukti, batasan, dan jurang susulan.",
+    },
+    {
+      id: "study",
+      label: "Kelas/Pembelajaran",
+      mode: "study",
+      pattern:
+        /(kelas|course|kursus|lecture|kuliah|study|nota|exam|peperiksaan)/i,
+      focus:
+        "Fokus pada nota pembelajaran: definisi, konsep, contoh, dan poin untuk ulang kaji.",
+    },
+    {
+      id: "news",
+      label: "News/Update",
+      mode: "quick",
+      pattern: /(news|berita|update|ringkas|current|semasa|headline)/i,
+      focus: "Fokus pada fakta utama, konteks ringkas, dan implikasi segera.",
+    },
+  ];
+
+  const matched =
+    presets.find((preset) => preset.pattern.test(normalizedCategory)) || null;
+  const mode =
+    modeFromSetting !== "auto"
+      ? modeFromSetting
+      : matched
+        ? matched.mode
+        : "deep";
+  const presetFocusFallback =
+    mode === "deep"
+      ? "Fokus seimbang: idea utama, implikasi, dan tindakan praktikal.\n- Implikasi jangka pendek dan jangka panjang (kepada individu, masyarakat, dan sistem)\n- Andaian tersembunyi dan kemungkinan bias\n- Tindakan praktikal yang realistik, boleh diuji, dan mempunyai risiko jelas\n\nGaya Penulisan:\n- Bahasa mudah difahami\n- Struktur berperingkat (sebab → kesan → tindakan)\n- Elakkan kesimpulan mutlak; nyatakan tahap kepastian"
+      : mode === "research"
+        ? "Fokus research: objektif/soalan utama, metodologi, bukti utama, batasan, dan cadangan kajian susulan."
+        : "Fokus seimbang: idea utama, implikasi, dan tindakan praktikal.";
+
+  return {
+    mode,
+    presetId: matched ? matched.id : "general",
+    presetLabel: matched ? matched.label : "General",
+    presetFocus: matched ? matched.focus : presetFocusFallback,
+  };
+}
+
+async function resolveYouTubeSummaryCategoryContext(
+  videoUrl,
+  preferredCategoryId,
+) {
+  const data = await lpStoreGet([
+    ITEM_KEY,
+    CATEGORY_KEY,
+    SELECTED_CATEGORY_KEY,
+  ]);
+  const items = coerceArray(data[ITEM_KEY]);
+  const categories = coerceArray(data[CATEGORY_KEY]);
+
+  let categoryId = preferredCategoryId
+    ? String(preferredCategoryId).trim()
+    : "";
+  if (!categoryId && videoUrl) {
+    const matchedItem = items.find(
+      (item) => item && item.url && urlsMatchForSave(videoUrl, item.url),
+    );
+    if (matchedItem && matchedItem.categoryId) {
+      categoryId = String(matchedItem.categoryId);
+    }
+  }
+  if (!categoryId) {
+    const selected = data[SELECTED_CATEGORY_KEY]
+      ? String(data[SELECTED_CATEGORY_KEY])
+      : "";
+    if (selected && selected !== "all" && selected !== "none" && selected !== "hidden_none") {
+      categoryId = selected;
+    }
+  }
+
+  if (categoryId === "all") {
+    return { categoryId: "all", categoryName: "All categories" };
+  }
+  if (categoryId === "none") {
+    return { categoryId: "none", categoryName: "Uncategorized" };
+  }
+  if (categoryId === "hidden_none") {
+    return { categoryId: "hidden_none", categoryName: "Uncategorize (hidden)" };
+  }
+  if (!categoryId) {
+    return { categoryId: "", categoryName: "" };
+  }
+  const matchedCategory = categories.find(
+    (cat) => cat && cat.id === categoryId,
+  );
+  return {
+    categoryId,
+    categoryName:
+      matchedCategory && matchedCategory.name
+        ? String(matchedCategory.name)
+        : "",
+  };
+}
+
+function computeSummarySignals(input) {
+  const transcript = input && input.transcript ? String(input.transcript) : "";
+  const timestampedTranscript =
+    input && input.timestampedTranscript
+      ? String(input.timestampedTranscript)
+      : "";
+  const source = input && input.source ? String(input.source) : "";
+  const autoGenerated = !!(input && input.autoGenerated);
+  const wordCount = transcript
+    ? transcript.split(/\s+/).filter(Boolean).length
+    : 0;
+  const totalSegmentsRaw = Number.parseInt(
+    input && input.totalSegments ? input.totalSegments : 0,
+    10,
+  );
+  const timestampedSegmentsRaw = Number.parseInt(
+    input && input.timestampedSegments ? input.timestampedSegments : 0,
+    10,
+  );
+  const totalSegments = Number.isFinite(totalSegmentsRaw)
+    ? totalSegmentsRaw
+    : 0;
+  const timestampedSegments = Number.isFinite(timestampedSegmentsRaw)
+    ? timestampedSegmentsRaw
+    : 0;
+
+  const timestampCoveragePercent =
+    totalSegments > 0
+      ? Math.round((timestampedSegments / totalSegments) * 100)
+      : timestampedTranscript
+        ? 70
+        : 0;
+
+  let coveragePercent = 0;
+  if (wordCount > 0) {
+    if (wordCount >= 2600) coveragePercent = 95;
+    else if (wordCount >= 1600) coveragePercent = 88;
+    else if (wordCount >= 900) coveragePercent = 80;
+    else if (wordCount >= 450) coveragePercent = 70;
+    else coveragePercent = 58;
+
+    if (autoGenerated) coveragePercent -= 6;
+    if (source.includes("transcript-dom")) coveragePercent -= 2;
+    if (timestampCoveragePercent > 0) {
+      coveragePercent = Math.round(
+        coveragePercent * 0.7 + timestampCoveragePercent * 0.3,
+      );
+    }
+    coveragePercent = clampNumber(coveragePercent, 10, 100);
+  }
+
+  let confidenceScore = wordCount > 0 ? 58 : 22;
+  if (wordCount >= 2600) confidenceScore += 22;
+  else if (wordCount >= 1400) confidenceScore += 16;
+  else if (wordCount >= 800) confidenceScore += 11;
+  else if (wordCount >= 350) confidenceScore += 6;
+
+  if (source.includes("caption-track")) confidenceScore += 8;
+  if (source.includes("transcript-dom")) confidenceScore += 4;
+  if (autoGenerated) confidenceScore -= 6;
+
+  if (timestampCoveragePercent >= 80) confidenceScore += 8;
+  else if (timestampCoveragePercent >= 50) confidenceScore += 4;
+  else if (timestampCoveragePercent > 0) confidenceScore += 2;
+  else if (wordCount > 0) confidenceScore -= 3;
+
+  confidenceScore = clampNumber(confidenceScore, 10, 98);
+  const confidenceLabel =
+    confidenceScore >= 80
+      ? "Tinggi"
+      : confidenceScore >= 60
+        ? "Sederhana"
+        : "Rendah";
+
+  return {
+    wordCount,
+    totalSegments,
+    timestampedSegments,
+    timestampCoveragePercent,
+    coveragePercent,
+    confidenceScore,
+    confidenceLabel,
+  };
+}
+
+function truncateTextForPrompt(text, maxChars) {
+  if (
+    summaryPromptCore &&
+    typeof summaryPromptCore.truncateTextForPrompt === "function"
+  ) {
+    return summaryPromptCore.truncateTextForPrompt(text, maxChars);
+  }
+  const raw = String(text || "");
+  const limit = Number.isFinite(maxChars) ? Math.max(1, maxChars) : 80000;
+  if (raw.length <= limit) {
+    return { text: raw, truncated: false };
+  }
+  return { text: raw.slice(0, limit), truncated: true };
+}
+
+function normalizeSummarySourceText(value) {
+  if (
+    summaryPromptCore &&
+    typeof summaryPromptCore.normalizeSummarySourceText === "function"
+  ) {
+    return summaryPromptCore.normalizeSummarySourceText(value);
+  }
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildResearchModeInstructionLines(topic, options) {
+  if (
+    summaryPromptCore &&
+    typeof summaryPromptCore.buildResearchModeInstructionLines === "function"
+  ) {
+    return summaryPromptCore.buildResearchModeInstructionLines(topic, options);
+  }
+  const safeTopic = normalizeSummarySourceText(topic) || "topik ini";
+  const includeTimestampRule = !!(options && options.includeTimestampRule);
+  const lines = [
+    "",
+    "Prompt khusus mode RESEARCH:",
+    "Saya ingin lakukan research mendalam tentang " +
+    safeTopic +
+    ". Tolong buat analisis menyeluruh yang merangkumi:",
+    "",
+    "1. **Pengenalan & Latar Belakang**: Terangkan sejarah, konteks, dan kepentingan topik ini.",
+    "2. **Teori & Kerangka Konsep**: Senaraikan teori, model, atau kerangka penyelidikan utama yang berkaitan.",
+    "3. **Kajian Terkini & Data Empirik**: Ringkaskan kajian akademik terbaru, statistik, trend, dan dapatan penting.",
+    "4. **Isu & Kontroversi**: Terangkan perdebatan atau cabaran utama dalam bidang ini.",
+    "5. **Kes Kajian / Contoh Praktikal**: Berikan contoh sebenar dari industri, komuniti, atau kajian lapangan.",
+    "6. **Cadangan / Insight Praktikal**: Apa implikasi praktikal, cadangan strategi, atau penyelidikan masa depan.",
+    "7. **Sumber & Rujukan**: Sertakan senarai sumber yang boleh dipercayai.",
+    "",
+    "Sila buat jawapan dalam bentuk yang tersusun dengan **tajuk & sub-tajuk** supaya mudah difahami, dan gunakan bahasa yang formal serta tepat.",
+    "",
+    "Format output WAJIB ikut tajuk seksyen berikut (jangan ubah tajuk):",
+    "## 1. Pengenalan & Latar Belakang",
+    "## 2. Teori & Kerangka Konsep",
+    "## 3. Kajian Terkini & Data Empirik",
+    "## 4. Isu & Kontroversi",
+    "## 5. Kes Kajian / Contoh Praktikal",
+    "## 6. Cadangan / Insight Praktikal",
+    "## 7. Sumber & Rujukan",
+  ];
+  if (includeTimestampRule) {
+    lines.push("");
+    lines.push(
+      "Peraturan tambahan sumber video: jika merujuk bukti transkrip, sertakan cap masa [mm:ss] atau [hh:mm:ss] bila tersedia.",
+    );
+  }
+  return lines;
+}
+
+function buildStudyModeInstructionLines(options) {
+  if (
+    summaryPromptCore &&
+    typeof summaryPromptCore.buildStudyModeInstructionLines === "function"
+  ) {
+    return summaryPromptCore.buildStudyModeInstructionLines(options);
+  }
+  const includeTimestampRule = !!(options && options.includeTimestampRule);
+  const lines = [
+    "",
+    "Prompt khusus mode STUDY:",
+    "Bertindaklah sebagai AI learning optimization specialist profesional.",
+    "Tugas anda adalah membina kandungan pendidikan yang menunjukkan bagaimana AI tools boleh membantu proses pembelajaran menjadi lebih cepat, tersusun, dan efisien.",
+    "Konteksnya, ramai pelajar dan profesional sukar memahami bahan kompleks dan sering belajar tanpa strategi.",
+    "",
+    "Struktur output WAJIB ikut tajuk seksyen berikut (jangan ubah tajuk):",
+    "## Pembuka: Kesilapan Umum dalam Belajar",
+    "## AI Tools untuk Merangkum, Menjelaskan, dan Latihan",
+    "## Demonstrasi Penggunaan Tools pada Satu Topik",
+    "## Strategi Memaksimumkan Hasil Belajar",
+    "## Langkah Praktikal yang Boleh Terus Diterapkan",
+    "",
+    "Peraturan tambahan:",
+    "1. Gunakan Bahasa Melayu standard yang edukatif, sistematik, dan mudah diikuti.",
+    "2. Elakkan penjelasan abstrak; fokus pada langkah praktikal yang boleh terus diterapkan audiens.",
+    "3. Berikan contoh konkrit penggunaan AI tools untuk merangkum, menjelaskan, dan membina latihan belajar.",
+  ];
+  if (includeTimestampRule) {
+    lines.push(
+      "4. Jika sumber ialah video, sertakan cap masa [mm:ss] atau [hh:mm:ss] untuk setiap poin demonstrasi bila tersedia.",
+    );
+  }
+  return lines;
+}
+
+function buildMalayYouTubeUrlOnlyPrompt(input) {
+  if (
+    summaryPromptCore &&
+    typeof summaryPromptCore.buildMalayYouTubeUrlOnlyPrompt === "function"
+  ) {
+    return summaryPromptCore.buildMalayYouTubeUrlOnlyPrompt(input);
+  }
+  return "";
+}
+
+function buildMalayYouTubeSummaryPrompt(input) {
+  if (
+    summaryPromptCore &&
+    typeof summaryPromptCore.buildMalayYouTubeSummaryPrompt === "function"
+  ) {
+    return summaryPromptCore.buildMalayYouTubeSummaryPrompt(input);
+  }
+  const url = input && input.url ? input.url : "";
+  const title = input && input.title ? input.title : "";
+  const transcript = input && input.transcript ? input.transcript : "";
+  const timestampedTranscript =
+    input && input.timestampedTranscript ? input.timestampedTranscript : "";
+  const languageCode = input && input.languageCode ? input.languageCode : "";
+  const categoryName = input && input.categoryName ? input.categoryName : "";
+  const summaryMode = normalizeSummaryMode(
+    input && input.summaryMode ? input.summaryMode : "deep",
+  );
+  const presetLabel =
+    input && input.presetLabel ? input.presetLabel : "General";
+  const presetFocus = input && input.presetFocus ? input.presetFocus : "";
+  const source = input && input.source ? input.source : "";
+  const autoGenerated = !!(input && input.autoGenerated);
+  const confidenceScore = Number.isFinite(input && input.confidenceScore)
+    ? input.confidenceScore
+    : 0;
+  const confidenceLabel =
+    input && input.confidenceLabel ? input.confidenceLabel : "Sederhana";
+  const coveragePercent = Number.isFinite(input && input.coveragePercent)
+    ? input.coveragePercent
+    : 0;
+  const timestampCoveragePercent = Number.isFinite(
+    input && input.timestampCoveragePercent,
+  )
+    ? input.timestampCoveragePercent
+    : 0;
+
+  const modeLabel = getSummaryModeLabel(summaryMode);
+  const modeGuidance = {
+    quick:
+      "Mode QUICK: padat dan terus kepada poin paling kritikal; elakkan huraian panjang.",
+    deep: "Mode DEEP: berikan analisis menyeluruh, konteks, dan hubungan antara idea.",
+    action:
+      "Mode ACTION ITEMS: utamakan langkah praktikal, checklist, dan cadangan pelaksanaan.",
+    study:
+      "Mode STUDY NOTES: susun seperti nota pembelajaran, definisi, contoh, dan soalan ulang kaji.",
+    research:
+      "Mode RESEARCH: tekankan soalan utama, kaedah/kerangka analisis, bukti, batasan, dan jurang kajian.",
+  };
+  const researchTopic = normalizeSummarySourceText(
+    title || categoryName || "video ini",
+  );
+  const outputLanguageRule =
+    "WAJIB jawab 100% dalam Bahasa Melayu standard (tiada campuran bahasa kecuali istilah teknikal).";
+
+  const heading = [
+    "Anda ialah pembantu ringkasan video YouTube.",
+    outputLanguageRule,
+    "",
+    "Maklumat video:",
+    "URL: " + (url || "(tiada URL)"),
+    "Tajuk: " + (title || "(tiada tajuk)"),
+    "Kategori: " + (categoryName || "(tiada kategori)"),
+    "Mode ringkasan: " + modeLabel,
+    "Preset kategori: " + presetLabel,
+    "Fokus preset: " + (presetFocus || "Fokus seimbang"),
+    "Sumber transkrip: " + (source || "tidak diketahui"),
+    "Bahasa transkrip: " + (languageCode || "tidak diketahui"),
+    "Auto-generated transcript: " + (autoGenerated ? "Ya" : "Tidak"),
+    "Liputan transkrip anggaran: " + coveragePercent + "%",
+    "Liputan cap masa: " + timestampCoveragePercent + "%",
+    "Keyakinan asas sistem: " +
+    confidenceLabel +
+    " (" +
+    confidenceScore +
+    "/100)",
+  ];
+
+  const instructions =
+    summaryMode === "research"
+      ? buildResearchModeInstructionLines(researchTopic, {
+        includeTimestampRule: true,
+      })
+      : summaryMode === "study"
+        ? buildStudyModeInstructionLines({ includeTimestampRule: true })
+        : [
+          "",
+          "Arahan mode:",
+          modeGuidance[summaryMode] || modeGuidance.deep,
+          "",
+          "Format output WAJIB ikut tajuk seksyen berikut (jangan ubah tajuk):",
+          "## Ringkasan Umum",
+          "## Inti Utama Bertimestamp",
+          "## Tindakan Praktikal",
+          "## Istilah Penting",
+          "## Confidence & Coverage",
+          "## Penutup",
+          "",
+          "Peraturan tambahan:",
+          "1. Dalam seksyen 'Inti Utama Bertimestamp', setiap bullet wajib bermula dengan cap masa [mm:ss] atau [hh:mm:ss].",
+          "2. Jika cap masa tidak pasti, gunakan tag [anggaran mm:ss].",
+          "3. Dalam seksyen 'Confidence & Coverage', WAJIB nyatakan semula nilai ini dengan tepat:",
+          `   - Keyakinan asas sistem: ${confidenceLabel} (${confidenceScore}/100)`,
+          `   - Liputan transkrip anggaran: ${coveragePercent}%`,
+          `   - Liputan cap masa: ${timestampCoveragePercent}%`,
+          "4. Nyatakan batasan data (contoh transkrip terhad/tiada) secara jujur dan ringkas.",
+          "5. Kekalkan gaya jelas, padat, dan berstruktur.",
+        ];
+
+  if (!transcript) {
+    instructions.push(
+      "",
+      "Nota data: Transkrip penuh tidak tersedia. Buat inferens secara konservatif dan nyatakan keterbatasan dengan jelas.",
+    );
+    return [...heading, ...instructions].join("\n");
+  }
+
+  const timestampedPack = truncateTextForPrompt(timestampedTranscript, 52000);
+  const plainPack = truncateTextForPrompt(transcript, 60000);
+  const body = [""];
+  if (timestampedPack.text) {
+    body.push("Transkrip bertimestamp (rujukan utama):");
+    body.push(timestampedPack.text);
+    if (timestampedPack.truncated) {
+      body.push("");
+      body.push(
+        "[Nota] Transkrip bertimestamp dipendekkan kerana terlalu panjang.",
+      );
+    }
+  } else {
+    body.push("Transkrip (tanpa cap masa terperinci):");
+    body.push(plainPack.text);
+    if (plainPack.truncated) {
+      body.push("");
+      body.push("[Nota] Transkrip dipendekkan kerana terlalu panjang.");
+    }
+  }
+
+  if (
+    timestampedPack.text &&
+    plainPack.text &&
+    plainPack.text !== timestampedPack.text
+  ) {
+    const extraPlain = truncateTextForPrompt(plainPack.text, 14000);
+    body.push("");
+    body.push("Petikan transkrip biasa (rujukan tambahan):");
+    body.push(extraPlain.text);
+    if (plainPack.truncated) {
+      body.push("[Nota] Petikan tambahan ini juga dipendekkan.");
+    }
+  }
+
+  return [...heading, ...instructions, ...body].join("\n");
+}
+
+function buildMalayWebSummaryPrompt(input) {
+  if (
+    summaryPromptCore &&
+    typeof summaryPromptCore.buildMalayWebSummaryPrompt === "function"
+  ) {
+    return summaryPromptCore.buildMalayWebSummaryPrompt(input);
+  }
+  const url = input && input.url ? input.url : "";
+  const title = input && input.title ? input.title : "";
+  const summaryMode = normalizeSummaryMode(
+    input && input.summaryMode ? input.summaryMode : "deep",
+  );
+  const presetLabel =
+    input && input.presetLabel ? input.presetLabel : "General";
+  const presetFocus = input && input.presetFocus ? input.presetFocus : "";
+  const categoryName = input && input.categoryName ? input.categoryName : "";
+  const source = input && input.source ? input.source : "";
+  const pageTitle =
+    input && input.pageTitle ? normalizeSummarySourceText(input.pageTitle) : "";
+  const pageDescription =
+    input && input.pageDescription
+      ? normalizeSummarySourceText(input.pageDescription)
+      : "";
+  const pageTextRaw = input && input.pageText ? String(input.pageText) : "";
+  const pageTextPack = truncateTextForPrompt(pageTextRaw, 52000);
+  const pageText = normalizeSummarySourceText(pageTextPack.text || "");
+
+  const modeLabel = getSummaryModeLabel(summaryMode);
+  const modeGuidance = {
+    quick:
+      "Mode QUICK: ringkas, terus kepada poin utama dan kesimpulan segera.",
+    deep: "Mode DEEP: ulas dengan konteks, sebab-akibat, dan implikasi yang lebih luas.",
+    action:
+      "Mode ACTION ITEMS: fokus pada langkah praktikal dan checklist pelaksanaan.",
+    study:
+      "Mode STUDY NOTES: susun seperti nota pembelajaran, definisi dan contoh.",
+    research:
+      "Mode RESEARCH: rangkum soalan utama, metodologi, bukti, batasan, dan cadangan kajian lanjutan.",
+  };
+  const researchTopic = normalizeSummarySourceText(
+    title || pageTitle || categoryName || "halaman ini",
+  );
+  const outputLanguageRule =
+    "WAJIB jawab 100% dalam Bahasa Melayu standard (kecuali istilah teknikal).";
+
+  const heading = [
+    "Anda ialah pembantu ringkasan halaman web.",
+    outputLanguageRule,
+    "",
+    "Maklumat halaman:",
+    "URL: " + (url || "(tiada URL)"),
+    "Tajuk asal: " + (title || "(tiada tajuk)"),
+    "Kategori: " + (categoryName || "(tiada kategori)"),
+    "Mode ringkasan: " + modeLabel,
+    "Preset kategori: " + presetLabel,
+    "Fokus preset: " + (presetFocus || "Fokus seimbang"),
+    "Sumber kandungan: " + (source || "metadata/URL sahaja"),
+  ];
+
+  const instructions =
+    summaryMode === "research"
+      ? buildResearchModeInstructionLines(researchTopic)
+      : summaryMode === "study"
+        ? buildStudyModeInstructionLines()
+        : [
+          "",
+          "Arahan mode:",
+          modeGuidance[summaryMode] || modeGuidance.deep,
+          "",
+          "Format output WAJIB ikut tajuk seksyen berikut (jangan ubah tajuk):",
+          "## Ringkasan Umum",
+          "## Poin Penting",
+          "## Tindakan Praktikal",
+          "## Soalan Lanjutan",
+          "## Penutup",
+          "",
+          "Peraturan tambahan:",
+          "1. Elakkan ayat terlalu panjang; utamakan kejelasan.",
+          "2. Jika data tidak lengkap, nyatakan batasan dengan jujur.",
+          "3. Jangan reka fakta yang tiada dalam sumber.",
+        ];
+
+  const body = [""];
+  if (pageTitle) {
+    body.push("Tajuk halaman (hasil ekstrak): " + pageTitle);
+  }
+  if (pageDescription) {
+    body.push("Penerangan ringkas halaman: " + pageDescription);
+  }
+  if (pageText) {
+    body.push("");
+    body.push("Kandungan halaman (rujukan utama):");
+    body.push(pageText);
+    if (pageTextPack.truncated) {
+      body.push("");
+      body.push("[Nota] Kandungan halaman dipendekkan kerana terlalu panjang.");
+    }
+  } else {
+    body.push("");
+    body.push("Nota data: Kandungan halaman penuh tidak dapat diekstrak.");
+    body.push(
+      "Gunakan URL, tajuk, dan penerangan yang ada untuk ringkasan konservatif.",
+    );
+  }
+
+  return [...heading, ...instructions, ...body].join("\n");
+}
+
+function buildWebPageExtractionScript() {
+  return `(function () {
+    function normalize(value) {
+      return String(value || "").replace(/\\s+/g, " ").trim();
+    }
+    function collectText(root) {
+      if (!root) return "";
+      const text = root.innerText || root.textContent || "";
+      return normalize(text);
+    }
+    var title = normalize(document.title || "");
+    var meta = document.querySelector("meta[name='description'],meta[property='og:description'],meta[name='twitter:description']");
+    var description = meta && meta.content ? normalize(meta.content) : "";
+    var preferred = document.querySelector("article,main,[role='main']") || document.body;
+    var clone = preferred && preferred.cloneNode ? preferred.cloneNode(true) : null;
+    if (clone) {
+      try {
+        var removeList = clone.querySelectorAll("script,style,noscript,iframe,svg,canvas,template");
+        for (var i = 0; i < removeList.length; i += 1) {
+          var node = removeList[i];
+          if (node && node.parentNode) {
+            node.parentNode.removeChild(node);
+          }
+        }
+      } catch (err) {
+        // ignore cleanup errors
+      }
+    }
+    var text = collectText(clone || preferred);
+    if (!text && document.body && preferred !== document.body) {
+      var bodyClone = document.body.cloneNode ? document.body.cloneNode(true) : document.body;
+      text = collectText(bodyClone);
+    }
+    if (text.length > 60000) {
+      text = text.slice(0, 60000);
+    }
+    return {
+      title: title,
+      description: description,
+      text: text,
+      source: "active-tab-dom"
+    };
+  })();`;
+}
+
+async function extractWebPageContentFromTab(sender, targetUrl) {
+  const senderTab = sender && sender.tab ? sender.tab : null;
+  if (!senderTab || !senderTab.id || !senderTab.url) {
+    return { ok: false, reason: "no-sender-tab" };
+  }
+  if (!urlsMatchForSave(String(senderTab.url), targetUrl)) {
+    return { ok: false, reason: "sender-url-mismatch" };
+  }
+  try {
+    const code = buildWebPageExtractionScript();
+    const result = await executeScriptSafe(senderTab.id, { code });
+    const payload = Array.isArray(result) ? result[0] : result;
+    const title =
+      payload && payload.title ? normalizeSummarySourceText(payload.title) : "";
+    const description =
+      payload && payload.description
+        ? normalizeSummarySourceText(payload.description)
+        : "";
+    const rawText = payload && payload.text ? String(payload.text) : "";
+    const packed = truncateTextForPrompt(rawText, 52000);
+    const text = normalizeSummarySourceText(packed.text || "");
+    if (!text) {
+      return { ok: false, reason: "empty-tab-text" };
+    }
+    return {
+      ok: true,
+      title,
+      description,
+      text,
+      source:
+        payload && payload.source ? String(payload.source) : "active-tab-dom",
+    };
+  } catch (err) {
+    return { ok: false, reason: "tab-extract-failed" };
+  }
+}
+
+async function fetchWebPageContent(rawUrl) {
+  if (!isSummarizableUrl(rawUrl)) {
+    return { ok: false, reason: "unsupported-url" };
+  }
+  try {
+    let controller = null;
+    let timeoutId = null;
+    if (typeof AbortController === "function") {
+      controller = new AbortController();
+      timeoutId = setTimeout(() => {
+        try {
+          controller.abort();
+        } catch (err) {
+          // ignore
+        }
+      }, SUMMARY_WEB_FETCH_TIMEOUT_MS);
+    }
+    const response = await fetch(rawUrl, {
+      method: "GET",
+      redirect: "follow",
+      cache: "no-store",
+      credentials: "omit",
+      signal: controller ? controller.signal : undefined,
+    });
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+    if (!response || !response.ok) {
+      return { ok: false, reason: "fetch-failed" };
+    }
+    const contentType = String(
+      response.headers.get("content-type") || "",
+    ).toLowerCase();
+    if (contentType && !contentType.includes("text/html")) {
+      return { ok: false, reason: "non-html" };
+    }
+    let html = await response.text();
+    if (!html) {
+      return { ok: false, reason: "empty-html" };
+    }
+    if (html.length > 400000) {
+      html = html.slice(0, 400000);
+    }
+    if (typeof DOMParser !== "function") {
+      return { ok: false, reason: "domparser-unavailable" };
+    }
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, "text/html");
+    if (!doc) {
+      return { ok: false, reason: "parse-failed" };
+    }
+    try {
+      const removeList = doc.querySelectorAll(
+        "script,style,noscript,iframe,svg,canvas,template",
+      );
+      removeList.forEach((node) => {
+        if (node && node.parentNode) {
+          node.parentNode.removeChild(node);
+        }
+      });
+    } catch (err) {
+      // ignore cleanup errors
+    }
+    const title = normalizeSummarySourceText(doc.title || "");
+    const meta = doc.querySelector(
+      "meta[name='description'],meta[property='og:description'],meta[name='twitter:description']",
+    );
+    const description =
+      meta && meta.content ? normalizeSummarySourceText(meta.content) : "";
+    const mainRoot =
+      doc.querySelector("article,main,[role='main']") || doc.body;
+    let text = normalizeSummarySourceText(
+      mainRoot ? mainRoot.innerText || mainRoot.textContent || "" : "",
+    );
+    if (!text && description) {
+      text = description;
+    }
+    const packed = truncateTextForPrompt(text, 52000);
+    const normalizedText = normalizeSummarySourceText(packed.text || "");
+    if (!normalizedText) {
+      return { ok: false, reason: "empty-text" };
+    }
+    return {
+      ok: true,
+      title,
+      description,
+      text: normalizedText,
+      source: "fetch-html",
+    };
+  } catch (err) {
+    return { ok: false, reason: "fetch-error" };
+  }
+}
+
+
+async function hydrateThumbnailBackground(itemId, url) {
+  if (!itemId || !url) return;
+
+  // Skip if already in progress for this URL
+  if (inFlightThumbnailFetchByUrl.has(url)) return;
+
+  // Check if previously failed - don't retry immediately
+  try {
+    const items = cachedItems || [];
+    const idx = items.findIndex(i => i && i.id === itemId);
+    if (idx >= 0 && items[idx].thumbnailFetchFailed) return;
+  } catch (e) { }
+
+  // Add to queue for batched processing
+  thumbnailFetchQueue.push({ itemId, url, timestamp: Date.now() });
+
+  // Process immediately for hover-triggered fetches
+  processThumbnailQueue();
+}
+
+let thumbnailQueueProcessing = false;
+async function processThumbnailQueue() {
+  if (thumbnailQueueProcessing) return;
+  thumbnailQueueProcessing = true;
+
+  try {
+    while (thumbnailFetchQueue.length > 0) {
+      const batch = thumbnailFetchQueue.splice(0, THUMBNAIL_FETCH_CONCURRENT_LIMIT);
+
+      // Process each with slight delay between
+      for (const { itemId, url } of batch) {
+        await new Promise(r => setTimeout(r, THUMBNAIL_FETCH_BATCH_DELAY_MS));
+
+        // Skip if already have thumbnail — guna cache sahaja, elak I/O
+        const items = cachedItems || [];
+        const existing = items.find(i => i && i.id === itemId);
+        if (existing && existing.thumbnailUrl) {
+          continue;
+        }
+
+        await fetchAndSaveThumbnail(itemId, url);
+      }
+    }
+  } finally {
+    thumbnailQueueProcessing = false;
+  }
+}
+
+function getDomainFromUrl(url) {
+  try {
+    let host = new URL(url).hostname;
+    if (host.startsWith("www.")) host = host.slice(4);
+    return host;
+  } catch(e) { return ""; }
+}
+
+function extractThumbnailUrlPattern(imageUrl) {
+  try {
+    const url = new URL(imageUrl);
+    let path = url.pathname;
+    path = path.replace(/\d+/g, "{N}");
+    path = path.replace(/([0-9a-f]{8,})-[0-9a-f]{4,}(-[0-9a-f]{4,})+/gi, "{ID}");
+    path = path.replace(/[0-9a-f]{8,}/gi, "{ID}");
+    return path;
+  } catch(e) { return ""; }
+}
+
+function matchThumbnailUrlPattern(candidateUrl, pattern) {
+  try {
+    const url = new URL(candidateUrl);
+    let path = url.pathname;
+    path = path.replace(/\d+/g, "{N}");
+    path = path.replace(/([0-9a-f]{8,})-[0-9a-f]{4,}(-[0-9a-f]{4,})+/gi, "{ID}");
+    path = path.replace(/[0-9a-f]{8,}/gi, "{ID}");
+    return path === pattern;
+  } catch(e) { return false; }
+}
+
+async function learnDomainThumbnailPattern(domain, imageUrl, pageUrl) {
+  if (!domain || !imageUrl) return;
+  const pattern = extractThumbnailUrlPattern(imageUrl);
+  if (!pattern) return;
+  try {
+    const data = await lpStoreGet(DOMAIN_THUMBNAIL_PATTERNS_KEY);
+    const allPatterns = data[DOMAIN_THUMBNAIL_PATTERNS_KEY] || {};
+    if (!allPatterns[domain]) allPatterns[domain] = { patterns: [], learnedCount: 0, lastUpdated: 0 };
+    const entry = allPatterns[domain];
+    const existing = entry.patterns.find(p => p.pattern === pattern);
+    if (existing) {
+      existing.count = (existing.count || 1) + 1;
+      existing.lastUsed = Date.now();
+    } else {
+      entry.patterns.push({ pattern, count: 1, firstLearned: Date.now(), lastUsed: Date.now() });
+      if (entry.patterns.length > 10) {
+        entry.patterns.sort((a, b) => (b.count || 0) - (a.count || 0));
+        entry.patterns = entry.patterns.slice(0, 10);
+      }
+    }
+    entry.learnedCount = entry.patterns.reduce((sum, p) => sum + (p.count || 1), 0);
+    entry.lastUpdated = Date.now();
+    allPatterns[domain] = entry;
+    await lpStoreSet({ [DOMAIN_THUMBNAIL_PATTERNS_KEY]: allPatterns });
+    // Invalidate in-memory cache selepas tulis supaya read seterusnya dapat data terkini
+    invalidateDomainThumbnailPatternsCache();
+  } catch(e) { /* silent */ }
+}
+
+// Cache dalam memori untuk domain thumbnail patterns — elak storage.local.get berulang
+// semasa thumbnail hydration batch
+let _domainThumbnailPatternsCache = null;
+let _domainThumbnailPatternsCacheAt = 0;
+const DOMAIN_THUMBNAIL_PATTERNS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minit
+
+async function getDomainThumbnailPatternsAll() {
+  const now = Date.now();
+  if (_domainThumbnailPatternsCache && now - _domainThumbnailPatternsCacheAt < DOMAIN_THUMBNAIL_PATTERNS_CACHE_TTL_MS) {
+    return _domainThumbnailPatternsCache;
+  }
+  try {
+    const data = await lpStoreGet(DOMAIN_THUMBNAIL_PATTERNS_KEY);
+    _domainThumbnailPatternsCache = data[DOMAIN_THUMBNAIL_PATTERNS_KEY] || {};
+    _domainThumbnailPatternsCacheAt = now;
+    return _domainThumbnailPatternsCache;
+  } catch (e) {
+    return _domainThumbnailPatternsCache || {};
+  }
+}
+
+function invalidateDomainThumbnailPatternsCache() {
+  _domainThumbnailPatternsCache = null;
+}
+
+async function getLearnedPatternsForDomain(domain) {
+  if (!domain) return [];
+  try {
+    const allPatterns = await getDomainThumbnailPatternsAll();
+    const entry = allPatterns[domain];
+    if (!entry || !Array.isArray(entry.patterns)) return [];
+    return entry.patterns;
+  } catch(e) { return []; }
+}
+
+async function pickThumbnailByDomainPatterns(candidates, domain) {
+  if (!candidates || !candidates.length || !domain) return null;
+  const patterns = await getLearnedPatternsForDomain(domain);
+  if (!patterns || !patterns.length) return null;
+  for (const c of candidates) {
+    let matchScore = 0;
+    for (const p of patterns) {
+      if (matchThumbnailUrlPattern(c.url, p.pattern)) {
+        matchScore += (p.count || 1) * 10;
+      }
+    }
+    c.domainScore = matchScore;
+  }
+  candidates.sort((a, b) => (b.domainScore || 0) - (a.domainScore || 0) || b.score - a.score);
+  if (candidates[0] && candidates[0].domainScore > 0) return candidates[0].url;
+  return null;
+}
+
+function upgradeSocialThumbnailUrl(url, sourceUrl) {
+  if (!url || typeof url !== 'string') return url;
+  let upgraded = url;
+  
+  const isInstagram = /(instagram\.com|fbcdn\.net|cdninstagram\.com)/i.test(sourceUrl || url);
+  const isTikTok = /(tiktok\.com|tiktokcdn\.com)/i.test(sourceUrl || url);
+  
+  if (isInstagram) {
+    // JANGAN ubah mana-mana bahagian URL Instagram — signed URL akan 403!
+    // Gambar profil HD diperolehi dari profile_pic_url_hd (URL BERBEZA)
+    // dalam extractThumbnailFromHtml / _igAvatarSnippet, bukan dengan
+    // mengubah og:image. Jadi biarkan URL ini utuh.
+    return upgraded;
+  } else if (isTikTok) {
+    try {
+      const urlObj = new URL(upgraded);
+      const heightParam = urlObj.searchParams.get('height');
+      const widthParam = urlObj.searchParams.get('width');
+      const sParam = urlObj.searchParams.get('s');
+      
+      if (heightParam) urlObj.searchParams.set('height', '1080');
+      if (widthParam) urlObj.searchParams.set('width', '1080');
+      if (sParam) urlObj.searchParams.delete('s');
+      
+      upgraded = urlObj.toString();
+    } catch(e) {}
+  }
+  
+  return upgraded;
+}
+
+function tryGetOembedUrl(pageUrl) {
+  try {
+    const url = new URL(pageUrl);
+    const host = url.hostname.replace(/^www\./, "");
+    if (host === "instagram.com" || host.endsWith(".instagram.com")) {
+      return `https://api.instagram.com/oembed?url=${encodeURIComponent(pageUrl)}`;
+    }
+    if (host === "twitter.com" || host === "x.com" || host.endsWith(".twitter.com")) {
+      return `https://publish.twitter.com/oembed?url=${encodeURIComponent(pageUrl)}`;
+    }
+    if (host === "tiktok.com" || host.endsWith(".tiktok.com")) {
+      return `https://www.tiktok.com/oembed?url=${encodeURIComponent(pageUrl)}`;
+    }
+  } catch(e) {}
+  return null;
+}
+
+async function refreshDomainThumbnails(domain) {
+  if (!domain) return;
+  const patterns = await getLearnedPatternsForDomain(domain);
+  if (!patterns || !patterns.length) return;
+  const items = await getItems();
+  const previousItems = items.map(i => ({ ...i }));
+  const toRefetch = [];
+  for (const item of items) {
+    if (!item || !item.url || getDomainFromUrl(item.url) !== domain) continue;
+    if (item.thumbnailManual) continue;
+    if (item.thumbnailUrl) {
+      const matchesPattern = patterns.some(p => matchThumbnailUrlPattern(item.thumbnailUrl, p.pattern));
+      if (matchesPattern) continue;
+    }
+    toRefetch.push(item);
+  }
+  if (!toRefetch.length) return;
+  for (const item of toRefetch) {
+    item.thumbnailUrl = "";
+    item.thumbnailFetchFailed = false;
+  }
+  await setItems(items, { previousItems, skipDedupe: true });
+  for (const item of toRefetch) {
+    hydrateThumbnailBackground(item.id, item.url);
+  }
+}
+
+function extractThumbnailFromHtml(html, sourceUrl) {
+  let thumbnailUrl = null;
+
+  // Helper: resolve URL relatif kepada URL penuh, return null jika gagal
+  function resolveUrl(raw) {
+    if (!raw || raw.startsWith("data:")) return null;
+    try {
+      return new URL(raw, sourceUrl).toString();
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Helper: tolak URL yang jelas bukan thumbnail (icon, logo, favicon, dll)
+  function looksLikeThumbnail(src) {
+    return !/(logo|favicon|icon|avatar|badge|ad\b|blank|flag|button|btn|sprite|pixel|tracking|analytics)/i.test(src);
+  }
+
+  // Helper: URL ini adalah kandidat kuat (ada keyword thumbnail dalam path)
+  function isStrongCandidate(src) {
+    return /(thumb|poster|preview|cover|snapshot|hqdefault|featured|hero|banner|og[-_]image|social)/i.test(src);
+  }
+
+  // ── Peringkat 1: Meta tag OG / Twitter / variasi tambahan ──────────────────
+  // Liputan: og:image, og:image:secure_url, og:image:url,
+  //          twitter:image, twitter:image:src, msapplication-TileImage, thumbnail
+  const META_PROPS = "og:image|og:image:secure_url|og:image:url|twitter:image|twitter:image:src|msapplication-TileImage|thumbnail";
+  const r1 = new RegExp(`<meta\\s+[^>]*?(?:property|name)=["'](?:${META_PROPS})["'][^>]*?content=["']([^"']+)["']`, "gi");
+  const r2 = new RegExp(`<meta\\s+[^>]*?content=["']([^"']+)["'][^>]*?(?:property|name)=["'](?:${META_PROPS})["']`, "gi");
+
+  // Kumpul semua match, pilih yang pertama yang lulus tapisan
+  const metaMatches = [...html.matchAll(r1), ...html.matchAll(r2)];
+  for (const match of metaMatches) {
+    if (match[1] && looksLikeThumbnail(match[1])) {
+      thumbnailUrl = match[1];
+      break;
+    }
+  }
+
+  // ── Peringkat 2: <link rel="image_src"> ────────────────────────────────────
+  // Format lama tapi masih digunakan sesetengah CMS dan blog platform.
+  // Lebih dipercayai dari imbas <img> rawak kerana laman web sendiri yang tentukan.
+  if (!thumbnailUrl) {
+    const linkMatch = html.match(/<link[^>]+rel=["']image_src["'][^>]+href=["']([^"']+)["']/i)
+      || html.match(/<link[^>]+href=["']([^"']+)["'][^>]+rel=["']image_src["']/i);
+    if (linkMatch && linkMatch[1]) {
+      thumbnailUrl = linkMatch[1];
+    }
+  }
+
+  // ── Peringkat 3: <video poster> (semua URL, bukan domain tertentu sahaja) ──
+  // Sebelum ini hanya aktif untuk domain video hardcoded. Kini aktif untuk semua
+  // URL kerana laman berita dan blog juga sering embed video dengan poster.
+  if (!thumbnailUrl) {
+    const posterMatch = html.match(/<video[^>]*?poster=["']([^"']+)["']/i);
+    if (posterMatch && posterMatch[1] && !posterMatch[1].startsWith("data:")) {
+      thumbnailUrl = posterMatch[1];
+    }
+  }
+
+  // ── Peringkat 4: JSON-LD structured data — imbas SEMUA blok, bukan pertama ─
+  // Sesetengah laman ada berbilang blok JSON-LD (website + artikel + breadcrumb).
+  // Cari dalam 30KB pertama sahaja untuk kelajuan.
+  if (!thumbnailUrl) {
+    const jsonSearchLimit = 30 * 1024;
+    let searchPos = 0;
+    while (!thumbnailUrl && searchPos < jsonSearchLimit) {
+      const jsonStart = html.indexOf('<script type="application/ld+json"', searchPos);
+      if (jsonStart < 0 || jsonStart >= jsonSearchLimit) break;
+      const jsonEnd = html.indexOf("</script>", jsonStart);
+      if (jsonEnd < 0 || jsonEnd <= jsonStart) break;
+      try {
+        const jsonStr = html.substring(jsonStart, jsonEnd + 9);
+        // Cuba parse JSON sebenar dahulu untuk ketepatan
+        const jsonContent = jsonStr.replace(/<script[^>]*>/, "").replace(/<\/script>/, "").trim();
+        let parsed = null;
+        try { parsed = JSON.parse(jsonContent); } catch (e) { }
+        if (parsed) {
+          // Sokong array JSON-LD (@graph) dan objek tunggal
+          const nodes = Array.isArray(parsed["@graph"]) ? parsed["@graph"]
+            : Array.isArray(parsed) ? parsed
+            : [parsed];
+          for (const node of nodes) {
+            if (!node || typeof node !== "object") continue;
+            // thumbnailUrl (VideoObject, schema.org)
+            const thumb = node.thumbnailUrl || node.thumbnail;
+            if (thumb) {
+              const val = Array.isArray(thumb) ? thumb[0] : thumb;
+              const src = typeof val === "object" ? (val.url || val.contentUrl) : val;
+              if (src && typeof src === "string" && !src.startsWith("data:")) {
+                thumbnailUrl = src;
+                break;
+              }
+            }
+            // image (Article, NewsArticle, WebPage, dll)
+            const img = node.image;
+            if (!thumbnailUrl && img) {
+              const val = Array.isArray(img) ? img[0] : img;
+              const src = typeof val === "object" ? (val.url || val.contentUrl) : val;
+              if (src && typeof src === "string" && !src.startsWith("data:") && looksLikeThumbnail(src)) {
+                thumbnailUrl = src;
+                break;
+              }
+            }
+          }
+        } else {
+          // Fallback regex jika JSON tidak valid
+          const jsonMatch = jsonStr.match(/["']thumbnailUrl["']\s*:\s*["']([^"']+)["']/i)
+            || jsonStr.match(/["']image["']\s*:\s*["']([^"'"\[{][^"']*?)["']/i);
+          if (jsonMatch && jsonMatch[1] && looksLikeThumbnail(jsonMatch[1])) {
+            thumbnailUrl = jsonMatch[1];
+          }
+        }
+      } catch (e) { }
+      searchPos = jsonEnd + 9;
+    }
+  }
+
+  // ── Peringkat 5: CSS background-image pada elemen player (player-wrap, dll) ─
+  if (!thumbnailUrl) {
+    const bgMatch = html.match(/<div[^>]*?\b(?:id=["']player-wrap["']|class=["'][^"']*?\bplayer-wrap\b[^"']*?["'])[^>]*?style=["'][^"']*?background-image:\s*url\(([^)]+)\)\s*;?\s*["']/i);
+    if (bgMatch && bgMatch[1]) {
+      thumbnailUrl = bgMatch[1];
+    }
+  }
+
+  // ── Peringkat 6: Imbas tag <img> dengan keutamaan berdasarkan saiz & keyword ─
+  // Dua larian: larian pertama cari kandidat kuat (keyword + saiz besar),
+  // larian kedua simpan fallback terbaik (saiz terbesar yang lulus tapisan).
+  if (!thumbnailUrl) {
+    // Regex tangkap src DAN atribut width/height dalam satu pass
+    const imgRegex = /<img([^>]+)>/gi;
+    let match;
+    let bestFallback = null;
+    let bestFallbackWidth = 0;
+
+    while ((match = imgRegex.exec(html)) !== null) {
+      const attrs = match[1];
+
+      // Ambil src dari pelbagai atribut lazy-load
+      const srcMatch = attrs.match(/(?:^|\s)(?:src|data-src|data-lazy-src|data-original|data-lazy|data-image)=["']([^"']+)["']/i);
+      if (!srcMatch) continue;
+      const src = srcMatch[1];
+      if (!src || src.startsWith("data:") || !looksLikeThumbnail(src)) continue;
+
+      // Cuba baca width dari atribut HTML untuk tolak gambar kecil
+      const wMatch = attrs.match(/\bwidth=["']?(\d+)/i);
+      const hMatch = attrs.match(/\bheight=["']?(\d+)/i);
+      const w = wMatch ? parseInt(wMatch[1], 10) : 0;
+      const h = hMatch ? parseInt(hMatch[1], 10) : 0;
+
+      // Tolak gambar yang jelas kecil (< 80px pada mana-mana dimensi yang diketahui)
+      if ((w > 0 && w < 80) || (h > 0 && h < 80)) continue;
+
+      // Kandidat kuat: keyword dalam URL — terus pilih
+      if (isStrongCandidate(src)) {
+        thumbnailUrl = src;
+        break;
+      }
+
+      // Simpan sebagai fallback terbaik berdasarkan lebar (gambar terbesar menang)
+      if (w > bestFallbackWidth || (!bestFallback && w === 0)) {
+        bestFallback = src;
+        bestFallbackWidth = w;
+      }
+    }
+
+    if (!thumbnailUrl && bestFallback) {
+      thumbnailUrl = bestFallback;
+    }
+  }
+
+  // ── Resolve URL relatif → URL penuh ────────────────────────────────────────
+  return thumbnailUrl ? resolveUrl(thumbnailUrl) : null;
+}
+
+// Versi extractThumbnailFromHtml yang return SEMUA kandidat (untuk image picker UI)
+// Return array { url, label, score } — diisih dari paling relevan ke kurang relevan
+// Had: maksimum MAX_CANDIDATES gambar, fetch hanya 100KB HTML
+function extractThumbnailCandidatesFromHtml(html, sourceUrl) {
+  const MAX_CANDIDATES = 12;
+  const seen = new Set();
+  let candidates = [];
+
+  function resolveUrl(raw) {
+    if (!raw || raw.startsWith("data:")) return null;
+    try { return new URL(raw, sourceUrl).toString(); } catch (e) { return null; }
+  }
+
+  function looksLikeThumbnail(src) {
+    // Don't exclude avatar/profile images for Instagram and TikTok
+    const isSpecialUrl = /(instagram\.com|fbcdn\.net|cdninstagram\.com|tiktok\.com|tiktokcdn\.com)/i.test(sourceUrl || src);
+    // Also check if the src itself looks like an Instagram/TikTok profile pic
+    const looksLikeProfilePic = /(profile_pic|profilepic|avatar)/i.test(src);
+    const excludePattern = (isSpecialUrl || looksLikeProfilePic) 
+      ? /(logo|favicon|badge|ad\b|blank|flag|button|btn|sprite|pixel|tracking|analytics)/i
+      : /(logo|favicon|icon|avatar|badge|ad\b|blank|flag|button|btn|sprite|pixel|tracking|analytics)/i;
+    return !excludePattern.test(src);
+  }
+
+  function isStrongCandidate(src) {
+    return /(thumb|poster|preview|cover|snapshot|hqdefault|featured|hero|banner|og[-_]image|social|profile_pic|profilepic|avatar)/i.test(src);
+  }
+
+  function add(raw, label, score) {
+    const url = resolveUrl(raw);
+    if (!url || seen.has(url)) return;
+    seen.add(url);
+    candidates.push({ url, label, score });
+  }
+
+  // SPECIAL: For Instagram URLs, prioritize profile picture specific patterns FIRST with highest score
+  const isInstagram = /(instagram\.com|fbcdn\.net|cdninstagram\.com)/i.test(sourceUrl);
+  if (isInstagram) {
+    // Function to calculate Instagram candidate score
+    const calculateInstagramScore = (url, baseScore) => {
+      let score = baseScore;
+      // Bonus: no stp param!
+      if (!/stp=/i.test(url)) score += 200;
+      // Bonus: fbcdn.net (ABSOLUTE TOP PRIORITY! MAKE IT 10,000 EXTRA POINTS!)
+      if (/fbcdn\.net/i.test(url)) score += 10000;
+      // Bonus: no size path like /s150x150/!
+      if (!/\/[sep]\d+(x\d+)?\//i.test(url)) score += 100;
+      return score;
+    };
+    
+    // Look for Instagram profile pic patterns in the HTML
+    // Pattern 1: script tags with profile_pic_url_hd (HIGHEST PRIORITY!)
+    const scriptProfilePicHdMatches = html.match(/"profile_pic_url_hd":"([^"]+)"/gi);
+    if (scriptProfilePicHdMatches) {
+      for (const match of scriptProfilePicHdMatches) {
+        const urlMatch = match.match(/"profile_pic_url_hd":"([^"]+)"/i);
+        if (urlMatch && urlMatch[1]) {
+          const decodedUrl = urlMatch[1].replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+          const score = calculateInstagramScore(decodedUrl, 10000);
+          add(decodedUrl, 'instagram-profile-script-hd', score);
+        }
+      }
+    }
+    
+    // Pattern 2: script tags with hdProfilePicUrl or hdProfilePicURL
+    const scriptHdProfilePicMatches = html.match(/"hdProfilePicURL?":"([^"]+)"/gi);
+    if (scriptHdProfilePicMatches) {
+      for (const match of scriptHdProfilePicMatches) {
+        const urlMatch = match.match(/"hdProfilePicURL?":"([^"]+)"/i);
+        if (urlMatch && urlMatch[1]) {
+          const decodedUrl = urlMatch[1].replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+          const score = calculateInstagramScore(decodedUrl, 9500);
+          add(decodedUrl, 'instagram-hd-profile-pic', score);
+        }
+      }
+    }
+    
+    // Pattern 3: script tags with profilePicUrlHd (NEXT HIGHEST!)
+    const scriptProfilePicUrlHdMatches = html.match(/"profilePicUrlHd":"([^"]+)"/gi);
+    if (scriptProfilePicUrlHdMatches) {
+      for (const match of scriptProfilePicUrlHdMatches) {
+        const urlMatch = match.match(/"profilePicUrlHd":"([^"]+)"/i);
+        if (urlMatch && urlMatch[1]) {
+          const decodedUrl = urlMatch[1].replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+          const score = calculateInstagramScore(decodedUrl, 9000);
+          add(decodedUrl, 'instagram-profile-script-2-hd', score);
+        }
+      }
+    }
+    
+    // Pattern 4: script tags with profile_pic_url
+    const scriptProfilePicMatches = html.match(/"profile_pic_url":"([^"]+)"/gi);
+    if (scriptProfilePicMatches) {
+      for (const match of scriptProfilePicMatches) {
+        const urlMatch = match.match(/"profile_pic_url":"([^"]+)"/i);
+        if (urlMatch && urlMatch[1]) {
+          const decodedUrl = urlMatch[1].replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+          const score = calculateInstagramScore(decodedUrl, 8500);
+          add(decodedUrl, 'instagram-profile-script', score);
+        }
+      }
+    }
+    
+    // Pattern 5: script tags with profilePicUrl
+    const scriptProfilePicUrlMatches = html.match(/"profilePicUrl":"([^"]+)"/gi);
+    if (scriptProfilePicUrlMatches) {
+      for (const match of scriptProfilePicUrlMatches) {
+        const urlMatch = match.match(/"profilePicUrl":"([^"]+)"/i);
+        if (urlMatch && urlMatch[1]) {
+          const decodedUrl = urlMatch[1].replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+          const score = calculateInstagramScore(decodedUrl, 8000);
+          add(decodedUrl, 'instagram-profile-script-2', score);
+        }
+      }
+    }
+    
+    // Pattern 5: meta tags with og:image
+    const ogImageMatches = html.match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"/gi);
+    if (ogImageMatches) {
+      for (const match of ogImageMatches) {
+        const urlMatch = match.match(/content="([^"]+)"/i);
+        if (urlMatch && urlMatch[1]) {
+          const score = calculateInstagramScore(urlMatch[1], 2000);
+          add(urlMatch[1], 'instagram-og-image', score);
+        }
+      }
+    }
+    
+    // Pattern 6: any img tags with profile/avatar in src
+    const imgProfileMatches = html.match(/<img[^>]+src="([^"]*(?:profile_pic|profilepic|avatar)[^"]*)"[^>]*>/gi);
+    if (imgProfileMatches) {
+      for (const match of imgProfileMatches) {
+        const urlMatch = match.match(/src="([^"]+)"/i);
+        if (urlMatch && urlMatch[1]) {
+          const score = calculateInstagramScore(urlMatch[1], 1900);
+          add(urlMatch[1], 'instagram-profile-img', score);
+        }
+      }
+    }
+  }
+
+  // SPECIAL: For redgifs URLs, prioritize profile picture (userpic.redgifs.com)
+  // and never pick the apple-touch-icon / generic icon as thumbnail.
+  let isRedgifs = false;
+  try {
+    isRedgifs = /(^|\.)redgifs\.com$/i.test(new URL(sourceUrl).hostname.replace(/^www\./, ""));
+  } catch (e) { isRedgifs = false; }
+  if (isRedgifs) {
+    // Profile picture hosted on userpic.redgifs.com (highest priority).
+    // HTML mungkin mengandungi URL dalam JSON bertindih (cth: \/) — buang escape dulu.
+    const redgifsHtmlNorm = html.replace(/\\"/g, '"').replace(/\\\//g, "/");
+    const userpicMatches = redgifsHtmlNorm.match(/https?:\/\/[^\s"'<>]*userpic\.redgifs\.com[^\s"'<>]*/gi);
+    if (userpicMatches) {
+      for (const m of userpicMatches) {
+        add(m, "redgifs-userpic", 9000);
+      }
+    }
+    // Img tag dengan src userpic.redgifs.com
+    const userpicImgMatches = html.match(/<img[^>]+src=["']([^"']*userpic\.redgifs\.com[^"']*)["']/gi);
+    if (userpicImgMatches) {
+      for (const match of userpicImgMatches) {
+        const urlMatch = match.match(/src=["']([^"']+)["']/i);
+        if (urlMatch && urlMatch[1]) add(urlMatch[1], "redgifs-userpic-img", 9000);
+      }
+    }
+    if (userpicMatches || userpicImgMatches) {
+      lpLog("info", "[RGFIX] html userpic candidates:", (userpicMatches || []).concat(userpicImgMatches || []).length);
+    }
+  }
+
+  // Peringkat 1: Meta OG / Twitter (score 100)
+  const META_PROPS = "og:image|og:image:secure_url|og:image:url|twitter:image|twitter:image:src|msapplication-TileImage|thumbnail";
+  const r1 = new RegExp(`<meta\\s+[^>]*?(?:property|name)=["'](?:${META_PROPS})["'][^>]*?content=["']([^"']+)["']`, "gi");
+  const r2 = new RegExp(`<meta\\s+[^>]*?content=["']([^"']+)["'][^>]*?(?:property|name)=["'](?:${META_PROPS})["']`, "gi");
+  for (const m of [...html.matchAll(r1), ...html.matchAll(r2)]) {
+    if (m[1] && looksLikeThumbnail(m[1])) add(m[1], "og/twitter", 100);
+  }
+
+  // Peringkat 2: link rel="image_src" (score 90)
+  const linkMatch = html.match(/<link[^>]+rel=["']image_src["'][^>]+href=["']([^"']+)["']/i)
+    || html.match(/<link[^>]+href=["']([^"']+)["'][^>]+rel=["']image_src["']/i);
+  if (linkMatch && linkMatch[1]) add(linkMatch[1], "image_src", 90);
+
+  // Peringkat 3: video poster (score 85)
+  const allPosters = html.matchAll(/<video[^>]*?poster=["']([^"']+)["']/gi);
+  for (const m of allPosters) {
+    if (m[1] && !m[1].startsWith("data:")) add(m[1], "video poster", 85);
+  }
+
+  // Peringkat 4: JSON-LD (score 80)
+  const jsonSearchLimit = 30 * 1024;
+  let searchPos = 0;
+  while (searchPos < jsonSearchLimit) {
+    const jsonStart = html.indexOf('<script type="application/ld+json"', searchPos);
+    if (jsonStart < 0 || jsonStart >= jsonSearchLimit) break;
+    const jsonEnd = html.indexOf("</script>", jsonStart);
+    if (jsonEnd < 0 || jsonEnd <= jsonStart) break;
+    try {
+      const jsonContent = html.substring(jsonStart, jsonEnd + 9)
+        .replace(/<script[^>]*>/, "").replace(/<\/script>/, "").trim();
+      let parsed = null;
+      try { parsed = JSON.parse(jsonContent); } catch (e) { }
+      if (parsed) {
+        const nodes = Array.isArray(parsed["@graph"]) ? parsed["@graph"]
+          : Array.isArray(parsed) ? parsed : [parsed];
+        for (const node of nodes) {
+          if (!node || typeof node !== "object") continue;
+          for (const key of ["thumbnailUrl", "thumbnail", "image"]) {
+            const val = node[key];
+            if (!val) continue;
+            const arr = Array.isArray(val) ? val : [val];
+            for (const v of arr) {
+              const src = typeof v === "object" ? (v.url || v.contentUrl) : v;
+              if (src && typeof src === "string" && !src.startsWith("data:") && looksLikeThumbnail(src)) {
+                add(src, "json-ld", 80);
+              }
+            }
+          }
+        }
+      }
+    } catch (e) { }
+    searchPos = jsonEnd + 9;
+  }
+
+  // Peringkat 5: CSS background-image pada elemen player (player-wrap) (score 75)
+  const bgMatch = html.match(/<div[^>]*?\b(?:id=["']player-wrap["']|class=["'][^"']*?\bplayer-wrap\b[^"']*?["'])[^>]*?style=["'][^"']*?background-image:\s*url\(([^)]+)\)\s*;?\s*["']/i);
+  if (bgMatch && bgMatch[1] && looksLikeThumbnail(bgMatch[1])) add(bgMatch[1], "player-wrap bg", 75);
+
+  // Peringkat 6: <img> tag — kuat (score 60) dan fallback (score 30)
+  const imgRegex = /<img([^>]+)>/gi;
+  let m;
+  while ((m = imgRegex.exec(html)) !== null) {
+    if (candidates.length >= MAX_CANDIDATES * 2) break; // elak scan terlalu lama
+    const attrs = m[1];
+    const srcMatch = attrs.match(/(?:^|\s)(?:src|data-src|data-lazy-src|data-original|data-lazy|data-image)=["']([^"']+)["']/i);
+    if (!srcMatch) continue;
+    const src = srcMatch[1];
+    if (!src || src.startsWith("data:") || !looksLikeThumbnail(src)) continue;
+    const wMatch = attrs.match(/\bwidth=["']?(\d+)/i);
+    const hMatch = attrs.match(/\bheight=["']?(\d+)/i);
+    const w = wMatch ? parseInt(wMatch[1], 10) : 0;
+    const h = hMatch ? parseInt(hMatch[1], 10) : 0;
+    if ((w > 0 && w < 80) || (h > 0 && h < 80)) continue;
+    const score = isStrongCandidate(src) ? 60 : 30;
+    add(src, "img", score);
+  }
+  
+  // FIRST: If it's Instagram, utamakan gambar profil (avatar) —
+  // bukan gambar post/kandungan. Kekal fbcdn.net jika tiada calon profil.
+  if (isInstagram) {
+    // STRONGEST: fbcdn.net profile picture (HD profile_pic_url / profile_pic_url_hd)
+    const fbcdnProfileCands = candidates.filter(c =>
+      /fbcdn\.net/i.test(c.url) &&
+      /profile_pic|profilepic|avatar/i.test(c.url)
+    );
+    // NEXT: apa-apa fbcdn.net (masih lagi lebih bagus dari scontent)
+    const fbcdnCands = candidates.filter(c => /fbcdn\.net/i.test(c.url));
+    // FALLBACK: og:image pada scontent.cdninstagram.com (akn di-upgrade ke
+    // resolusi penuh dalam upgradeSocialThumbnailUrl)
+    const scontentOgCands = candidates.filter(c =>
+      /instagram-og-image/i.test(c.label) || /scontent\.cdninstagram\.com/i.test(c.url)
+    );
+
+    if (fbcdnProfileCands.length > 0) {
+      candidates = fbcdnProfileCands;
+    } else if (fbcdnCands.length > 0) {
+      candidates = fbcdnCands;
+    } else if (scontentOgCands.length > 0) {
+      candidates = scontentOgCands;
+    }
+  }
+
+  // FIRST (redgifs): ONLY keep userpic.redgifs.com URLs if there are any
+  // (elak apple-touch-icon / og:image generik dipilih sebagai thumbnail)
+  if (isRedgifs) {
+    const userpicCandidates = candidates.filter(c => /userpic\.redgifs\.com/i.test(c.url));
+    if (userpicCandidates.length > 0) {
+      candidates = userpicCandidates;
+    }
+  }
+  
+  // Isih: score tinggi dulu, kemudian kekalkan urutan asal dalam kumpulan sama
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates.slice(0, MAX_CANDIDATES);
+}
+
+// Fetch HTML halaman dan return senarai kandidat gambar untuk image picker UI
+// Digunakan oleh handler "fetch-image-candidates"
+async function fetchImageCandidatesForUrl(url) {
+  if (!url) return [];
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 6000);
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "GET",
+        credentials: "omit",
+        signal: controller.signal,
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Range": "bytes=0-524287"
+        }
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
+    if (!res || (!res.ok && res.status !== 206 && res.status !== 416)) return [];
+    let html = "";
+    if (res.body && typeof res.body.getReader === "function") {
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let bytesRead = 0;
+      while (bytesRead < 524288) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        html += decoder.decode(value, { stream: true });
+        bytesRead += value.length;
+      }
+      html += decoder.decode();
+      reader.cancel().catch(() => {});
+    } else {
+      html = (await res.text()).substring(0, 524288);
+    }
+    if (!html || html.length < 50) return [];
+    return extractThumbnailCandidatesFromHtml(html, url);
+  } catch (e) {
+    return [];
+  }
+  }
+
+  // Kesan: URL profil Instagram (instagram.com/username) — bukan pos (/p/),
+  // reel (/reel/), tv (/tv/), stories (/stories/), dsb.
+  function isInstagramProfileUrl(pageUrl) {
+    try {
+      const u = new URL(pageUrl);
+      const host = u.hostname.replace(/^www\./, "");
+      if (host !== "instagram.com" && !host.endsWith(".instagram.com")) return false;
+      const parts = u.pathname.replace(/^\//, "").split("/").filter(Boolean);
+      if (parts.length === 0) return false; // root
+      const SECTIONS = ["p", "reel", "tv", "stories", "explore", "about",
+        "accounts", "developer", "legal", "press", "jobs", "blog", "business",
+        "api", "embed", "direct", "activity", "settings", "edit",
+        "challenge", "fbsr", "locations", "hashtag", "tags", "www", "guide"];
+      return !SECTIONS.includes(parts[0].toLowerCase());
+    } catch (e) { return false; }
+  }
+
+  async function fetchAndSaveThumbnail(itemId, url) {
+  const key = url;
+  inFlightThumbnailFetchByUrl.set(key, true);
+
+  try {
+    const isYt = extractYouTubeVideoId(url);
+    if (isYt) return;
+
+    let thumbnailUrl = null;
+    
+    // Check if Instagram first - we'll skip oEmbed for Instagram
+    let isInstagramUrl = false;
+    try {
+      const host = new URL(url).hostname.replace(/^www\./, "");
+      isInstagramUrl = host === "instagram.com" || host.endsWith(".instagram.com");
+    } catch(e) {}
+
+    // Instagram: cuba dapatkan gambar profil dari tab yang sedang dibuka DULU
+    // (elak fetch terus ke Instagram yang di-block oleh bot protection).
+    if (isInstagramUrl) {
+      try {
+        const tabPic = await tryGetInstagramProfilePicFromTab(url);
+        if (tabPic) thumbnailUrl = tabPic;
+      } catch (e) { /* jatuh ke HTML fetch */ }
+    }
+
+    // First try: oEmbed lpApi (for Twitter, TikTok only - skip Instagram)
+    if (!isInstagramUrl) {
+      const oembedUrl = tryGetOembedUrl(url);
+      if (oembedUrl) {
+        try {
+          const oembedController = new AbortController();
+          const oembedTimer = setTimeout(() => oembedController.abort(), 4000);
+          const oembedRes = await fetch(oembedUrl, {
+            method: "GET",
+            signal: oembedController.signal,
+            headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" }
+          });
+          clearTimeout(oembedTimer);
+          if (oembedRes.ok) {
+            const oembedData = await oembedRes.json();
+            let thumb = oembedData && (oembedData.thumbnail_url || oembedData.thumbnailUrl);
+            if (thumb && typeof thumb === "string") {
+              thumbnailUrl = thumb;
+            }
+          }
+        } catch (e) { /* oembed failed */ }
+      }
+    }
+
+    // Jika thumbnail sudah di-fetch (dari tab terbuka), terus guna.
+    // Untuk lain, fetch HTML jika tiada lagi.
+    if (!thumbnailUrl) {
+      // Fetch HTML page
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+      let res;
+      try {
+        res = await fetch(url, {
+          method: "GET",
+          credentials: "omit",
+          signal: controller.signal,
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Range": "bytes=0-524287"
+          }
+        });
+      } catch (fetchErr) {
+        clearTimeout(timeoutId);
+        /* html fetch failed, continue */
+      }
+      clearTimeout(timeoutId);
+
+      if (res && (res.ok || res.status === 206 || res.status === 416)) {
+        let html = "";
+        try {
+          if (res.body && typeof res.body.getReader === 'function') {
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let bytesRead = 0;
+            const maxBytes = 524288;
+            while (bytesRead < maxBytes) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              html += decoder.decode(value, { stream: true });
+              bytesRead += value.length;
+            }
+            html += decoder.decode();
+            reader.cancel().catch(() => {});
+          } else {
+            const fullHtml = await res.text();
+            html = fullHtml.substring(0, 524288);
+          }
+        } catch (e) { /* body read failed */ }
+
+        if (html && html.length >= 50) {
+          const domain = getDomainFromUrl(url);
+          const candidates = extractThumbnailCandidatesFromHtml(html, url);
+          if (domain && candidates && candidates.length) {
+            if (isInstagramUrl) {
+              // Untuk profil Instagram: utamakan gambar profil (avatar),
+              // bukan gambar post/kandungan (cth scontent.cdninstagram.com/v/t51..._n.jpg).
+              if (isInstagramProfileUrl(url)) {
+                const profileCands = candidates.filter(c =>
+                  /profile|og-image/i.test(c.label) ||
+                  /profile_pic|profilepic|avatar/i.test(c.url)
+                );
+                if (profileCands.length) {
+                  profileCands.sort((a, b) => b.score - a.score);
+                  thumbnailUrl = profileCands[0].url;
+                } else {
+                  // Tapis keluar gambar <img> generik (post) — guna calon lain
+                  const nonPost = candidates.filter(c => c.label !== "img");
+                  thumbnailUrl = (nonPost[0] || candidates[0]).url;
+                }
+              } else {
+                // For Instagram: SKIP old learned patterns and just take the highest-scoring candidate
+                thumbnailUrl = candidates[0].url;
+              }
+            } else {
+              thumbnailUrl = await pickThumbnailByDomainPatterns(candidates, domain);
+            }
+          }
+          if (!thumbnailUrl && candidates && candidates.length) {
+            thumbnailUrl = candidates[0].url;
+          }
+
+          if (!thumbnailUrl && domain) {
+            const patterns = await getLearnedPatternsForDomain(domain);
+            if (patterns && patterns.length) {
+              const greedyRegex = /<img[^>]+(?:src|data-src|data-lazy-src)=["']([^"']+)["']/gi;
+              let gm;
+              while ((gm = greedyRegex.exec(html)) !== null) {
+                const src = gm[1];
+                if (!src || src.startsWith("data:")) continue;
+                const fullUrl = (() => { try { return new URL(src, url).toString(); } catch(e) { return null; } })();
+                if (!fullUrl) continue;
+                for (const p of patterns) {
+                  if (matchThumbnailUrlPattern(fullUrl, p.pattern)) {
+                    thumbnailUrl = fullUrl;
+                    break;
+                  }
+                }
+                if (thumbnailUrl) break;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (thumbnailUrl) {
+      // Apply upgrade untuk TikTok DAN Instagram (profile picture / full-res)
+      thumbnailUrl = upgradeSocialThumbnailUrl(thumbnailUrl, url);
+      
+      await queueItemsMutation(async () => {
+        const items = await getItems();
+        const idx = items.findIndex(i => i && i.id === itemId);
+        // For Instagram: always update the thumbnailUrl (even if already set).
+        // For force-refresh (dari "Refresh thumbnail"): sentiasa tulis semula thumbnail
+        // yang di-fetch (item mungkin dah ada thumbnail buruk seperti apple-touch-icon).
+        if (idx >= 0 && (!items[idx].thumbnailUrl || isInstagramUrl || force)) {
+          items[idx].thumbnailUrl = thumbnailUrl;
+          items[idx].thumbnailFetchFailed = false;
+          await setItems(items, { previousItems: items.slice(), skipDedupe: true });
+          flashSavedBadge();
+          if (lpApi.runtime && lpApi.runtime.sendMessage) {
+            lpApi.runtime.sendMessage({ type: "refresh-picker-ui" }).catch(() => {});
+          }
+        }
+      });
+    } else {
+      await markFetchFailed(itemId);
+    }
+  } catch (err) {
+    await markFetchFailed(itemId);
+  } finally {
+    inFlightThumbnailFetchByUrl.delete(key);
+  }
+}
+
+function getRedgifsUsername(pageUrl) {
+  try {
+    const u = new URL(pageUrl);
+    const host = u.hostname.replace(/^www\./, "");
+    if (host !== "redgifs.com" && !host.endsWith(".redgifs.com")) return null;
+    const parts = u.pathname.split("/").filter(Boolean);
+    if (parts.length === 0) return null;
+    if (parts[0].toLowerCase() === "users" && parts[1]) return parts[1].replace(/^@/, "");
+    // Root-level username (cth: /eva2000 atau /@eva2000) — bukan bahagian dikenali
+    const KNOWN_SECTIONS = ["watch", "ifr", "gifs", "gif", "explore", "search",
+      "categories", "recent", "top", "tags", "featured", "porn", "reactions",
+      "games", "auth", "api", "embed", "users", "discover", "trending"];
+    if (!KNOWN_SECTIONS.includes(parts[0].toLowerCase())) return parts[0].replace(/^@/, "");
+    return null;
+  } catch (e) { return null; }
+}
+
+// Cuba dapatkan gambar profil redgifs dari tab yang sedang dibuka (DOM sudah di-render).
+// Ini ialah cara paling boleh diharap untuk SPA redgifs — elakkan kebergantungan pada
+// API/HTML yang tak mengandungi URL userpic. Inject snippet inline supaya berfungsi
+// pada APA-SAHAJA tab redgifs yang dibuka (tak perlu contentScript.js di-inject dulu).
+function _rgUserpicSnippet() {
+  var i = document.querySelector('img[src*="userpic.redgifs.com"]');
+  if (i && i.src) return i.src;
+  var a = document.querySelectorAll('img');
+  for (var n = 0; n < a.length; n++) {
+    if (a[n].src && /userpic\.redgifs\.com/i.test(a[n].src)) return a[n].src;
+  }
+  var b = document.querySelector('[style*="userpic.redgifs.com"]');
+  if (b) {
+    var m = (b.getAttribute('style') || '').match(/url\(["']?([^"')]*userpic\.redgifs\.com[^"')]*)/i);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+// Cuba dapatkan gambar profil Instagram dari tab yang sedang dibuka (DOM
+// sudah di-render). Ini paling boleh diharap kerana elak fetch terus ke
+// pelayan Instagram yang akan di-block (bot protection) bila kerap refresh.
+function _igAvatarSnippet() {
+  try {
+    // Decode penuh escape JSON Instagram (\u0026=&, \u0025=%, \u003D==, \u002F=/, \/)
+    // supaya URL jadi sah dan load betul.
+    function decodeIgUrl(s) {
+      if (!s) return s;
+      s = s.replace(/\\u0026/g, '&');
+      s = s.replace(/&amp;/gi, '&');
+      s = s.replace(/\\\//g, '/');
+      s = s.replace(/\\u([0-9a-fA-F]{4})/g, function (_, h) {
+        return String.fromCharCode(parseInt(h, 16));
+      });
+      return s;
+    }
+    function unesc(t) { return (t || '').replace(/\\"/g, '"'); }
+    function extractPic(text) {
+      if (!text || text.indexOf('profile_pic') === -1) return null;
+      var t = unesc(text);
+      var m = t.match(/"profile_pic_url_hd"\s*:\s*"([^"]+)"/)
+            || t.match(/"profilePicUrlHd"\s*:\s*"([^"]+)"/)
+            || t.match(/"profile_pic_url"\s*:\s*"([^"]+)"/)
+            || t.match(/"profilePicUrl"\s*:\s*"([^"]+)"/);
+      return m && m[1] ? decodeIgUrl(m[1]) : null;
+    }
+    function urlPath(u) { try { return (u || '').split('?')[0]; } catch (e) { return u || ''; } }
+
+    var SECTIONS = ["p", "reel", "tv", "stories", "explore", "about",
+      "accounts", "developer", "legal", "press", "jobs", "blog", "business",
+      "api", "embed", "direct", "activity", "settings", "edit",
+      "challenge", "fbsr", "locations", "hashtag", "tags", "www", "guide"];
+    var pathUser = null;
+    try {
+      var pu = location.pathname.split('/').filter(Boolean);
+      if (pu[0] && !SECTIONS.includes(pu[0].toLowerCase())) pathUser = pu[0];
+    } catch (e) { pathUser = null; }
+
+    var scripts = [].slice.call(document.querySelectorAll('script'));
+    var texts = scripts.map(function (s) { return s.textContent || ''; });
+    var imgs = [].slice.call(document.querySelectorAll('img'));
+
+    // 0. PALING TEPAT: <img> header profil dengan alt "{username}'s profile picture".
+    //    Ini gambar tepat di sebelah nama profil — padan dengan username dalam URL,
+    //    jadi elak tersalah ambil avatar viewer / akaun cadangan.
+    if (pathUser) {
+      var unameLc = pathUser.toLowerCase();
+      for (var a = 0; a < imgs.length; a++) {
+        var alt = (imgs[a].getAttribute('alt') || '').toLowerCase();
+        if (!alt) continue;
+        if (alt.indexOf('profile picture') === -1 && alt.indexOf('profile photo') === -1) continue;
+        if (alt.indexOf(unameLc) === -1) continue;
+        var asrc = imgs[a].getAttribute('src') || imgs[a].getAttribute('data-src') || '';
+        if (/scontent|fbcdn|cdninstagram/i.test(asrc)) return decodeIgUrl(asrc);
+      }
+    }
+
+    // 1. PALING BOLEH DIHARAP: cari script __additionalDataLoaded
+    //    yang membawa route page ini (cth: __additionalDataLoaded('/marissol_lu/reels/'...)).
+    //    Data viewer (akaun login) ada di script BERBEZA (bootstrap),
+    //    jadi script ini = data owner page sahaja.
+    if (pathUser) {
+      var route = '/' + pathUser + '/';
+      for (var i = 0; i < scripts.length; i++) {
+        var t = texts[i];
+        if (t.indexOf('__additionalDataLoaded') === -1) continue;
+        if (t.indexOf(route) === -1 && t.indexOf('"' + pathUser + '"') === -1) continue;
+        var p = extractPic(t);
+        if (p) return p;
+      }
+    }
+
+    // 2. Dapatkan path avatar VIEWER (akaun login) dari objek "viewer"
+    //    dalam JSON, supaya kita TAPISnya (jangan ambil gambar sendiri).
+    var viewerPath = null;
+    for (var v = 0; v < scripts.length; v++) {
+      var cv = unesc(texts[v]);
+      var vi = cv.indexOf('"viewer"');
+      if (vi >= 0) {
+        var vp = extractPic(cv.slice(vi));
+        if (vp) { viewerPath = urlPath(vp); break; }
+      }
+    }
+
+    // 3. Kumpul semua profile_pic dari JSON (ikut turutan).
+    //    Buang yang PATH-nya sama dgn viewer (akaun sendiri).
+    var allPics = [];
+    for (var k = 0; k < scripts.length; k++) {
+      var pk = extractPic(texts[k]);
+      if (pk && allPics.indexOf(pk) === -1) allPics.push(pk);
+    }
+    var filtered = allPics.filter(function (p) {
+      return !(viewerPath && urlPath(p) === viewerPath);
+    });
+    try { lpLog("info", '[IGSNAP]', JSON.stringify({
+      pathUser: pathUser, viewerPath: viewerPath,
+      allPics: allPics.map(function (p) { return p.split('?')[0]; }),
+      filtered: filtered.map(function (p) { return p.split('?')[0]; })
+    }).substring(0, 1500)); } catch (e) {}
+    if (filtered.length) return filtered[0];
+    if (allPics.length) return allPics[0];
+
+    // 4. Fallback: <img> avatar terbesar yang BUKAN viewer
+    var best = null, bestScore = -1;
+    for (var j = 0; j < imgs.length; j++) {
+      var src = imgs[j].getAttribute('src') || imgs[j].getAttribute('data-src') || '';
+      if (!/scontent\.cdninstagram\.com/i.test(src) || !/t51\.[0-9]+-19/i.test(src)) continue;
+      var d = decodeIgUrl(src);
+      if (viewerPath && urlPath(d) === viewerPath) continue;
+      var w = imgs[j].naturalWidth || imgs[j].clientWidth || imgs[j].width || 0;
+      var score = Math.min(w, 800) + (/s150x150/i.test(src) ? 0 : 100);
+      if (score > bestScore) { bestScore = score; best = d; }
+    }
+    if (best) return best;
+
+    // 5. og:image (hanya betul untuk profile page, bukan post)
+    if (pathUser) {
+      var og = document.querySelector('meta[property="og:image"]');
+      if (og && og.getAttribute('content')) return decodeIgUrl(og.getAttribute('content'));
+    }
+    return null;
+  } catch (e) { return null; }
+}
+
+// Snippet debug: return struktur calon (bukan URL) supaya boleb di-log
+// ke background console tanpa buka console page.
+function _igAvatarDebug() {
+  try {
+    function unesc(t) { return (t || '').replace(/\\"/g, '"'); }
+    function extractPic(text) {
+      if (!text || text.indexOf('profile_pic') === -1) return null;
+      var t = unesc(text);
+      var m = t.match(/"profile_pic_url_hd"\s*:\s*"([^"]+)"/)
+            || t.match(/"profile_pic_url"\s*:\s*"([^"]+)"/);
+      return m && m[1] ? m[1] : null;
+    }
+    function urlId(u) { try { var p = (u || '').split('?')[0]; var m = p.match(/\/([0-9_]+)_n\.jpg/); return m ? m[1] : p; } catch (e) { return u || ''; } }
+    var texts = [].slice.call(document.querySelectorAll('script')).map(function (s) { return s.textContent || ''; });
+    var all = [];
+    for (var k = 0; k < texts.length; k++) {
+      var pk = extractPic(texts[k]);
+      if (pk && all.indexOf(pk) === -1) all.push(pk);
+    }
+    var viewerId = null;
+    for (var v = 0; v < texts.length; v++) {
+      var vi = unesc(texts[v]).indexOf('"viewer"');
+      if (vi >= 0) { var vp = extractPic(unesc(texts[v]).slice(vi)); if (vp) { viewerId = urlId(vp); break; } }
+    }
+    return JSON.stringify({
+      pathUser: (location.pathname.split('/').filter(Boolean)[0] || ''),
+      viewerId: viewerId,
+      allIds: all.map(urlId)
+    });
+  } catch (e) { return JSON.stringify({ error: String(e) }); }
+}
+
+async function tryGetInstagramProfilePicFromTab(itemUrl) {
+  try {
+    const u = new URL(itemUrl);
+    if (!/(^|\.)instagram\.com$/i.test(u.hostname)) return null;
+    if (!lpApi.tabs || !lpApi.tabs.query || !lpApi.tabs.executeScript) return null;
+    const tabs = await lpApi.tabs.query({ url: "*://*.instagram.com/*" });
+    for (const tab of tabs || []) {
+      if (!tab || tab.id == null) continue;
+      // Padankan profil: tab mesti sama username dengan item
+      try {
+        const tu = new URL(tab.url || "");
+        const a = tu.pathname.split('/').filter(Boolean)[0] || '';
+        const b = u.pathname.split('/').filter(Boolean)[0] || '';
+        if (a && b && a.toLowerCase() !== b.toLowerCase()) continue;
+      } catch (e) { /* terus cuba */ }
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const res = await lpApi.tabs.executeScript(tab.id, { code: "(" + _igAvatarSnippet.toString() + ")()" });
+          const url = Array.isArray(res) ? res[0] : res;
+          if (url && /scontent\.cdninstagram\.com|fbcdn\.net/i.test(url)) {
+            lpLog("info", '[IGAVATAR] open-tab found:', url);
+            return url;
+          }
+        } catch (e) { /* tab belum sedia */ }
+        if (attempt < 2) await new Promise(r => setTimeout(r, 800));
+      }
+    }
+
+    // Fallback (sama macam redgifs): buka tab sementara di latar belakang,
+    // tunggu page render, extract gambar profil, kemudian tutup.
+    try {
+      const tmp = await lpApi.tabs.create({ url: itemUrl, active: false });
+      if (tmp && tmp.id != null) {
+        let found = null;
+        for (let i = 0; i < 8 && !found; i++) {
+          await new Promise(r => setTimeout(r, 1000));
+          try {
+            const res = await lpApi.tabs.executeScript(tmp.id, { code: "(" + _igAvatarSnippet.toString() + ")()" });
+            const u = Array.isArray(res) ? res[0] : res;
+            if (u && /scontent\.cdninstagram\.com|fbcdn\.net/i.test(u)) found = u;
+          } catch (e) { /* belum sedia */ }
+        }
+        try { await lpApi.tabs.remove(tmp.id); } catch (e) {}
+        try {
+          const dbg = await lpApi.tabs.executeScript(tmp.id, { code: "(" + _igAvatarDebug.toString() + ")()" });
+          lpLog("info", '[IGAVATAR-DEBUG]', Array.isArray(dbg) ? dbg[0] : dbg);
+        } catch (e) {}
+        if (found) { lpLog("info", '[IGAVATAR] temp-tab found:', found); return found; }
+      }
+    } catch (e) { /* buka tab gagal — abaikan */ }
+    lpLog("info", '[IGAVATAR] tiada jumpa (semua percubaan gagal) untuk', itemUrl);
+    return null;
+  } catch (e) { return null; }
+}
+
+async function tryGetRedgifsUserpicFromTab(itemUrl) {
+  try {
+    if (!lpApi.tabs || !lpApi.tabs.query) return null;
+    const username = getRedgifsUsername(itemUrl);
+    if (!username) return null;
+    const tabs = await lpApi.tabs.query({ url: "*://*.redgifs.com/*" });
+    for (const tab of tabs || []) {
+      if (!tab || !tab.id) continue;
+      // Padankan username tab dengan item (elak tab redgifs lain)
+      try {
+        const tu = new URL(tab.url || "");
+        const tp = tu.pathname.split("/").filter(Boolean);
+        const tabUser = (tp[0] && tp[0].toLowerCase() === "users" && tp[1])
+          ? tp[1].replace(/^@/, "")
+          : (tp[0] && !["watch", "ifr", "gifs", "gif"].includes(tp[0].toLowerCase()) ? tp[0].replace(/^@/, "") : null);
+        if (tabUser && tabUser.toLowerCase() !== username.toLowerCase()) continue;
+      } catch (e) { /* ignore, terus cuba */ }
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const res = await lpApi.tabs.executeScript(tab.id, { code: "(" + _rgUserpicSnippet.toString() + ")()" });
+          const url = Array.isArray(res) ? res[0] : res;
+          if (url && /userpic\.redgifs\.com/i.test(url)) return url;
+        } catch (e) { /* tab belum sedia — cuba lagi */ }
+        if (attempt < 2) await new Promise(r => setTimeout(r, 800));
+      }
+    }
+
+    // Fallback: buka tab sementara di latar belakang, tunggu SPA render, extract, tutup.
+    try {
+      const tmp = await lpApi.tabs.create({ url: itemUrl, active: false });
+      if (tmp && tmp.id != null) {
+        let found = null;
+        for (let i = 0; i < 8 && !found; i++) {
+          await new Promise(r => setTimeout(r, 1000));
+          try {
+            const res = await lpApi.tabs.executeScript(tmp.id, { code: "(" + _rgUserpicSnippet.toString() + ")()" });
+            const u = Array.isArray(res) ? res[0] : res;
+            if (u && /userpic\.redgifs\.com/i.test(u)) found = u;
+          } catch (e) { /* belum sedia */ }
+        }
+        try { await lpApi.tabs.remove(tmp.id); } catch (e) {}
+        if (found) return found;
+      }
+    } catch (e) { /* buka tab gagal — abaikan */ }
+  } catch (e) { /* ignore */ }
+  return null;
+}
+
+async function fetchAndSaveThumbnailDirect(itemId, url, force = false, prefetchedThumbnailUrl = null) {
+  lpLog("info", "[RGFIX] fetchAndSaveThumbnailDirect called", { itemId, url, force });
+  if (!itemId || !url) return false;
+
+  // Check if already has thumbnail first (fast)
+  let isInstagramUrl = false;
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, "");
+    isInstagramUrl = host === "instagram.com" || host.endsWith(".instagram.com");
+  } catch(e) {}
+
+  const cachedItem = cachedItems && cachedItems.find(i => i && i.id === itemId);
+  // Skip fetch if a thumbnail already exists — UNLESS this is an explicit refresh
+  // (force). A force-refresh (dari "Refresh thumbnail" dalam category picker) mesti
+  // sentiasa fetch semula walaupun thumbnailUrl sudah ada.
+  // For Instagram, kita sentiasa FORCE refresh walaupun thumbnail sedia ada!
+  if (cachedItem && cachedItem.thumbnailUrl && !isInstagramUrl && !force) return true;
+  
+  // Check YouTube first (fast)
+  const isYt = extractYouTubeVideoId(url);
+  if (isYt) return false;
+  
+  let thumbnailUrl = null;
+
+  // Jika thumbnail sudah di-fetch dari tab yang terbuka (redgifs / instagram), guna terus.
+  if (prefetchedThumbnailUrl && /userpic\.redgifs\.com|scontent\.cdninstagram\.com|fbcdn\.net/i.test(prefetchedThumbnailUrl)) {
+    thumbnailUrl = prefetchedThumbnailUrl;
+  }
+
+  // Instagram: cuba dapatkan gambar profil dari tab yang sedang dibuka DULU
+  // (elak fetch terus ke Instagram yang di-block oleh bot protection bila kerap refresh).
+  if (!thumbnailUrl && isInstagramUrl) {
+    try {
+      const tabPic = await tryGetInstagramProfilePicFromTab(url);
+      if (tabPic) thumbnailUrl = tabPic;
+    } catch (e) { /* tab tiada / belum sedia — jatuh ke HTML fetch */ }
+  }
+
+  // Redgifs: guna API pengguna untuk dapatkan gambar profil (userpic.redgifs.com).
+  // Halaman redgifs ialah SPA — HTML mentah tiada URL userpic, jadi guna API.
+  const redgifsUser = (!isInstagramUrl && !isYt) ? getRedgifsUsername(url) : null;
+  lpLog("info", "[RGFIX] redgifsUser:", redgifsUser, "url:", url);
+  if (!thumbnailUrl && redgifsUser) {
+    try {
+      const apiController = new AbortController();
+      const apiTimer = setTimeout(() => apiController.abort(), 6000);
+      const apiRes = await fetch(`https://api.redgifs.com/v2/users/${encodeURIComponent(redgifsUser)}`, {
+        method: "GET",
+        signal: apiController.signal,
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Accept": "application/json",
+        }
+      });
+      clearTimeout(apiTimer);
+      lpLog("info", "[RGFIX] api status:", apiRes.status, "ok:", apiRes.ok);
+      if (apiRes.ok) {
+        // Cari mana-mana URL userpic.redgifs.com dalam JSON respons (field mungkin
+        // profileImage / images.profileImage / thumbnail — scan keseluruhan teks).
+        const text = (await apiRes.text()).replace(/\\"/g, '"').replace(/\\\//g, "/");
+        const m = text.match(/(?:https?:\/\/)?[^\s"'<>]*userpic\.redgifs\.com[^\s"'<>]*/i);
+        lpLog("info", "[RGFIX] userpic found in api:", m ? m[0] : "NONE");
+        if (m && m[0]) {
+          thumbnailUrl = /^https?:/i.test(m[0]) ? m[0] : "https://" + m[0].replace(/^\/+/, "");
+        }
+      }
+    } catch (e) {
+      lpLog("info", "[RGFIX] api fetch error:", e && e.message);
+      /* redgifs API gagal — jatuh ke HTML extraction */
+    }
+  }
+
+  // First try: oEmbed lpApi (for Twitter, TikTok only - skip Instagram)
+  if (!isInstagramUrl) {
+    const oembedUrl = tryGetOembedUrl(url);
+    if (oembedUrl) {
+      try {
+        const oembedController = new AbortController();
+        const oembedTimer = setTimeout(() => oembedController.abort(), 4000);
+        const oembedRes = await fetch(oembedUrl, {
+          method: "GET",
+          signal: oembedController.signal,
+          headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" }
+        });
+        clearTimeout(oembedTimer);
+        if (oembedRes.ok) {
+          const oembedData = await oembedRes.json();
+          let thumb = oembedData && (oembedData.thumbnail_url || oembedData.thumbnailUrl);
+          if (thumb && typeof thumb === "string") {
+            thumbnailUrl = thumb;
+          }
+        }
+      } catch (e) { /* oembed failed */ }
+    }
+  }
+  
+  // Jika thumbnail sudah di-fetch (dari tab terbuka), terus guna — JANGAN
+  // fetch HTML Instagram yang di-block. Untuk lain, fetch HTML jika tiada lagi.
+  if (!thumbnailUrl) {
+    const isRedgifsPage = /redgifs\.com/i.test(url);
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
+      
+      const headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      };
+      // Jangan hantar Range untuk redgifs — data gambar profil mungkin di luar 512KB pertama.
+      if (!isRedgifsPage) headers["Range"] = "bytes=0-524287";
+      
+      const res = await fetch(url, {
+        method: "GET",
+        signal: controller.signal,
+        headers,
+      });
+      clearTimeout(timeoutId);
+      
+      if (res.ok || res.status === 206 || res.status === 416) {
+        let html = "";
+        const maxBytes = isRedgifsPage ? 4 * 1024 * 1024 : 524288;
+        try {
+          if (res.body && typeof res.body.getReader === 'function') {
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let bytesRead = 0;
+            while (bytesRead < maxBytes) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              html += decoder.decode(value, { stream: true });
+              bytesRead += value.length;
+            }
+            html += decoder.decode();
+            reader.cancel().catch(() => {});
+          } else {
+            const fullHtml = await res.text();
+            html = isRedgifsPage ? fullHtml : fullHtml.substring(0, 524288);
+          }
+        } catch (e) { /* body read failed */ }
+        
+        if (html && html.length >= 50) {
+          const domain = getDomainFromUrl(url);
+          const candidates = extractThumbnailCandidatesFromHtml(html, url);
+          if (domain && candidates && candidates.length) {
+            if (isInstagramUrl) {
+              // Untuk profil Instagram: utamakan gambar profil (avatar),
+              // bukan gambar post/kandungan (cth scontent.cdninstagram.com/v/t51..._n.jpg).
+              if (isInstagramProfileUrl(url)) {
+                const profileCands = candidates.filter(c =>
+                  /profile|og-image/i.test(c.label) ||
+                  /profile_pic|profilepic|avatar/i.test(c.url)
+                );
+                if (profileCands.length) {
+                  profileCands.sort((a, b) => b.score - a.score);
+                  thumbnailUrl = profileCands[0].url;
+                } else {
+                  // Tapis keluar gambar <img> generik (post) — guna calon lain
+                  const nonPost = candidates.filter(c => c.label !== "img");
+                  thumbnailUrl = (nonPost[0] || candidates[0]).url;
+                }
+              } else {
+                // For Instagram: SKIP old learned patterns and just take the highest-scoring candidate
+                thumbnailUrl = candidates[0].url;
+              }
+            } else {
+              thumbnailUrl = await pickThumbnailByDomainPatterns(candidates, domain);
+            }
+          }
+          if (!thumbnailUrl && candidates && candidates.length) {
+            thumbnailUrl = candidates[0].url;
+          }
+          
+          if (!thumbnailUrl && domain) {
+            const patterns = await getLearnedPatternsForDomain(domain);
+            if (patterns && patterns.length) {
+              const greedyRegex = /<img[^>]+(?:src|data-src|data-lazy-src)=["']([^"']+)["']/gi;
+              let gm;
+              while ((gm = greedyRegex.exec(html)) !== null) {
+                const src = gm[1];
+                if (!src || src.startsWith("data:")) continue;
+                const fullUrl = (() => { try { return new URL(src, url).toString(); } catch(e) { return null; } })();
+                if (!fullUrl) continue;
+                for (const p of patterns) {
+                  if (matchThumbnailUrlPattern(fullUrl, p.pattern)) {
+                    thumbnailUrl = fullUrl;
+                    break;
+                  }
+                }
+                if (thumbnailUrl) break;
+              }
+            }
+          }
+        }
+      }
+    } catch (err) { /* html fetch failed */ }
+  }
+
+  lpLog("info", "[RGFIX] result thumbnailUrl:", thumbnailUrl || "(none)", "for", url);
+  if (!thumbnailUrl) {
+    await markFetchFailed(itemId);
+    return false;
+  }
+  
+  // Apply upgrade untuk TikTok DAN Instagram (profile picture / full-res)
+  thumbnailUrl = upgradeSocialThumbnailUrl(thumbnailUrl, url);
+  
+  try {
+    const items = await getItems();
+    const previousItems = items.map(i => ({ ...i }));
+    const idx = items.findIndex(i => i && i.id === itemId);
+    if (idx >= 0) {
+      items[idx].thumbnailUrl = thumbnailUrl;
+      items[idx].thumbnailFetchFailed = false;
+      await setItems(items, { previousItems, skipDedupe: true });
+      if (lpApi.runtime && lpApi.runtime.sendMessage) {
+        lpApi.runtime.sendMessage({ type: "refresh-picker-ui" }).catch(() => {});
+      }
+      return true;
+    }
+  } catch (e) {
+    return false;
+  }
+  
+  return false;
+}
+
+async function markFetchFailed(itemId) {
+  await queueItemsMutation(async () => {
+    const items = await getItems();
+    const idx = items.findIndex(i => i && i.id === itemId);
+    if (idx >= 0 && !items[idx].thumbnailFetchFailed) {
+      items[idx].thumbnailFetchFailed = true;
+      // skipDedupe: true — hanya kemaskini flag, bukan tambah item baru
+      await setItems(items, { previousItems: items.slice(), skipDedupe: true });
+    }
+  }).catch(() => { });
+}
+
+async function upsertMinimalItemFromUrl(rawUrl, title, categoryId, options = {}) {
+  return queueItemsMutation(async () => {
+    if (!rawUrl) return null;
+    const safeOptions = options && typeof options === "object" ? options : {};
+    const normalized = normalizeUrl(rawUrl);
+    if (!normalized) return null;
+    const normalizedTitle = normalizeExtractedTitle(title);
+    const items = await getItems();
+    const previousItems = items.slice();
+    const existingIndex = getExistingIndexFromUrl(normalized, items);
+    const existing = existingIndex >= 0 ? items[existingIndex] : null;
+    const id = existing && existing.id ? existing.id : makeId(normalized);
+    const now = new Date().toISOString();
+    const hasExplicitCategory = typeof categoryId === "string";
+    const hasExplicitFavorite = Object.prototype.hasOwnProperty.call(
+      safeOptions,
+      "favorite",
+    );
+    const requestedFavorite = hasExplicitFavorite
+      ? safeOptions.favorite === true
+      : false;
+    const autoCategoryCandidate = buildAutoCategoryCandidate({
+      url: normalized,
+      title: normalizedTitle,
+    });
+    let autoCategoryReport = null;
+    let effectiveCategoryId = hasExplicitCategory
+      ? normalizeCategoryIdForSave(categoryId)
+      : categoryId
+        ? normalizeCategoryIdForSave(categoryId)
+        : existing && existing.categoryId
+          ? String(existing.categoryId)
+          : "";
+    if (!effectiveCategoryId && !existing && !hasExplicitCategory) {
+      const [settings, categories] = await Promise.all([
+        getSettings(),
+        getCachedCategories(),
+      ]);
+      autoCategoryReport = await resolveAutoCategoryMatchReportForCandidate(
+        autoCategoryCandidate,
+        {
+          settings,
+          categories,
+        },
+      );
+      effectiveCategoryId =
+        autoCategoryReport && autoCategoryReport.categoryId
+          ? autoCategoryReport.categoryId
+          : "";
+    }
+    const existingCategoryId =
+      existing && existing.categoryId ? existing.categoryId : "";
+    const existingManualOrder = getManualOrderValue(existing);
+    let manualOrder = existingManualOrder;
+    const targetBounds = getManualOrderBounds(items, effectiveCategoryId);
+    if (
+      !existing ||
+      normalizeCategoryIdForOrder(existingCategoryId) !==
+      normalizeCategoryIdForOrder(effectiveCategoryId) ||
+      (existingManualOrder === null && targetBounds.count > 0)
+    ) {
+      manualOrder = computeManualOrderForCategory(
+        items,
+        effectiveCategoryId,
+        "prepend",
+      );
+    }
+    const safeNormalizedTitle =
+      normalizedTitle &&
+        !looksLikeUrlText(normalizedTitle, normalized) &&
+        !isGenericFallbackTitleText(normalizedTitle)
+        ? normalizedTitle
+        : "";
+    const existingTitle =
+      existing && existing.title ? normalizeExtractedTitle(existing.title) : "";
+    const safeExistingTitle =
+      existingTitle &&
+        !looksLikeUrlText(existingTitle, normalized) &&
+        !isGenericFallbackTitleText(existingTitle)
+        ? existingTitle
+        : "";
+    const minimal = {
+      id,
+      url: normalized,
+      title:
+        safeNormalizedTitle ||
+        safeExistingTitle ||
+        buildFallbackItemTitle(normalized),
+      byline: existing ? existing.byline : "",
+      siteName:
+        existing && existing.siteName
+          ? existing.siteName
+          : siteNameFromUrl(normalized),
+      excerpt: existing ? existing.excerpt : "",
+      content: existing ? existing.content : "",
+      textContent: existing ? existing.textContent : "",
+      wordCount: existing ? existing.wordCount : 0,
+      readingTime: existing ? existing.readingTime : 0,
+      savedAt: now,
+      lang: existing ? existing.lang : "",
+      faviconUrl: existing ? existing.faviconUrl : "",
+      thumbnailUrl: safeOptions.thumbnailUrl
+        ? String(safeOptions.thumbnailUrl)
+        : existing && existing.thumbnailUrl
+          ? existing.thumbnailUrl
+          : "",
+      favorite: hasExplicitFavorite
+        ? requestedFavorite
+        : existing
+          ? !!existing.favorite
+          : false,
+      categoryId: effectiveCategoryId,
+    };
+    const minimalWithOrder = withManualOrder(minimal, manualOrder);
+
+    if (existingIndex >= 0) {
+      const merged = { ...existing, ...minimalWithOrder, savedAt: now };
+      items[existingIndex] = withManualOrder(merged, manualOrder);
+    } else {
+      items.unshift(minimalWithOrder);
+    }
+    await setItems(items, { previousItems });
+
+    // Kemaskini kategori terpilih kepada kategori yang baru disimpan ini
+    if (effectiveCategoryId) {
+      await lpStoreSet({ [SELECTED_CATEGORY_KEY]: effectiveCategoryId });
+    } else if (hasExplicitCategory || !existing) {
+      await lpStoreSet({ [SELECTED_CATEGORY_KEY]: "none" });
+    }
+
+    if (!minimalWithOrder.thumbnailUrl && !minimalWithOrder.thumbnailFetchFailed) {
+      hydrateThumbnailBackground(minimalWithOrder.id, minimalWithOrder.url);
+    }
+
+    if (!existing && !hasExplicitCategory) {
+      queueAiCategoryClassificationFromReport({
+        itemId: minimalWithOrder.id,
+        initialCategoryId: effectiveCategoryId,
+        candidate: autoCategoryCandidate,
+        report: autoCategoryReport,
+      });
+    }
+    return minimalWithOrder;
+  });
+}
+
+async function upsertMinimalItemFromUrlBatch(payloads) {
+  return queueItemsMutation(async () => {
+    if (!Array.isArray(payloads) || !payloads.length) return 0;
+
+    const items = await getItems();
+    const previousItems = items.slice();
+    const now = new Date().toISOString();
+
+    const [settings, categories] = await Promise.all([
+      getSettings(),
+      getCachedCategories(),
+    ]);
+
+    let addedCount = 0;
+
+    // Bina indeks carian sementara O(N) untuk lookups O(1) di dalam loop — elak O(N*M)
+    const existingIndexMap = new Map();
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item && item.url) {
+        const candidates = buildUrlCompareCandidates(item.url);
+        for (const candidate of candidates) {
+          existingIndexMap.set(candidate, i);
+        }
+      }
+    }
+
+    for (const payload of payloads) {
+      const rawUrl = payload.url;
+      const title = payload.title;
+      const categoryId = payload.categoryId;
+      const favorite = payload.favorite === true;
+
+      if (!rawUrl) continue;
+      const normalized = normalizeUrl(rawUrl);
+      if (!normalized) continue;
+      const normalizedTitle = normalizeExtractedTitle(title);
+
+      // Carian O(1) menggunakan indexMap (pantas)
+      let existingIndex = -1;
+      const searchCandidates = buildUrlCompareCandidates(normalized);
+      for (const candidate of searchCandidates) {
+        if (existingIndexMap.has(candidate)) {
+          existingIndex = existingIndexMap.get(candidate);
+          break;
+        }
+      }
+
+      const existing = existingIndex >= 0 ? items[existingIndex] : null;
+      const id = existing && existing.id ? existing.id : makeId(normalized);
+
+      const hasExplicitCategory = typeof categoryId === "string" && categoryId !== "";
+      let effectiveCategoryId = hasExplicitCategory
+        ? normalizeCategoryIdForSave(categoryId)
+        : existing && existing.categoryId
+          ? String(existing.categoryId)
+          : "";
+
+      let autoCategoryReport = null;
+      let autoCategoryCandidate = null;
+
+      if (!effectiveCategoryId && !existing && !hasExplicitCategory) {
+        autoCategoryCandidate = buildAutoCategoryCandidate({
+          url: normalized,
+          title: normalizedTitle,
+        });
+        autoCategoryReport = await resolveAutoCategoryMatchReportForCandidate(
+          autoCategoryCandidate,
+          { settings, categories }
+        );
+        effectiveCategoryId =
+          autoCategoryReport && autoCategoryReport.categoryId
+            ? autoCategoryReport.categoryId
+            : "";
+      }
+
+      const existingCategoryId = existing && existing.categoryId ? existing.categoryId : "";
+      let manualOrder = getManualOrderValue(existing);
+
+      if (
+        !existing ||
+        normalizeCategoryIdForOrder(existingCategoryId) !==
+        normalizeCategoryIdForOrder(effectiveCategoryId) ||
+        manualOrder === null
+      ) {
+        manualOrder = computeManualOrderForCategory(items, effectiveCategoryId, "prepend");
+      }
+
+      const safeNormalizedTitle = !isGenericFallbackTitleText(normalizedTitle) ? normalizedTitle : "";
+      const existingTitle = existing && existing.title ? String(existing.title) : "";
+      const safeExistingTitle = !isGenericFallbackTitleText(existingTitle) ? existingTitle : "";
+
+      const minimal = {
+        id,
+        url: normalized,
+        title: safeNormalizedTitle || safeExistingTitle || buildFallbackItemTitle(normalized),
+        byline: existing ? existing.byline : "",
+        siteName: existing && existing.siteName ? existing.siteName : siteNameFromUrl(normalized),
+        excerpt: existing ? existing.excerpt : "",
+        content: existing ? existing.content : "",
+        textContent: existing ? existing.textContent : "",
+        wordCount: existing ? existing.wordCount : 0,
+        readingTime: existing ? existing.readingTime : 0,
+        savedAt: now,
+        lang: existing ? existing.lang : "",
+        faviconUrl: existing ? existing.faviconUrl : "",
+        thumbnailUrl: payload.thumbnailUrl
+          ? String(payload.thumbnailUrl)
+          : existing && existing.thumbnailUrl
+            ? existing.thumbnailUrl
+            : "",
+        favorite: Object.prototype.hasOwnProperty.call(payload, "favorite")
+          ? favorite
+          : existing
+            ? !!existing.favorite
+            : false,
+        categoryId: effectiveCategoryId,
+      };
+
+      const minimalWithOrder = withManualOrder(minimal, manualOrder);
+
+      if (existingIndex >= 0) {
+        const merged = { ...existing, ...minimalWithOrder, savedAt: now };
+        items[existingIndex] = withManualOrder(merged, manualOrder);
+      } else {
+        items.unshift(minimalWithOrder);
+        addedCount++;
+      }
+
+      if (!existing && !hasExplicitCategory && autoCategoryCandidate) {
+        queueAiCategoryClassificationFromReport({
+          itemId: id,
+          initialCategoryId: effectiveCategoryId,
+          candidate: autoCategoryCandidate,
+          report: autoCategoryReport,
+        });
+      }
+    }
+
+    await setItems(items, { previousItems });
+
+    // Trigger background thumbnail hydration for all newly added items (batched)
+    items.slice(0, addedCount).forEach((item) => {
+      if (item && item.id && item.url && !item.thumbnailUrl && !item.thumbnailFetchFailed) {
+        hydrateThumbnailBackground(item.id, item.url);
+      }
+    });
+
+    return addedCount;
+  });
+}
+
+async function upsertMinimalItemFromTab(tab, categoryId, options = {}) {
+  if (!tab || !tab.url) return null;
+  // Gunakan tab.title terus — elak blocking network call (3.5-7.5s)
+  // Title yang lebih tepat akan dikemas kini oleh saveExtracted kemudian
+  const tabTitle = tab.title ? normalizeExtractedTitle(tab.title) : "";
+  return upsertMinimalItemFromUrl(tab.url, tabTitle, categoryId, options);
+}
+
+async function persistItemsToPrimaryStore(nextItems, previousItems) {
+  // Always use IndexedDB incremental sync if available. Skipping it for large arrays causes Double I/O and full IDB rewrites.
+  const useIndexedDb = true;
+  if (!useIndexedDb || !itemsIndexedDbStore) {
+    await lpStoreSet({ [ITEM_KEY]: nextItems });
+    return { indexedDbUpdated: 0, indexedDbDeleted: 0 };
+  }
+
+  let indexedDbResult = { updated: 0, deleted: 0 };
+  try {
+    if (
+      Array.isArray(previousItems) &&
+      typeof itemsIndexedDbStore.applyIncremental === "function"
+    ) {
+      indexedDbResult = await itemsIndexedDbStore.applyIncremental(
+        previousItems,
+        nextItems,
+      );
+    } else if (typeof itemsIndexedDbStore.replaceAll === "function") {
+      indexedDbResult = await itemsIndexedDbStore.replaceAll(nextItems);
+    }
+    // Sync to storage.local as non-blocking backup, sertakan flag __idb_synced
+    // CRITICAL FIX: Strip heavy payload (content/textContent) to prevent storage.local from ballooning to 30MB+ and freezing the main thread
+    const backupItems = useIndexedDb ? nextItems.map(item => {
+      const copy = { ...item };
+      delete copy.content;
+      delete copy.textContent;
+      return copy;
+    }) : nextItems;
+    lpStoreSet({ [ITEM_KEY]: backupItems, __idb_synced: Date.now() }).catch(() => { });
+  } catch (err) {
+    // If IndexedDB write fails, keep storage.local as fallback source of truth.
+    itemsIndexedDbAvailability = false;
+    // Ensure storage.local is updated as fallback
+    await lpStoreSet({ [ITEM_KEY]: nextItems }).catch(() => { });
+  }
+
+  return {
+    indexedDbUpdated:
+      indexedDbResult && Number.isFinite(indexedDbResult.updated)
+        ? indexedDbResult.updated
+        : 0,
+    indexedDbDeleted:
+      indexedDbResult && Number.isFinite(indexedDbResult.deleted)
+        ? indexedDbResult.deleted
+        : 0,
+  };
+}
+
+function buildYouTubeThumbnailUrl(rawUrl) {
+  const videoId = extractYouTubeVideoId(rawUrl);
+  if (!videoId) return "";
+  return `https://i.ytimg.com/vi/${encodeURIComponent(videoId)}/mqdefault.jpg`;
+}
+
+function applyYouTubeThumbnailCacheToItems(items) {
+  const source = coerceArray(items);
+  let changed = false;
+  const nextItems = source.map((item) => {
+    if (!item || typeof item !== "object") return item;
+    const nextThumbnailUrl = buildYouTubeThumbnailUrl(item.url);
+    const currentThumbnailUrl = item.youtubeThumbnailUrl
+      ? String(item.youtubeThumbnailUrl)
+      : "";
+    if (nextThumbnailUrl) {
+      if (currentThumbnailUrl === nextThumbnailUrl) return item;
+      changed = true;
+      return { ...item, youtubeThumbnailUrl: nextThumbnailUrl };
+    }
+    if (!Object.prototype.hasOwnProperty.call(item, "youtubeThumbnailUrl")) {
+      return item;
+    }
+    changed = true;
+    const nextItem = { ...item };
+    delete nextItem.youtubeThumbnailUrl;
+    return nextItem;
+  });
+  return {
+    items: changed ? nextItems : source,
+    changed,
+  };
+}
+
+async function setItems(items, options = {}, trashItemsToAdd = null) {
+  // skipDedupe: true — operasi yang hanya kemaskini data item sedia ada
+  // (thumbnail, title, progress, notes, highlights, delete)
+  // Elak O(N) dedupe scan dan O(N) YouTube thumbnail cache apply
+  const skipDedupe = options && options.skipDedupe === true;
+  const thumbnailCacheResult = skipDedupe
+    ? { items: Array.isArray(items) ? items : [], changed: false }
+    : applyYouTubeThumbnailCacheToItems(items);
+  const dedupeResult = skipDedupe
+    ? { items: thumbnailCacheResult.items, changed: false }
+    : dedupeItemsByUrl(thumbnailCacheResult.items);
+  const nextItems =
+    dedupeResult && Array.isArray(dedupeResult.items)
+      ? dedupeResult.items
+      : coerceArray(thumbnailCacheResult.items);
+  const safeOptions = options && typeof options === "object" ? options : {};
+  const previousItems = Array.isArray(safeOptions.previousItems)
+    ? safeOptions.previousItems
+    : null;
+  const storeWriteResult = await persistItemsToPrimaryStore(
+    nextItems,
+    previousItems,
+  );
+  const favoritesDelta = summarizeFavoritesDeltaForDebug(previousItems, nextItems);
+  if (favoritesDelta) {
+    addFavoritesDebugLog("set-items-favorites-delta", favoritesDelta);
+  }
+  cachedItems = nextItems;
+  hasCachedItems = true;
+  // Guna incremental update jika cache sudah wujud, bukan rebuild penuh O(N×5 regex)
+  if (previousItems && urlIndexCacheBuilt) {
+    updateUrlIndexCacheIncremental(previousItems, nextItems);
+  } else {
+    buildUrlIndexCache(nextItems);
+  }
+
+  // Update badge dengan count yang betul mengikut kategori terpilih
+  // Guna scheduleBadgeUpdate untuk elak baca storage terlalu kerap
+  scheduleBadgeUpdate();
+
+  let trashCount = 0;
+  if (trashItemsToAdd && Array.isArray(trashItemsToAdd) && trashItemsToAdd.length) {
+    try {
+      const currentTrash = await lpStoreGet(TRASH_KEY);
+      const existingTrash = Array.isArray(currentTrash[TRASH_KEY]) ? currentTrash[TRASH_KEY] : [];
+      const settings = currentSettings || {};
+      const limitRaw = typeof settings.trashLimit !== "undefined" ? Number(settings.trashLimit) : 0;
+      const trashLimit = Number.isFinite(limitRaw) ? Math.max(0, limitRaw) : 0;
+      const deletedAt = new Date().toISOString();
+      const trashEntries = trashItemsToAdd.map((item) => ({ ...item, deletedAt }));
+      const combined = [...existingTrash, ...trashEntries];
+      const nextTrash = trashLimit > 0 ? combined.slice(0, trashLimit) : combined;
+      await lpStoreSet({ [TRASH_KEY]: nextTrash });
+      trashCount = trashEntries.length;
+    } catch (err) {
+      trashCount = 0;
+    }
+  }
+
+  return {
+    count: nextItems.length,
+    deduped: !!(dedupeResult && dedupeResult.changed),
+    indexedDbUpdated: storeWriteResult.indexedDbUpdated,
+    indexedDbDeleted: storeWriteResult.indexedDbDeleted,
+    trashedCount: trashCount,
+  };
+}
+
+function queueItemsMutation(work) {
+  // Serialise mutations: tunggu queue sebelum start work()
+  // Elak race condition di mana dua saves concurrent baca snapshot yang sama
+  const task = itemsMutationQueue
+    .catch(() => {})
+    .then(() => work());
+  itemsMutationQueue = task.then(
+    () => {
+      if (itemsMutationQueueTimer) {
+        clearTimeout(itemsMutationQueueTimer);
+      }
+      itemsMutationQueueTimer = setTimeout(() => {
+        itemsMutationQueue = Promise.resolve();
+        itemsMutationQueueTimer = null;
+      }, 5000);
+      return undefined;
+    },
+    () => {
+      if (itemsMutationQueueTimer) {
+        clearTimeout(itemsMutationQueueTimer);
+      }
+      itemsMutationQueueTimer = setTimeout(() => {
+        itemsMutationQueue = Promise.resolve();
+        itemsMutationQueueTimer = null;
+      }, 5000);
+      return undefined;
+    },
+  );
+  return task;
+}
+
+async function appendItemsToTrash(itemsToTrash) {
+  const source = coerceArray(itemsToTrash).filter(
+    (item) => item && typeof item === "object",
+  );
+  if (!source.length) return { count: 0, trashCount: null };
+
+  const data = await lpStoreGet([TRASH_KEY, SETTINGS_KEY]);
+  const trash = coerceArray(data[TRASH_KEY]);
+  const settings = mergeSettings(data[SETTINGS_KEY]);
+  const limitRaw =
+    typeof settings.trashLimit !== "undefined"
+      ? Number(settings.trashLimit)
+      : Number(currentSettings.trashLimit);
+  const trashLimit = Number.isFinite(limitRaw) ? Math.max(0, limitRaw) : 0;
+  const deletedAt = new Date().toISOString();
+  const trashEntries = source.map((item) => ({ ...item, deletedAt }));
+  const combined = [...trashEntries, ...trash];
+  const nextTrash = trashLimit > 0 ? combined.slice(0, trashLimit) : combined;
+
+  await lpStoreSet({ [TRASH_KEY]: nextTrash });
+  return { count: trashEntries.length, trashCount: nextTrash.length };
+}
+
+async function getFreshItemsFromStore() {
+  const items = await loadItemsFromPrimaryStore();
+  cachedItems = items;
+  hasCachedItems = true;
+  buildUrlIndexCache(items);
+  return items;
+}
+
+function findStoredItemIndexByIdentity(items, itemId, rawUrl) {
+  const safeItems = coerceArray(items);
+  const normalizedItemId = itemId ? String(itemId) : "";
+  const normalizedUrl = rawUrl ? normalizeUrl(rawUrl) : "";
+  if (normalizedItemId) {
+    const byIdIndex = safeItems.findIndex(
+      (item) => item && item.id && String(item.id) === normalizedItemId,
+    );
+    if (byIdIndex >= 0) return byIdIndex;
+  }
+  if (!normalizedUrl) return -1;
+  return safeItems.findIndex((item) =>
+    urlsMatchForSave(normalizedUrl, item && item.url ? item.url : ""),
+  );
+}
+
+async function updateStoredItemByIdentity(itemId, rawUrl, mutate) {
+  if (typeof mutate !== "function") {
+    return { ok: false, reason: "invalid-mutate" };
+  }
+  return queueItemsMutation(async () => {
+    const items = await getFreshItemsFromStore();
+    const index = findStoredItemIndexByIdentity(items, itemId, rawUrl);
+    if (index < 0) {
+      return { ok: false, reason: "not-found" };
+    }
+    const currentItem = items[index];
+    if (!currentItem || typeof currentItem !== "object") {
+      return { ok: false, reason: "invalid-item" };
+    }
+    const nextItem = mutate(currentItem);
+    if (!nextItem || typeof nextItem !== "object") {
+      return { ok: false, reason: "invalid-next-item" };
+    }
+    if (nextItem === currentItem) {
+      return { ok: true, changed: false, item: currentItem };
+    }
+    const nextItems = items.slice();
+    nextItems[index] = nextItem;
+    // skipDedupe: true — updateStoredItemByIdentity hanya kemaskini item sedia ada,
+    // bukan tambah item baru yang mungkin duplikat
+    await setItems(nextItems, { previousItems: items, skipDedupe: true });
+    return { ok: true, changed: true, item: nextItem };
+  });
+}
+
+async function mutateStoredItems(action, payload) {
+  const normalizedAction = action ? String(action) : "";
+  const safePayload = payload && typeof payload === "object" ? payload : {};
+  const items = await getFreshItemsFromStore();
+  const mutationResult =
+    itemsMutationCore &&
+      typeof itemsMutationCore.applyItemMutation === "function"
+      ? itemsMutationCore.applyItemMutation(
+        items,
+        normalizedAction,
+        safePayload,
+      )
+      : { ok: false, reason: "mutation-core-unavailable" };
+
+  if (!mutationResult || mutationResult.ok !== true) {
+    return mutationResult && mutationResult.reason
+      ? { ok: false, reason: mutationResult.reason }
+      : { ok: false, reason: "unknown-action" };
+  }
+
+  if (!mutationResult.changed) {
+    return { ok: true, changed: false, count: items.length };
+  }
+
+  const nextItems = coerceArray(mutationResult.items);
+  
+  // Tanda item sebagai imported untuk skip background thumbnail/title fetch
+  if (normalizedAction === "replace-all" && safePayload.isImported === true) {
+    for (let i = 0; i < nextItems.length; i++) {
+      nextItems[i] = { ...nextItems[i], _imported: true };
+    }
+  }
+  
+  const removedItems = coerceArray(mutationResult.removedItems);
+  let moveRemovedItemsToTrash = false;
+  if (normalizedAction === "delete-by-id") {
+    moveRemovedItemsToTrash = safePayload.moveToTrash !== false;
+  } else if (
+    normalizedAction === "clear-all" ||
+    normalizedAction === "delete-uncategorized"
+  ) {
+    moveRemovedItemsToTrash = safePayload.moveToTrash === true;
+  }
+
+  const setResult = await setItems(nextItems, {
+    previousItems: items,
+    // skipDedupe untuk semua operasi kecuali replace-all (import)
+    // Semua operasi lain (delete, update fields, set-reading-progress, dll.)
+    // tidak tambah item baru jadi tidak perlu dedupe scan O(N×candidates)
+    skipDedupe: normalizedAction !== "replace-all",
+  }, moveRemovedItemsToTrash ? removedItems : null);
+
+  if (!mutationResult.changed) {
+    return { ok: true, changed: false, count: setResult.count };
+  }
+
+  return {
+    ok: true,
+    changed: true,
+    count: setResult.count,
+    deduped: setResult.deduped,
+    removedCount: removedItems.length,
+    trashedCount: setResult.trashedCount || 0,
+  };
+}
+
+async function dedupeStoredItemsIfNeeded() {
+  const current = await getFreshItemsFromStore();
+  const dedupeResult = dedupeItemsByUrl(current);
+  const nextItems =
+    dedupeResult && Array.isArray(dedupeResult.items)
+      ? dedupeResult.items
+      : current;
+  if (dedupeResult && dedupeResult.changed) {
+    await setItems(nextItems, { previousItems: current });
+  }
+  cachedItems = nextItems;
+  hasCachedItems = true;
+  buildUrlIndexCache(nextItems);
+  return {
+    count: nextItems.length,
+    deduped: !!(dedupeResult && dedupeResult.changed),
+  };
+}
+
+function updateBadge(count) {
+  if (!currentSettings.showBadge) {
+    lpApi.browserAction.setBadgeText({ text: "" });
+    return;
+  }
+  // Format compact ikut saiz:
+  // < 1000   → angka penuh:  "842"
+  // 1000–9999 → "1.2k"
+  // 10k–999k  → "12k"
+  // 1M+       → "1.2M"
+  let text = "";
+  if (count) {
+    if (count < 1000) {
+      text = String(count);
+    } else if (count < 10000) {
+      text = (count / 1000).toFixed(1) + "k";
+    } else if (count < 1000000) {
+      text = Math.floor(count / 1000) + "k";
+    } else {
+      text = (count / 1000000).toFixed(1) + "M";
+    }
+  }
+  lpApi.browserAction.setBadgeText({ text });
+  // Warna badge ikut mode hidden semasa
+  const hiddenMode = currentSettings ? (currentSettings.showHiddenCategories || 0) : 0;
+  let normalizedMode = hiddenMode;
+  if (normalizedMode === true) normalizedMode = 1;
+  if (!normalizedMode || normalizedMode === false) normalizedMode = 0;
+  if (normalizedMode === 2) {
+    lpApi.browserAction.setBadgeBackgroundColor({ color: "#ca8a04" }); // kuning — tersembunyi sahaja
+  } else if (normalizedMode === 1) {
+    lpApi.browserAction.setBadgeBackgroundColor({ color: "#0284c7" }); // biru — tunjuk semua
+  } else {
+    lpApi.browserAction.setBadgeBackgroundColor({ color: "#1f6f5c" }); // hijau — normal
+  }
+}
+
+/**
+ * Tukar warna icon browserAction mengikut mode hidden:
+ * State 0 (normal)       — icon asal (merah)
+ * State 1 (tunjuk semua) — icon tinted biru
+ * State 2 (hidden sahaja)— icon tinted kuning
+ */
+function updateBadgeColorForHiddenMode(hiddenMode) {
+  if (!lpApi.browserAction) return;
+  let mode = hiddenMode;
+  if (mode === true) mode = 1;
+  if (!mode || mode === false) mode = 0;
+
+  // Tint warna mengikut state
+  const tintColors = {
+    0: null,                    // null = guna icon asal (merah)
+    1: [2, 132, 199],           // biru #0284c7
+    2: [202, 138, 4],           // kuning #ca8a04
+  };
+
+  const tint = tintColors[mode] !== undefined ? tintColors[mode] : null;
+
+  // Kemas kini badge background color supaya konsisten
+  if (lpApi.browserAction.setBadgeBackgroundColor) {
+    if (mode === 2) {
+      lpApi.browserAction.setBadgeBackgroundColor({ color: "#ca8a04" });
+    } else if (mode === 1) {
+      lpApi.browserAction.setBadgeBackgroundColor({ color: "#0284c7" });
+    } else {
+      lpApi.browserAction.setBadgeBackgroundColor({ color: "#1f6f5c" });
+    }
+  }
+
+  // Tint icon menggunakan canvas (guna 16px dan 32px)
+  if (!lpApi.browserAction.setIcon) return;
+
+  const sizes = [16, 32];
+  const iconPaths = {
+    16: "icons/icon-default-16.png",
+    32: "icons/icon-default-32.png",
+  };
+
+  if (!tint) {
+    // Balik ke icon asal
+    const iconPath = {};
+    sizes.forEach(s => { iconPath[s] = iconPaths[s]; });
+    try {
+      lpApi.browserAction.setIcon({ path: iconPath });
+    } catch (_) {}
+    return;
+  }
+
+  // Dalam MV2 background page, document tersedia. OffscreenCanvas lebih baik jika ada.
+  const makeCanvas = (size) => {
+    if (typeof OffscreenCanvas !== "undefined") {
+      return new OffscreenCanvas(size, size);
+    }
+    if (typeof document !== "undefined") {
+      const c = document.createElement("canvas");
+      c.width = c.height = size;
+      return c;
+    }
+    return null;
+  };
+
+  const tintIcon = (size) => {
+    return new Promise((resolve) => {
+      const canvas = makeCanvas(size);
+      if (!canvas) { resolve(null); return; }
+      const ctx = canvas.getContext("2d");
+      if (!ctx) { resolve(null); return; }
+
+      const iconUrl = lpApi.runtime && lpApi.runtime.getURL
+        ? lpApi.runtime.getURL(iconPaths[size])
+        : iconPaths[size];
+
+      // Guna fetch + createImageBitmap — berfungsi dalam background script tanpa document/Image
+      fetch(iconUrl)
+        .then(r => r.blob())
+        .then(blob => createImageBitmap(blob))
+        .then(bitmap => {
+          ctx.drawImage(bitmap, 0, 0, size, size);
+          bitmap.close();
+          const imageData = ctx.getImageData(0, 0, size, size);
+          const data = imageData.data;
+          const [tr, tg, tb] = tint;
+
+          // Tint: blend warna pixel dengan warna target berdasarkan luminosity
+          for (let i = 0; i < data.length; i += 4) {
+            const a = data[i + 3];
+            if (a === 0) continue;
+            const lum = (data[i] * 0.299 + data[i+1] * 0.587 + data[i+2] * 0.114) / 255;
+            data[i]   = Math.min(255, Math.round(tr * lum + data[i]   * 0.3));
+            data[i+1] = Math.min(255, Math.round(tg * lum + data[i+1] * 0.3));
+            data[i+2] = Math.min(255, Math.round(tb * lum + data[i+2] * 0.3));
+          }
+          ctx.putImageData(imageData, 0, 0);
+          resolve({ size, imageData });
+        })
+        .catch(() => resolve(null));
+    });
+  };
+
+  Promise.all(sizes.map(tintIcon)).then((results) => {
+    const imageData = {};
+    let hasData = false;
+    results.forEach((r) => {
+      if (r && r.imageData) {
+        imageData[r.size] = r.imageData;
+        hasData = true;
+      }
+    });
+    if (hasData) {
+      try {
+        lpApi.browserAction.setIcon({ imageData });
+      } catch (_) {}
+    }
+  }).catch(() => {});
+}
+
+function flashSavedBadge() {
+  if (!currentSettings.showBadge) return;
+  lpApi.browserAction.setBadgeText({ text: "OK" });
+  lpApi.browserAction.setBadgeBackgroundColor({ color: "#0d8f68" });
+  setTimeout(() => updateBadgeFromStorage(), 900);
+}
+
+let badgeUpdateTimer = null;
+const BADGE_UPDATE_DEBOUNCE_MS = 300;
+
+async function updateBadgeFromStorage() {
+  const keysToFetch = [SELECTED_CATEGORY_KEY];
+  if (!hasCachedItems) keysToFetch.push(ITEM_KEY);
+  if (cachedCategories === null) keysToFetch.push(CATEGORY_KEY);
+
+  const data = await lpApi.storage.local.get(keysToFetch);
+  const items = hasCachedItems ? cachedItems : coerceArray(data[ITEM_KEY]);
+  const categories = cachedCategories !== null ? cachedCategories : sortCategories(coerceArray(data[CATEGORY_KEY]));
+
+  const counts = buildCategoryCounts(items, categories, {
+    showHiddenCategories: currentSettings.showHiddenCategories,
+  });
+
+  if (!hasCachedItems) {
+    cachedItems = items;
+    hasCachedItems = true;
+    buildUrlIndexCache(items);
+  }
+  if (cachedCategories === null) {
+    cachedCategories = categories;
+  }
+  const categoryId = data[SELECTED_CATEGORY_KEY]
+    ? data[SELECTED_CATEGORY_KEY]
+    : "";
+  let count = counts.all;
+  if (categoryId) {
+    count = getCategoryCount(categoryId, counts);
+  }
+  updateBadge(count);
+}
+
+// Versi debounced untuk elak badge update terlalu kerap semasa operasi berturutan
+function scheduleBadgeUpdate() {
+  if (badgeUpdateTimer) clearTimeout(badgeUpdateTimer);
+  badgeUpdateTimer = setTimeout(() => {
+    badgeUpdateTimer = null;
+    updateBadgeFromStorage().catch(() => {});
+  }, BADGE_UPDATE_DEBOUNCE_MS);
+}
+
+function isUrlSaved(url, items) {
+  return isUrlSavedWithIndex(url, items);
+}
+
+async function removeItemByUrl(url) {
+  return queueItemsMutation(async () => {
+    const items = await getItems();
+    const matchIndex = getExistingIndexFromUrl(url, items);
+    if (matchIndex < 0) return items;
+    const target = items[matchIndex];
+
+    // Simpan cursor navigasi sebelum item dipadam supaya next link berfungsi dengan betul
+    try {
+      const cursorSettings = await getSettings();
+      const cursorSelectedCategory = await getSelectedCategoryId();
+      const cursorFavOnly = typeof shouldUseFavoritesOnlyNavigation === "function"
+        ? shouldUseFavoritesOnlyNavigation(cursorSettings, cursorSelectedCategory)
+        : false;
+      const cursorItems = cursorFavOnly
+        ? (Array.isArray(items) ? items.filter(item => item && item.favorite === true) : [])
+        : (typeof getItemsForSelectedCategory === "function"
+          ? getItemsForSelectedCategory(items, cursorSelectedCategory)
+          : items.slice());
+      const cursorSortOpts = typeof buildNavigationSortOptions === "function"
+        ? buildNavigationSortOptions(cursorSettings, cursorFavOnly)
+        : {};
+      const cursorOrdered = typeof sortItemsBySavedAt === "function"
+        ? sortItemsBySavedAt(cursorItems, cursorSortOpts)
+        : cursorItems;
+      const cursorIdx = cursorOrdered.findIndex(item => item && item.id === target.id);
+      if (cursorIdx >= 0) {
+        const cursorKey = cursorSelectedCategory || "all";
+        pendingNextLinkCursor.set(cursorKey, cursorIdx);
+      }
+    } catch (err) {
+      // ignore cursor update errors
+    }
+
+    await appendItemsToTrash([target]);
+
+    const filtered = items.filter((_, i) => i !== matchIndex);
+    await setItems(filtered, { previousItems: items, skipDedupe: true });
+
+    // Jika kategori yang dipadam tadi menjadi kosong, set semula selectedCategory
+    // (Kecuali jika user mahu kekal di kategori terakhir dibuka)
+    try {
+      const settings = await getSettings();
+      const pickerStartMode = (settings.pickerStartMode || "home").toLowerCase();
+      const isLastMode = pickerStartMode === "last" || pickerStartMode === "last-category" || pickerStartMode === "last_category" || pickerStartMode === "last-page" || pickerStartMode === "last-link";
+
+      if (!isLastMode) {
+        const selected = await getSelectedCategoryId();
+        const targetCategoryId = target && target.categoryId ? String(target.categoryId) : "none";
+        if (selected === targetCategoryId) {
+          const remainingInCategory = filtered.filter(item => {
+            const catId = item && item.categoryId ? String(item.categoryId) : "none";
+            return catId === targetCategoryId;
+          }).length;
+          if (remainingInCategory === 0) {
+            await lpStoreSet({ [SELECTED_CATEGORY_KEY]: "all" });
+          }
+        }
+      }
+    } catch (err) {
+      // ignore
+    }
+
+    return filtered;
+  });
+}
+
+async function saveExtracted(payload, senderTitle, options = {}) {
+  return queueItemsMutation(async () => {
+    const rawUrl = payload && payload.url ? payload.url : "";
+    const normalized = normalizeUrl(rawUrl);
+    if (!normalized) {
+      return { ok: false, reason: "missing-url" };
+    }
+
+    // Guna getItems() — ia guna cachedItems terus jika cache warm (O(1)),
+    // tiada I/O selagi cachedItems tidak stale
+    const items = await getItems();
+    const previousItems = items.slice();
+    const existingIndex = getExistingIndexFromUrl(normalized, items);
+    const existing = existingIndex >= 0 ? items[existingIndex] : null;
+    const id = existing && existing.id ? existing.id : makeId(normalized);
+    const now = new Date().toISOString();
+    const hasForcedCategory = Object.prototype.hasOwnProperty.call(
+      options || {},
+      "forcedCategoryId",
+    );
+    const forcedCategoryId = hasForcedCategory
+      ? String(options.forcedCategoryId || "")
+      : "";
+    const senderPreferredTitle = normalizeExtractedTitle(senderTitle);
+    const payloadPreferredTitle =
+      payload && payload.title ? normalizeExtractedTitle(payload.title) : "";
+    const preferredTitle = chooseMergedTitle(
+      senderPreferredTitle,
+      payloadPreferredTitle,
+      normalized,
+    );
+    const autoCategoryCandidate = buildAutoCategoryCandidate({
+      url: normalized,
+      title: preferredTitle,
+      siteName: payload && payload.siteName ? payload.siteName : "",
+    });
+    let autoCategoryReport = null;
+    let selectedCategoryFallback = "";
+    let selectedCategoryId = "";
+    if (hasForcedCategory) {
+      selectedCategoryId = normalizeCategoryIdForSave(forcedCategoryId);
+    } else if (existing && existing.categoryId) {
+      selectedCategoryId = String(existing.categoryId);
+    } else {
+      // Guna currentSettings (sudah dalam memori) untuk elak storage read
+      // Hanya baca CATEGORY_KEY dan selectedCategory dari storage
+      const cachedSettings = currentSettings && typeof currentSettings === "object"
+        ? currentSettings
+        : null;
+      const [settingsResult, categoryData, fallbackCategoryId] =
+        await Promise.all([
+          cachedSettings ? Promise.resolve(cachedSettings) : getSettings(),
+          cachedCategories !== null
+            ? Promise.resolve({ [CATEGORY_KEY]: cachedCategories })
+            : lpStoreGet(CATEGORY_KEY),
+          getSelectedCategoryId(),
+        ]);
+      const settings = cachedSettings || settingsResult;
+      autoCategoryReport = await resolveAutoCategoryMatchReportForCandidate(
+        autoCategoryCandidate,
+        {
+          settings,
+          categories: coerceArray(categoryData[CATEGORY_KEY]),
+        },
+      );
+      selectedCategoryFallback = normalizeCategoryIdForSave(fallbackCategoryId);
+      selectedCategoryId =
+        (autoCategoryReport && autoCategoryReport.categoryId
+          ? autoCategoryReport.categoryId
+          : "") || selectedCategoryFallback;
+    }
+    const existingCategoryId =
+      existing && existing.categoryId ? existing.categoryId : "";
+    const existingManualOrder = getManualOrderValue(existing);
+    let manualOrder = existingManualOrder;
+    const targetBounds = getManualOrderBounds(items, selectedCategoryId);
+    if (
+      !existing ||
+      normalizeCategoryIdForOrder(existingCategoryId) !==
+      normalizeCategoryIdForOrder(selectedCategoryId) ||
+      (existingManualOrder === null && targetBounds.count > 0)
+    ) {
+      manualOrder = computeManualOrderForCategory(
+        items,
+        selectedCategoryId,
+        "prepend",
+      );
+    }
+    const existingTitle =
+      existing && existing.title ? normalizeExtractedTitle(existing.title) : "";
+    const safeExistingTitle =
+      existingTitle &&
+        !looksLikeUrlText(existingTitle, normalized) &&
+        !isGenericFallbackTitleText(existingTitle)
+        ? existingTitle
+        : "";
+    const normalizedPreferredTitle = normalizeExtractedTitle(preferredTitle);
+    const safePreferredTitle =
+      normalizedPreferredTitle &&
+        !looksLikeUrlText(normalizedPreferredTitle, normalized) &&
+        !isGenericFallbackTitleText(normalizedPreferredTitle)
+        ? normalizedPreferredTitle
+        : "";
+
+    // Gunakan title sedia ada dahulu — TANPA blocking network call
+    const immediateTitle =
+      safePreferredTitle ||
+      safeExistingTitle ||
+      buildFallbackItemTitle(normalized);
+
+    const item = {
+      id,
+      url: normalized,
+      title: immediateTitle,
+      byline: payload && payload.byline ? payload.byline : "",
+      siteName: payload && payload.siteName ? payload.siteName : "",
+      excerpt: payload && payload.excerpt ? payload.excerpt : "",
+      content: payload && payload.content ? payload.content : "",
+      textContent: payload && payload.textContent ? payload.textContent : "",
+      wordCount: payload && payload.wordCount ? payload.wordCount : 0,
+      readingTime: payload && payload.readingTime ? payload.readingTime : 0,
+      savedAt: now,
+      lang: payload && payload.lang ? payload.lang : "",
+      faviconUrl:
+        payload && payload.faviconUrl
+          ? payload.faviconUrl
+          : existing && existing.faviconUrl
+            ? existing.faviconUrl
+            : "",
+      thumbnailUrl: (() => {
+        let thumb = "";
+        const isSpecialUrl = /(instagram\.com|tiktok\.com)/i.test(normalized);
+        const isInstagram = /instagram\.com/i.test(normalized);
+        const isTikTok = /tiktok\.com/i.test(normalized);
+        if (isSpecialUrl && payload && payload.thumbnailUrl) {
+          thumb = payload.thumbnailUrl;
+        } else {
+          thumb = payload && payload.thumbnailUrl
+            ? payload.thumbnailUrl
+            : existing && existing.thumbnailUrl
+              ? existing.thumbnailUrl
+              : "";
+        }
+        // Upgrade TikTok DAN Instagram (profile picture / full-res)
+        if (isSpecialUrl) {
+          thumb = upgradeSocialThumbnailUrl(thumb, normalized);
+        }
+        return thumb;
+      })(),
+      thumbnailFetchFailed: payload && payload.thumbnailUrl
+        ? false
+        : existing && existing.thumbnailFetchFailed
+          ? existing.thumbnailFetchFailed
+          : false,
+      favorite: existing ? !!existing.favorite : false,
+      categoryId: selectedCategoryId ? selectedCategoryId : "",
+    };
+
+    // Set YouTube thumbnail SEBELUM simpan — elak Double I/O
+    if (!item.thumbnailUrl) {
+      const ytVideoId = extractYouTubeVideoId(normalized);
+      if (ytVideoId) {
+        const ytThumb = buildYouTubeThumbnailUrl(normalized);
+        if (ytThumb) {
+          item.thumbnailUrl = ytThumb;
+          item.thumbnailFetchFailed = false;
+        }
+      }
+    }
+
+    const itemWithOrder = withManualOrder(item, manualOrder);
+
+    if (existingIndex >= 0) {
+      const merged = { ...existing, ...itemWithOrder, savedAt: now };
+      items[existingIndex] = withManualOrder(merged, manualOrder);
+    } else {
+      items.unshift(itemWithOrder);
+    }
+
+    await setItems(items, { previousItems });
+
+    const savedItem = itemWithOrder;
+    const savedUrl = savedItem.url || "";
+
+    // Jika masih tiada thumbnail, cetuskan pengambilan latar belakang (non-blocking)
+    // SKIP untuk imported items - elak 1333 background requests selepas import
+    const isImportedItem = savedItem._imported === true;
+    if (!savedItem.thumbnailUrl && !savedItem.thumbnailFetchFailed && !isImportedItem) {
+      setTimeout(() => {
+        hydrateThumbnailBackground(savedItem.id, savedUrl).catch(() => {});
+      }, THUMBNAIL_FETCH_DELAY_MS);
+    }
+
+    if (
+      !hasForcedCategory
+      && (!selectedCategoryFallback || (autoCategoryReport && autoCategoryReport.categoryId))
+    ) {
+      queueAiCategoryClassificationFromReport({
+        itemId: itemWithOrder.id,
+        initialCategoryId: itemWithOrder.categoryId || "",
+        candidate: autoCategoryCandidate,
+        report: autoCategoryReport,
+      });
+    }
+    flashSavedBadge();
+
+    // Background title refresh — hanya jika title semasa adalah fallback generik
+    // SKIP untuk imported items - elak 1333 background title fetch selepas import
+    if (
+      !safePreferredTitle &&
+      !safeExistingTitle &&
+      !isImportedItem
+    ) {
+      setTimeout(() => {
+        refreshStoredItemTitle(normalized, { itemId: id, forceRemote: true }).catch(() => {});
+      }, 200);
+    }
+
+    return { ok: true, id };
+  });
+}
+
+async function saveFromTab(tab, options = {}) {
+  if (!tab || !tab.id) {
+    return { ok: false, reason: "invalid-tab" };
+  }
+
+  const filePermission = await ensureFilePermissionForTab(
+    tab,
+    "simpan halaman fail lokal",
+  );
+  if (!filePermission.ok) {
+    return {
+      ok: false,
+      reason: filePermission.reason || "file-permission-denied",
+    };
+  }
+  const hasForcedCategory = Object.prototype.hasOwnProperty.call(
+    options || {},
+    "forcedCategoryId",
+  );
+  if (hasForcedCategory) {
+    setPendingContextMenuCategory(tab.id, options.forcedCategoryId);
+  }
+  const capturedUrl = tab && tab.url ? tab.url : "";
+  try {
+    // CUBA hantar mesej dahulu jika skrip sudah ada
+    if (contentScriptInjectedTabs.has(tab.id)) {
+      try {
+        const response = await lpApi.tabs.sendMessage(tab.id, { type: "request-extraction", capturedUrl });
+        if (response && response.ok) return { ok: true };
+      } catch (e) {
+        contentScriptInjectedTabs.delete(tab.id);
+      }
+    }
+
+    await lpApi.tabs.executeScript(tab.id, { file: "contentScript.js" });
+    contentScriptInjectedTabs.add(tab.id);
+    // Trigger extraction explicitly instead of relying on the content script's
+    // idle auto-extract (which delayed the first save by up to 2s). Extraction
+    // now only runs when a save is actually requested (#1).
+    try {
+      await lpApi.tabs.sendMessage(tab.id, { type: "request-extraction", capturedUrl });
+    } catch (extractErr) {
+      // Listener may not be ready immediately after injection; retry shortly.
+      try {
+        await new Promise((res) => setTimeout(res, 300));
+        await lpApi.tabs.sendMessage(tab.id, { type: "request-extraction", capturedUrl });
+      } catch (_) {
+        // Save will be retried on the next save request for this tab.
+      }
+    }
+    return { ok: true };
+  } catch (err) {
+    if (hasForcedCategory) {
+      clearPendingContextMenuCategory(tab.id);
+    }
+    lpErr("Inject failed", err);
+    return { ok: false, reason: "inject-failed", error: getErrorMessage(err) };
+  }
+}
+
+async function saveCurrentTabEntry(tab, options = {}) {
+  if (!tab || !tab.id) return { ok: false, reason: "invalid-tab" };
+  const safeOptions = options && typeof options === "object" ? options : {};
+  const requestedFavorite = safeOptions.favorite === true;
+  setPageActionStateFast(tab, true).catch(() => { });
+  let selectedCategoryId = normalizeCategoryIdForSave(await getSelectedCategoryId());
+
+  // Jika dalam mod hidden (showHiddenCategories >= 1), pastikan simpanan ke realm hidden
+  if (currentSettings.showHiddenCategories >= 1) {
+    // Jika "all" atau tiada category, simpan ke hidden_none (Uncategorized hidden)
+    if (!selectedCategoryId || selectedCategoryId === "all" || selectedCategoryId === "hidden_all" || selectedCategoryId === "all_hidden") {
+      selectedCategoryId = "hidden_none";
+    } else {
+      // Pastikan category yang dipilih adalah hidden category
+      const cats = await getCachedCategories();
+      const isHidden = cats.some(c => c && c.id === selectedCategoryId && c.hidden);
+      if (!isHidden && selectedCategoryId !== "hidden_none") {
+        selectedCategoryId = "hidden_none";
+      }
+    }
+  }
+
+  const quickItem = await upsertMinimalItemFromTab(
+    tab,
+    selectedCategoryId,
+    requestedFavorite ? { favorite: true } : {},
+  );
+  const saveOptions = selectedCategoryId
+    ? { forcedCategoryId: selectedCategoryId }
+    : {};
+  const saveResult = await saveFromTab(tab, saveOptions);
+  if (!saveResult || saveResult.ok === false) {
+    return {
+      ok: false,
+      reason:
+        saveResult && saveResult.reason
+          ? saveResult.reason
+          : "save-failed",
+    };
+  }
+  const categoryId =
+    quickItem && quickItem.categoryId
+      ? String(quickItem.categoryId)
+      : selectedCategoryId
+        ? String(selectedCategoryId)
+        : "";
+  let categoryName = "";
+  try {
+    const categories = sortCategories(coerceArray(await getCachedCategories()));
+    categoryName = getCategoryLabel(categoryId, categories);
+  } catch (err) {
+    categoryName = "";
+  }
+  return {
+    ok: true,
+    categoryId,
+    categoryName,
+    saveLabel: requestedFavorite ? "Favorite" : categoryName,
+    favorite: requestedFavorite === true || !!(quickItem && quickItem.favorite),
+  };
+}
+
+function buildMinimalItemFromTab(tab, categoryId, manualOrder) {
+  if (!tab || !tab.url) return null;
+  if (!/^https?:/i.test(tab.url)) return null;
+  const normalized = normalizeUrl(tab.url);
+  if (!normalized) return null;
+  const now = new Date().toISOString();
+  const normalizedTabTitle =
+    tab && tab.title ? normalizeExtractedTitle(tab.title) : "";
+  const safeTabTitle =
+    normalizedTabTitle &&
+      !looksLikeUrlText(normalizedTabTitle, normalized) &&
+      !isGenericFallbackTitleText(normalizedTabTitle)
+      ? normalizedTabTitle
+      : "";
+  const item = {
+    id: makeId(normalized),
+    url: normalized,
+    title: safeTabTitle || buildFallbackItemTitle(normalized),
+    byline: "",
+    siteName: siteNameFromUrl(normalized),
+    excerpt: "",
+    content: "",
+    textContent: "",
+    wordCount: 0,
+    readingTime: 0,
+    savedAt: now,
+    lang: "",
+    // Use tab.favIconUrl if available, otherwise use DuckDuckGo favicon
+    faviconUrl: (tab && tab.favIconUrl) ? tab.favIconUrl : (normalized ? "https://icons.duckduckgo.com/favicon.ico?domain=" + new URL(normalized).hostname : ""),
+    favorite: false,
+    categoryId: normalizeCategoryIdForSave(categoryId),
+  };
+  return withManualOrder(item, manualOrder);
+}
+
+async function saveAllTabsInWindow() {
+  if (saveAllTabsInProgress) {
+    return { ok: false, busy: true, added: 0, skipped: 0, closed: 0 };
+  }
+  saveAllTabsInProgress = true;
+  try {
+    const tabs = await lpApi.tabs.query({ currentWindow: true });
+    const items = await getItems();
+    
+    const existing = new Set();
+    for (const item of items) {
+      if (item && item.url) {
+        const candidates = buildUrlCompareCandidates(item.url);
+        for (const key of candidates) {
+          existing.add(key);
+        }
+      }
+    }
+    
+    const [selectedCategoryId, settings, categoryData] = await Promise.all([
+      getSelectedCategoryId(),
+      getSettings(),
+      lpStoreGet(CATEGORY_KEY),
+    ]);
+    const categoriesForRules = coerceArray(categoryData[CATEGORY_KEY]);
+    
+    let targetCategoryId = selectedCategoryId;
+    if (!targetCategoryId && categoriesForRules.length > 0) {
+      targetCategoryId = categoriesForRules[0].id || "";
+    }
+    const nextItems = items.slice();
+    let added = 0;
+    let skipped = 0;
+    const tabsToClose = [];
+    const newItems = [];
+
+    // Reset tracking
+    saveAllTabsIds.clear();
+    saveAllTabsPending = 0;
+    saveAllTabsResolver = null;
+
+    // Send save-started progress message
+    if (lpApi.runtime && lpApi.runtime.sendMessage) {
+      lpApi.runtime.sendMessage({
+        type: "save-progress",
+        current: 0,
+        total: tabs.length,
+        phase: "started",
+      }).catch(() => { });
+    }
+
+    // First pass: filter tabs that need saving and resolve categories in parallel
+    const tabsToSave = [];
+    for (let i = tabs.length - 1; i >= 0; i -= 1) {
+      const tab = tabs[i];
+      if (!tab || !tab.url || !/^https?:/i.test(tab.url)) continue;
+      if (tab.id) {
+        tabsToClose.push(tab.id);
+      }
+      const compareCandidates = buildUrlCompareCandidates(tab.url);
+      let alreadySaved = false;
+      for (const key of compareCandidates) {
+        if (existing.has(key)) {
+          alreadySaved = true;
+          break;
+        }
+      }
+      if (alreadySaved) {
+        skipped += 1;
+        continue;
+      }
+
+      tabsToSave.push({
+        tab,
+        compareCandidates,
+      });
+    }
+
+    // Build minimal items directly using selected category (no AI)
+    for (const entry of tabsToSave) {
+      const { tab, compareCandidates } = entry;
+      const manualOrder = computeManualOrderForCategory(
+        nextItems,
+        targetCategoryId,
+        "prepend",
+      );
+      const minimal = buildMinimalItemFromTab(
+        tab,
+        targetCategoryId,
+        manualOrder,
+      );
+      if (!minimal) continue;
+
+      if (tab.id) {
+        saveAllTabsIds.add(tab.id);
+        saveAllTabsPending++;
+      }
+
+      newItems.push(minimal);
+      for (const key of compareCandidates) {
+        existing.add(key);
+      }
+      added += 1;
+    }
+
+    // Save all items to storage (no AI queue, direct write)
+    if (added > 0) {
+      const combinedItems = [...newItems, ...items];
+      // Direct save to storage, bypassing setItems dedupe to avoid issues
+      await lpStoreSet({ [ITEM_KEY]: combinedItems });
+      cachedItems = combinedItems;
+      hasCachedItems = true;
+      buildUrlIndexCache(cachedItems);
+    }
+
+    // Skip content script extraction for "Save All Tabs" - use basic tab data only
+    // This significantly speeds up bulk saving
+    // Thumbnails will be fetched later when viewing items (lazy load)
+    
+    // Send immediate completion since we don't wait for extraction
+    if (lpApi.runtime && lpApi.runtime.sendMessage) {
+      lpApi.runtime.sendMessage({
+        type: "save-progress",
+        current: added,
+        total: added + skipped,
+        phase: "complete",
+      }).catch(() => { });
+    }
+
+    if (added > 0) {
+      // Refresh the category picker UI
+      if (lpApi.runtime && lpApi.runtime.sendMessage) {
+        lpApi.runtime.sendMessage({ type: "refresh-picker-ui" }).catch(() => { });
+      }
+    }
+
+    if (currentSettings.closeOnSaveAllTabs && tabsToClose.length) {
+      let toClose = tabsToClose.slice();
+      if (toClose.length) {
+        const activeTab = tabs.find(
+          (tab) => tab && tab.active && tab.id && toClose.includes(tab.id),
+        );
+        const keepId = activeTab ? activeTab.id : toClose[0];
+        toClose = toClose.filter((id) => id !== keepId);
+      }
+      try {
+        if (toClose.length) {
+          await lpApi.tabs.remove(toClose);
+        }
+      } catch (err) {
+        lpErr("Failed to close tabs after save all", err);
+      }
+    }
+    return {
+      ok: true,
+      added,
+      skipped,
+      closed: currentSettings.closeOnSaveAllTabs
+        ? Math.max(0, tabsToClose.length - 1)
+        : 0,
+    };
+  } catch (err) {
+    lpErr("saveAllTabsInWindow exception:", err);
+    throw err;
+  } finally {
+    saveAllTabsInProgress = false;
+  }
+}
+
+
+async function openUrlInUserContext(rawUrl, forceNewTab = false, backgroundTab = false) {
+  const url = normalizeUrl(rawUrl);
+  if (!url) {
+    return { ok: false, reason: "invalid-url", tabId: null, url: "", newTab: !!forceNewTab };
+  }
+  if (forceNewTab) {
+    const created = await lpApi.tabs.create({ url, active: false });
+    const tabId = created && (created.id || created.id === 0) ? created.id : null;
+    return { ok: true, tabId, url, newTab: true };
+  }
+  const tabs = await lpApi.tabs.query({ active: true, currentWindow: true });
+  const activeTab = tabs && tabs[0] ? tabs[0] : null;
+  const activeTabId = activeTab && (activeTab.id || activeTab.id === 0) ? activeTab.id : null;
+  if (activeTabId || activeTabId === 0) {
+    const updated = await lpApi.tabs.update(activeTabId, { url });
+    const tabId = updated && (updated.id || updated.id === 0) ? updated.id : activeTabId;
+    return { ok: true, tabId, url, newTab: false };
+  } else {
+    const created = await lpApi.tabs.create({ url });
+    const tabId = created && (created.id || created.id === 0) ? created.id : null;
+    return { ok: true, tabId, url, newTab: true };
+  }
+}
+
+async function openFirstItem() {
+  const data = await lpStoreGet([ITEM_KEY, SETTINGS_KEY]);
+  const settings = mergeSettings(data[SETTINGS_KEY]);
+  const favoritesOnly = settings.navigationFavoritesOnly === true;
+  const items = applyFavoritesOnlyNavigationFilter(data[ITEM_KEY], settings);
+  const first = sortItemsBySavedAt(
+    items,
+    buildNavigationSortOptions(settings, favoritesOnly),
+  ).find((item) => item && item.url);
+  addFavoritesDebugLog("background-open-first", {
+    favoritesOnly,
+    itemCount: Array.isArray(items) ? items.length : 0,
+    chosen: summarizeFavoriteItemForDebug(first),
+  });
+  if (!first) return;
+  const firstItemId = first.id ? String(first.id) : "";
+  await openUrlInUserContext(first.url);
+  if (firstItemId) {
+    try {
+      await lpStoreSet({
+        [CATEGORY_PICKER_LAST_LOCATION_KEY]: {
+          mode: "items",
+          categoryId: "all",
+          lastOpenedItemId: firstItemId,
+          lastOpenedAt: Date.now(),
+          updatedAt: new Date().toISOString(),
+        },
+      });
+    } catch (err) { /* ignore */ }
+  }
+}
+
+function getItemsForSelectedCategory(items, categoryId) {
+  const safeItems = Array.isArray(items)
+    ? items.filter((item) => item && item.url)
+    : [];
+  if (categoryId === "none") {
+    return safeItems.filter((item) => !item.categoryId);
+  }
+  if (categoryId === "hidden_none") {
+    return safeItems.filter((item) => item.categoryId === "hidden_none");
+  }
+  if (categoryId === "hidden_all" || categoryId === "all_hidden") {
+    const hiddenCatIds = new Set();
+    if (Array.isArray(cachedCategories)) {
+      for (const cat of cachedCategories) {
+        if (cat && cat.id && cat.hidden) {
+          hiddenCatIds.add(String(cat.id));
+        }
+      }
+    }
+    return safeItems.filter((item) => {
+      const itemCatId = item && item.categoryId ? String(item.categoryId) : "";
+      return itemCatId === "hidden_none" || hiddenCatIds.has(itemCatId);
+    });
+  }
+  if (categoryId && categoryId !== "all") {
+    return safeItems.filter((item) => item.categoryId === categoryId);
+  }
+  return safeItems;
+}
+
+function applyFavoritesOnlyNavigationFilter(items, settings) {
+  const safeItems = coerceArray(items);
+  if (!settings || settings.navigationFavoritesOnly !== true) {
+    return safeItems;
+  }
+  return safeItems.filter((item) => item && item.favorite === true);
+}
+
+function shouldUseFavoritesOnlyNavigation(settings, categoryId) {
+  if (!settings || settings.navigationFavoritesOnly !== true) return false;
+  const selected = categoryId ? String(categoryId) : "all";
+  return selected === "all";
+}
+
+function normalizeFavoritesSortMode(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (normalized === "asc" || normalized === "desc") return normalized;
+  return "manual";
+}
+
+function buildNavigationSortOptions(settings, favoritesOnly) {
+  const favoriteSortMode = favoritesOnly
+    ? normalizeFavoritesSortMode(settings && settings.favoritesSortMode)
+    : "manual";
+  return {
+    favoritesSortMode: favoriteSortMode,
+    savedAtDirection:
+      favoritesOnly && favoriteSortMode !== "manual"
+        ? favoriteSortMode
+        : "desc",
+  };
+}
+
+function sortItemsBySavedAt(items, options = {}) {
+  const safeItems = Array.isArray(items) ? items.slice() : [];
+  const safeOptions = options && typeof options === "object" ? options : {};
+  const favoritesSortMode = normalizeFavoritesSortMode(
+    safeOptions.favoritesSortMode,
+  );
+  const savedAtDirection = safeOptions.savedAtDirection === "asc" ? "asc" : "desc";
+  const allFavorites =
+    safeItems.length > 0 &&
+    safeItems.every((item) => item && item.favorite === true);
+  const categoryKeys = new Set(
+    safeItems.map((item) =>
+      item && item.categoryId ? String(item.categoryId) : "",
+    ),
+  );
+  const useManualOrder = !allFavorites && categoryKeys.size <= 1;
+  return safeItems.sort((a, b) => {
+    if (allFavorites && favoritesSortMode === "manual") {
+      const aFavoriteOrder = getFavoriteOrderValue(a);
+      const bFavoriteOrder = getFavoriteOrderValue(b);
+      if (
+        aFavoriteOrder !== null &&
+        bFavoriteOrder !== null &&
+        aFavoriteOrder !== bFavoriteOrder
+      ) {
+        return aFavoriteOrder - bFavoriteOrder;
+      }
+      if (aFavoriteOrder !== null && bFavoriteOrder === null) return -1;
+      if (aFavoriteOrder === null && bFavoriteOrder !== null) return 1;
+    }
+    if (useManualOrder) {
+      const aOrder = getManualOrderValue(a);
+      const bOrder = getManualOrderValue(b);
+      if (aOrder !== null && bOrder !== null && aOrder !== bOrder) {
+        return aOrder - bOrder;
+      }
+      if (aOrder !== null && bOrder === null) return -1;
+      if (aOrder === null && bOrder !== null) return 1;
+    }
+    const aTime = a && a.savedAt ? Date.parse(a.savedAt) : 0;
+    const bTime = b && b.savedAt ? Date.parse(b.savedAt) : 0;
+    if (aTime !== bTime) {
+      return savedAtDirection === "asc" ? aTime - bTime : bTime - aTime;
+    }
+    const aId = a && a.id ? String(a.id) : "";
+    const bId = b && b.id ? String(b.id) : "";
+    return aId.localeCompare(bId);
+  });
+}
+
+function pickNextItemFromPool(pool, currentUrl, categoryKey, options = {}) {
+  const ordered = sortItemsBySavedAt(pool, options);
+  if (!ordered.length) return null;
+
+  const key = categoryKey ? String(categoryKey) : "all";
+  const currentIndex = currentUrl
+    ? ordered.findIndex(
+      (item) => item && item.url && urlsMatchForSave(item.url, currentUrl),
+    )
+    : -1;
+
+  if (currentIndex >= 0) {
+    const nextIndex = (currentIndex + 1) % ordered.length;
+    nextSequenceCursorByCategory.set(key, nextIndex);
+    return ordered[nextIndex] || null;
+  }
+
+  const lastIndex = nextSequenceCursorByCategory.get(key);
+  if (
+    typeof lastIndex === "number" &&
+    lastIndex >= 0 &&
+    lastIndex < ordered.length
+  ) {
+    const nextIndex = currentIndex < 0 ? lastIndex : (lastIndex + 1) % ordered.length;
+    nextSequenceCursorByCategory.set(key, nextIndex);
+    return ordered[nextIndex] || null;
+  }
+
+  // Jika cursor telah dikosongkan oleh storage.onChanged, guna pendingNextLinkCursor yang tak dikosongkan
+  if (currentIndex < 0) {
+    const pendingDeleted = pendingNextLinkCursor.get(key);
+    if (typeof pendingDeleted === "number" && pendingDeleted >= 0) {
+      pendingNextLinkCursor.delete(key);
+      const nextIndex = pendingDeleted < ordered.length ? pendingDeleted : 0;
+      nextSequenceCursorByCategory.set(key, nextIndex);
+      return ordered[nextIndex] || null;
+    }
+  }
+
+  nextSequenceCursorByCategory.set(key, 0);
+  return ordered[0] || null;
+}
+
+function pickRandomItemFromPool(pool, excludeUrl) {
+  let ordered = sortItemsBySavedAt(pool);
+  if (excludeUrl && ordered.length > 1) {
+    const filtered = ordered.filter(
+      (item) => !urlsMatchForSave(item.url, excludeUrl),
+    );
+    if (filtered.length) {
+      ordered = filtered;
+    }
+  }
+  if (!ordered.length) return null;
+  const index = Math.floor(Math.random() * ordered.length);
+  return ordered[index] || null;
+}
+
+function shuffleArray(values) {
+  const next = Array.isArray(values) ? values.slice() : [];
+  for (let i = next.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = next[i];
+    next[i] = next[j];
+    next[j] = tmp;
+  }
+  return next;
+}
+
+function buildCategoryItemMap(items) {
+  const map = new Map();
+  const safeItems = Array.isArray(items) ? items : [];
+  safeItems.forEach((item) => {
+    if (!item || !item.url) return;
+    const key = item.categoryId ? String(item.categoryId) : "none";
+    if (!map.has(key)) {
+      map.set(key, []);
+    }
+    map.get(key).push(item);
+  });
+  return map;
+}
+
+function pickRandomItemAcrossCategories(
+  items,
+  excludeUrl,
+  preferredCategoryId,
+) {
+  const categoryMap = buildCategoryItemMap(items);
+  if (!categoryMap.size) return null;
+
+  const preferredKey =
+    preferredCategoryId && preferredCategoryId !== "all"
+      ? preferredCategoryId === "none"
+        ? "none"
+        : String(preferredCategoryId)
+      : "";
+
+  if (preferredKey && categoryMap.has(preferredKey)) {
+    const fromPreferred = pickRandomItemFromPool(
+      categoryMap.get(preferredKey),
+      excludeUrl,
+    );
+    if (fromPreferred && fromPreferred.url) {
+      return fromPreferred;
+    }
+  }
+
+  const otherKeys = Array.from(categoryMap.keys()).filter(
+    (key) => key !== preferredKey,
+  );
+  const shuffledKeys = shuffleArray(otherKeys);
+  for (const key of shuffledKeys) {
+    const fromCategory = pickRandomItemFromPool(
+      categoryMap.get(key),
+      excludeUrl,
+    );
+    if (fromCategory && fromCategory.url) {
+      return fromCategory;
+    }
+  }
+  return null;
+}
+
+function findSavedItemByUrl(items, targetUrl) {
+  if (!targetUrl) return null;
+  const safeItems = Array.isArray(items) ? items : [];
+  for (const item of safeItems) {
+    if (!item || !item.url) continue;
+    if (urlsMatchForSave(item.url, targetUrl)) {
+      return item;
+    }
+  }
+  return null;
+}
+
+function resolveNavigationCategoryId(items, selectedCategoryId, currentUrl) {
+  const fallback = selectedCategoryId ? String(selectedCategoryId) : "all";
+  if (!currentUrl) return fallback;
+  const matched = findSavedItemByUrl(items, currentUrl);
+  if (!matched) return fallback;
+  return matched.categoryId ? String(matched.categoryId) : "none";
+}
+
+function buildCategoryPoolForNavigation(items, selectedCategoryId, currentUrl) {
+  const selected = selectedCategoryId ? String(selectedCategoryId) : "all";
+  // Guna kategori terpilih terus jika user pilih kategori spesifik (bukan "all")
+  // Elak resolveNavigationCategoryId override kategori yang dipilih user
+  const resolved = selected !== "all"
+    ? selected
+    : resolveNavigationCategoryId(items, selected, currentUrl);
+  let pool = getItemsForSelectedCategory(items, resolved);
+  let categoryKey = resolved;
+  if (!pool.length && resolved !== selected) {
+    pool = getItemsForSelectedCategory(items, selected);
+    categoryKey = selected;
+  }
+  if (!pool.length && selected !== "all") {
+    pool = getItemsForSelectedCategory(items, "all");
+    categoryKey = "all";
+  }
+  return { pool, categoryKey };
+}
+
+// Helper untuk tunggu tab selesai load sebelum papar notification di tab baru
+function waitForTabLoad(tabId) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      try { lpApi.tabs.onUpdated.removeListener(listener); } catch (e) {}
+      resolve();
+    };
+    const listener = (updatedTabId, changeInfo) => {
+      if (updatedTabId === tabId && changeInfo.status === "complete") {
+        finish();
+      }
+    };
+    try { lpApi.tabs.onUpdated.addListener(listener); } catch (e) {}
+    Promise.resolve(lpApi.tabs.get(tabId)).then((tab) => {
+      if (tab && tab.status === "complete") {
+        finish();
+      }
+    }).catch(() => {});
+    // Timeout fallback — 8 saat, supaya notification tetap muncul walaupun event missed
+    setTimeout(finish, 8000);
+  });
+}
+
+// Papar toast in-page untuk next/random link — sama seperti toast tukar kategori
+async function showNextLinkNotification(item, pool, linkIndex, categoryLabel, mode, targetTabId) {
+  if (!item) return;
+  const totalLinks = Array.isArray(pool) ? pool.length : 0;
+  const linkTitle = item.title ? String(item.title).trim() : item.url || "";
+  const truncatedTitle = linkTitle.length > 60 ? linkTitle.slice(0, 57) + "…" : linkTitle;
+  const modePrefix = mode === "random" ? "🎲 Rawak" : "➡ Seterusnya";
+  const linkNum = typeof linkIndex === "number" && linkIndex >= 0 ? linkIndex + 1 : "?";
+  // Nombor per jumlah — besar dan menonjol
+  const counterText = `${linkNum} / ${totalLinks}`;
+  // Baris metadata: "➡ Seterusnya  —  Kategori A"
+  const message = `${modePrefix}  —  ${categoryLabel}`;
+  // Baris bawah besar berwarna: tajuk link
+  const subtext = truncatedTitle || item.url || "";
+  const accentColor = mode === "random" ? "#f59e0b" : "#48d597";
+  await showInPageToast(message, subtext, accentColor, targetTabId, 2000, counterText);
+}
+
+async function openNextItemFromCurrentUrl(currentUrl) {
+  const data = await lpStoreGet([
+    ITEM_KEY,
+    SELECTED_CATEGORY_KEY,
+    SETTINGS_KEY,
+    CATEGORY_KEY,
+  ]);
+  const settings = mergeSettings(data[SETTINGS_KEY]);
+  const categoryId = data[SELECTED_CATEGORY_KEY]
+    ? String(data[SELECTED_CATEGORY_KEY])
+    : "all";
+  const favoritesAcrossCategories = shouldUseFavoritesOnlyNavigation(
+    settings,
+    categoryId,
+  );
+  const sortOptions = buildNavigationSortOptions(
+    settings,
+    favoritesAcrossCategories,
+  );
+  const items = favoritesAcrossCategories
+    ? applyFavoritesOnlyNavigationFilter(data[ITEM_KEY], settings)
+    : coerceArray(data[ITEM_KEY]);
+  const navigation = favoritesAcrossCategories
+    ? { pool: items, categoryKey: "all" }
+    : buildCategoryPoolForNavigation(items, categoryId, currentUrl);
+  if (!favoritesAcrossCategories) {
+    const hiddenCatIds = new Set();
+    const cats = Array.isArray(data[CATEGORY_KEY]) ? data[CATEGORY_KEY] : [];
+    for (const cat of cats) {
+      if (cat && cat.id && cat.hidden) hiddenCatIds.add(String(cat.id));
+    }
+    const showHidden = settings.showHiddenCategories || 0;
+    // Jika kategori dipilih ialah hidden_none atau all_hidden, skip filter
+    // kerana pool sudah discope kepada item hidden sahaja
+    const isHiddenSpecialCategory = categoryId === "hidden_none" || categoryId === "all_hidden" || categoryId === "hidden_all";
+    if (!isHiddenSpecialCategory) {
+      navigation.pool = navigation.pool.filter((item) => {
+        if (!item || !item.url) return false;
+        const catId = item.categoryId ? String(item.categoryId) : "";
+        const isHidden = catId === "hidden_none" || hiddenCatIds.has(catId);
+        if (showHidden === 2) return isHidden;
+        if (showHidden === 0) return !isHidden;
+        return true;
+      });
+    }
+  }
+  const next = pickNextItemFromPool(
+    navigation.pool,
+    currentUrl,
+    navigation.categoryKey,
+    sortOptions,
+  );
+  addFavoritesDebugLog("background-open-next", {
+    currentUrl: sanitizeSidebarFocusDebugValue(currentUrl || ""),
+    categoryId,
+    favoritesAcrossCategories,
+    categoryKey: navigation.categoryKey,
+    poolSize: Array.isArray(navigation.pool) ? navigation.pool.length : 0,
+    sortOptions,
+    chosen: summarizeFavoriteItemForDebug(next),
+  });
+  if (!next || !next.url) return false;
+  const nextUrl = next.url;
+  const nextItemId = next.id ? String(next.id) : "";
+
+  // Kira nombor indeks (0-based) item yang akan dibuka dalam pool yang disusun
+  const sortedPool = sortItemsBySavedAt(navigation.pool, sortOptions);
+  const nextIndexInPool = sortedPool.findIndex(
+    (item) => item && item.url && urlsMatchForSave(item.url, nextUrl)
+  );
+  const categories = Array.isArray(data[CATEGORY_KEY]) ? data[CATEGORY_KEY] : [];
+  const resolvedCatId = next.categoryId ? String(next.categoryId) : (navigation.categoryKey || categoryId);
+  const categoryLabel = getCategoryLabel(resolvedCatId, categories);
+
+  // Papar notification SEBELUM tab dibuka
+  await showNextLinkNotification(next, sortedPool, nextIndexInPool, categoryLabel, "next");
+
+  const opened = settings && settings.globalLinkInBackgroundTab === false
+    ? await openUrlInUserContext(nextUrl)
+    : await openUrlInUserContext(nextUrl, true, true);
+
+  // Notification sekali lagi di tab baru selepas load selesai (2 saat)
+  if (opened && (opened.tabId || opened.tabId === 0)) {
+    waitForTabLoad(opened.tabId).then(() => {
+      showNextLinkNotification(next, sortedPool, nextIndexInPool, categoryLabel, "next", opened.tabId).catch(() => {});
+    }).catch(() => {});
+  }
+
+  if (nextItemId) {
+    try {
+      await lpStoreSet({
+        [CATEGORY_PICKER_LAST_LOCATION_KEY]: {
+          mode: "items",
+          categoryId: categoryId,
+          lastOpenedItemId: nextItemId,
+          lastOpenedAt: Date.now(),
+          updatedAt: new Date().toISOString(),
+        },
+      });
+    } catch (err) { /* ignore */ }
+  }
+  if (settings && settings.deleteAfterOpen) {
+    try {
+      await removeItemByUrl(nextUrl);
+    } catch (err) {
+      // ignore removal errors
+    }
+  }
+  if (opened && (opened.tabId || opened.tabId === 0)) {
+    try {
+      const items = await getItems();
+      const saved = isUrlSaved(opened.url || nextUrl, items);
+      await setPageActionStateFast({ id: opened.tabId, url: opened.url || nextUrl }, saved);
+    } catch (err) { /* ignore */ }
+  }
+  return true;
+}
+
+async function openRandomItem(options = {}) {
+  const data = await lpStoreGet([
+    ITEM_KEY,
+    SELECTED_CATEGORY_KEY,
+    SETTINGS_KEY,
+    CATEGORY_KEY,
+  ]);
+  const settings = mergeSettings(data[SETTINGS_KEY]);
+  const categoryId = data[SELECTED_CATEGORY_KEY]
+    ? String(data[SELECTED_CATEGORY_KEY])
+    : "all";
+  const favoritesAcrossCategories = shouldUseFavoritesOnlyNavigation(
+    settings,
+    categoryId,
+  );
+  const sortOptions = buildNavigationSortOptions(settings, favoritesAcrossCategories);
+  const items = favoritesAcrossCategories
+    ? applyFavoritesOnlyNavigationFilter(data[ITEM_KEY], settings)
+    : coerceArray(data[ITEM_KEY]);
+  const excludeUrl = options.excludeUrl ? String(options.excludeUrl) : "";
+  const currentUrl = options.currentUrl ? String(options.currentUrl) : "";
+  const preferCurrentUrlCategory = options.preferCurrentUrlCategory === true;
+  const includeOtherCategories = options.includeOtherCategories === true;
+  const randomAcrossAll = options.forceRandomAcrossAll === true || settings.randomAcrossAllCategories === true;
+
+  // Bina hidden category IDs dan filter function ikut mode mata (showHiddenCategories)
+  const hiddenCatIds = new Set();
+  const cats = Array.isArray(data[CATEGORY_KEY]) ? data[CATEGORY_KEY] : [];
+  for (const cat of cats) {
+    if (cat && cat.id && cat.hidden) hiddenCatIds.add(String(cat.id));
+  }
+  const showHidden = settings.showHiddenCategories || 0;
+  function filterByShowHidden(item) {
+    if (!item || !item.url) return false;
+    const catId = item.categoryId ? String(item.categoryId) : "";
+    const isHidden = catId === "hidden_none" || hiddenCatIds.has(catId);
+    if (showHidden === 2) return isHidden;      // only hidden
+    if (showHidden === 0) return !isHidden;     // only normal
+    return true;                                 // show all
+  }
+
+  let pick = null;
+  if (favoritesAcrossCategories) {
+    pick = pickRandomItemFromPool(items, excludeUrl);
+  } else if (includeOtherCategories) {
+    pick = pickRandomItemAcrossCategories(items, excludeUrl, categoryId);
+  } else if (randomAcrossAll) {
+    const pool = items.filter(filterByShowHidden);
+    pick = pickRandomItemFromPool(pool, excludeUrl);
+  } else {
+    let pool = preferCurrentUrlCategory
+      ? buildCategoryPoolForNavigation(
+        items,
+        categoryId,
+        currentUrl || excludeUrl,
+      ).pool
+      : getItemsForSelectedCategory(items, categoryId);
+    // Jika kategori dipilih ialah hidden_none atau all_hidden, skip filter
+    // kerana pool sudah discope kepada item hidden sahaja
+    const isHiddenSpecialCat = categoryId === "hidden_none" || categoryId === "all_hidden" || categoryId === "hidden_all";
+    let filteredPool = isHiddenSpecialCat ? pool.filter(item => item && item.url) : pool.filter(filterByShowHidden);
+    // Fallback jika filtered pool kosong: cuba pool lebih luas
+    if (!filteredPool.length) {
+      if (preferCurrentUrlCategory) {
+        // Cuba tanpa prefer URL category
+        pool = getItemsForSelectedCategory(items, categoryId);
+        filteredPool = isHiddenSpecialCat ? pool.filter(item => item && item.url) : pool.filter(filterByShowHidden);
+      }
+      if (!filteredPool.length && categoryId !== "all") {
+        // Cuba semua kategori
+        filteredPool = items.filter(filterByShowHidden);
+      }
+    }
+    pick = pickRandomItemFromPool(filteredPool, excludeUrl);
+  }
+
+  if (!pick || !pick.url) return false;
+  const pickUrl = pick.url;
+  const pickItemId = pick.id ? String(pick.id) : "";
+
+  // Kira pool dan indeks untuk notification random, papar SEBELUM tab dibuka
+  let sortedNotifPool = [];
+  let pickIndexInPool = -1;
+  let categoryLabel = "";
+  try {
+    const categories = Array.isArray(data[CATEGORY_KEY]) ? data[CATEGORY_KEY] : [];
+    const resolvedCatId = pick.categoryId ? String(pick.categoryId) : categoryId;
+    categoryLabel = getCategoryLabel(resolvedCatId, categories);
+    let notifPool;
+    if (favoritesAcrossCategories) {
+      notifPool = items;
+    } else if (includeOtherCategories) {
+      notifPool = coerceArray(data[ITEM_KEY]).filter(filterByShowHidden);
+    } else if (randomAcrossAll) {
+      notifPool = items.filter(filterByShowHidden);
+    } else {
+      let rawPool = preferCurrentUrlCategory
+        ? buildCategoryPoolForNavigation(items, categoryId, currentUrl || excludeUrl).pool
+        : getItemsForSelectedCategory(items, categoryId);
+      notifPool = rawPool.filter(filterByShowHidden);
+      // Fallback sama seperti pick logic
+      if (!notifPool.length) {
+        if (preferCurrentUrlCategory) {
+          rawPool = getItemsForSelectedCategory(items, categoryId);
+          notifPool = rawPool.filter(filterByShowHidden);
+        }
+        if (!notifPool.length && categoryId !== "all") {
+          notifPool = items.filter(filterByShowHidden);
+        }
+      }
+    }
+    sortedNotifPool = sortItemsBySavedAt(notifPool, sortOptions);
+    pickIndexInPool = sortedNotifPool.findIndex(
+      (item) => item && item.url && urlsMatchForSave(item.url, pickUrl)
+    );
+    await showNextLinkNotification(pick, sortedNotifPool, pickIndexInPool, categoryLabel, "random");
+  } catch (e) { /* ignore notification errors */ }
+
+  const opened = settings && settings.globalLinkInBackgroundTab === false
+    ? await openUrlInUserContext(pickUrl)
+    : await openUrlInUserContext(pickUrl, true, true);
+
+  // Notification sekali lagi di tab baru selepas load selesai (2 saat)
+  if (opened && (opened.tabId || opened.tabId === 0)) {
+    waitForTabLoad(opened.tabId).then(() => {
+      showNextLinkNotification(pick, sortedNotifPool, pickIndexInPool, categoryLabel, "random", opened.tabId).catch(() => {});
+    }).catch(() => {});
+  }
+
+  if (pickItemId) {
+    try {
+      await lpStoreSet({
+        [CATEGORY_PICKER_LAST_LOCATION_KEY]: {
+          mode: "items",
+          categoryId: categoryId,
+          lastOpenedItemId: pickItemId,
+          lastOpenedAt: Date.now(),
+          updatedAt: new Date().toISOString(),
+        },
+      });
+    } catch (err) { /* ignore */ }
+  }
+  if (settings && settings.deleteAfterOpen) {
+    try {
+      await removeItemByUrl(pickUrl);
+    } catch (err) { /* ignore */ }
+  }
+  if (opened && (opened.tabId || opened.tabId === 0)) {
+    try {
+      const items = await getItems();
+      const saved = isUrlSaved(opened.url || pickUrl, items);
+      await setPageActionStateFast({ id: opened.tabId, url: opened.url || pickUrl }, saved);
+    } catch (err) { /* ignore */ }
+  }
+  return true;
+}
+
+function isYouTubePlaybackUrl(rawUrl) {
+  return !!extractYouTubeVideoId(rawUrl);
+}
+
+function isSummarizableUrl(rawUrl) {
+  if (!rawUrl) return false;
+  try {
+    const parsed = new URL(String(rawUrl));
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch (err) {
+    return false;
+  }
+}
+
+async function handleYouTubeVideoEnded(message, sender) {
+  const senderTab = sender && sender.tab ? sender.tab : null;
+  if (!senderTab || !senderTab.id) {
+    return { ok: false, reason: "no-source-tab" };
+  }
+  if (senderTab.active === false) {
+    return { ok: false, reason: "source-tab-inactive" };
+  }
+  if (lpApi.tabs && lpApi.tabs.query) {
+    try {
+      const tabs = await lpApi.tabs.query({ active: true, currentWindow: true });
+      const activeTab = tabs && tabs[0] ? tabs[0] : null;
+      if (activeTab && activeTab.id && activeTab.id !== senderTab.id) {
+        return { ok: false, reason: "source-tab-not-active" };
+      }
+    } catch (err) {
+      // ignore active tab validation errors
+    }
+  }
+  const messageUrl = message && message.url ? String(message.url) : "";
+  const senderUrl = senderTab.url ? String(senderTab.url) : "";
+  const sourceUrl = isYouTubePlaybackUrl(messageUrl) ? messageUrl : senderUrl;
+  if (!isYouTubePlaybackUrl(sourceUrl)) {
+    return { ok: false, reason: "not-youtube" };
+  }
+  const settings = await getSettings();
+  const autoNext = settings.youtubeAutoNext === true;
+  const autoRandom = settings.youtubeAutoRandom === true;
+  if (!autoNext && !autoRandom) {
+    return { ok: false, reason: "disabled" };
+  }
+  if (autoNext) {
+    const openedNext = await openNextItemFromCurrentUrl(sourceUrl);
+    if (openedNext) {
+      return { ok: true, mode: "next" };
+    }
+  }
+  if (autoRandom) {
+    const openedRandom = await openRandomItem({
+      excludeUrl: sourceUrl,
+      currentUrl: sourceUrl,
+      preferCurrentUrlCategory: true,
+      includeOtherCategories: false,
+    });
+    if (openedRandom) {
+      return { ok: true, mode: "random" };
+    }
+  }
+  return { ok: false, reason: "no-target-item" };
+}
+
+
+async function toggleSaveFromTab(tab) {
+  if (!tab || !tab.id) return;
+  let resolvedTab = tab;
+  if (!resolvedTab.url) {
+    try {
+      resolvedTab = await lpApi.tabs.get(tab.id);
+    } catch (err) {
+      return;
+    }
+  }
+  if (!resolvedTab.url) return;
+  if (/^file:/i.test(String(resolvedTab.url))) {
+    await saveFromTab(resolvedTab);
+    return;
+  }
+
+  const items = await getItems();
+  const saved = isUrlSaved(resolvedTab.url, items);
+  if (saved) {
+    // Optimistic UI: flip icon immediately.
+    await setPageActionStateFast(resolvedTab, false);
+    await removeItemByUrl(resolvedTab.url);
+    await updatePageActionForTab(resolvedTab);
+    return;
+  }
+  const selectedCategoryId = await getSelectedCategoryId();
+  // Optimistic UI: show saved icon right away.
+  await setPageActionStateFast(resolvedTab, true);
+  await upsertMinimalItemFromTab(resolvedTab, selectedCategoryId);
+  await updatePageActionForTab(resolvedTab);
+  // Fire-and-forget full content scrape to stay responsive.
+  saveFromTab(resolvedTab).catch((err) =>
+    lpErr("Deferred saveFromTab failed", err),
+  );
+  // Show beautiful toast with category name
+  const cats = await getCachedCategories();
+  const catName = getCategoryLabel(selectedCategoryId || "", cats || []);
+  showSavedToast(catName, selectedCategoryId).catch(() => {});
+}
+
+function shouldShowPageAction(tab) {
+  if (!tab || !tab.url) return false;
+  return /^https?:/i.test(tab.url);
+}
+
+async function updateBrowserActionForTab(tabId, saved) {
+  if (!lpApi.browserAction || !lpApi.browserAction.setIcon) return;
+  if (!tabId && tabId !== 0) return;
+  const iconPath = saved ? PAGE_ACTION_ICON_SAVED : PAGE_ACTION_ICON_DEFAULT;
+  await runTabUiApiCall(
+    () => lpApi.browserAction.setIcon({ tabId, path: iconPath }),
+    tabId,
+    "browserAction.setIcon",
+  );
+  if (lpApi.browserAction.setTitle) {
+    const linkCount = hasCachedItems ? cachedItems.length : (await getItems()).length;
+    const unsavedText = `Save to Local Pocket` + (linkCount > 0 ? ` (${linkCount})` : "");
+    await runTabUiApiCall(
+      () =>
+        lpApi.browserAction.setTitle({
+          tabId,
+          title: saved ? "Saved (click to remove)" : unsavedText,
+        }),
+      tabId,
+      "browserAction.setTitle",
+    );
+  }
+}
+
+async function setPageActionStateFast(tab, saved) {
+  if (!tab || !tab.id || !tab.url) return;
+  const tabId = tab.id;
+  const shouldShow = shouldShowPageAction(tab);
+  const iconPath = saved ? PAGE_ACTION_ICON_SAVED : PAGE_ACTION_ICON_DEFAULT;
+
+  if (shouldShow && lpApi.pageAction) {
+    // Force immediate show + icon update to keep UX snappy.
+    await runTabUiApiCall(
+      () => lpApi.pageAction.show(tabId),
+      tabId,
+      "pageAction.show",
+    );
+    await runTabUiApiCall(
+      () => lpApi.pageAction.setIcon({ tabId, path: iconPath }),
+      tabId,
+      "pageAction.setIcon",
+    );
+    const linkCount = hasCachedItems ? cachedItems.length : (await getItems()).length;
+    const unsavedText = `Save to Local Pocket` + (linkCount > 0 ? ` (${linkCount})` : "");
+    await runTabUiApiCall(
+      () =>
+        lpApi.pageAction.setTitle({
+          tabId,
+          title: saved ? "Saved (click to remove)" : unsavedText,
+        }),
+      tabId,
+      "pageAction.setTitle",
+    );
+  }
+
+  await updateBrowserActionForTab(tabId, saved);
+  pageActionStateByTabId.set(tabId, { shown: shouldShow, saved });
+}
+
+async function updatePageActionForTab(tab, itemsSnapshot) {
+  try {
+    if (!tab || !tab.id) return;
+    let resolvedTab = tab;
+    if (!resolvedTab.url) {
+      try {
+        resolvedTab = await lpApi.tabs.get(tab.id);
+      } catch (err) {
+        return;
+      }
+    }
+    if (!resolvedTab.url) return;
+
+    const tabId = resolvedTab.id;
+    if (!tabId && tabId !== 0) return;
+
+    // Guna in-memory cache dahulu — elak storage.local.get + full cache rebuild
+    // pada setiap tab focus/navigation event
+    let items;
+    if (Array.isArray(itemsSnapshot)) {
+      items = itemsSnapshot;
+    } else if (hasCachedItems && urlIndexCacheBuilt) {
+      // Cache warm — guna terus, tiada I/O
+      items = cachedItems;
+    } else {
+      // Cache sejuk — baca dari store sekali sahaja
+      items = await getItems();
+    }
+
+    // Rebuild cache hanya jika belum sah
+    if (!urlIndexCacheBuilt) {
+      buildUrlIndexCache(items);
+      urlIndexCacheBuilt = true;
+    }
+
+    const saved = isUrlSaved(resolvedTab.url, items);
+    const shouldShow = shouldShowPageAction(resolvedTab);
+    const linkCount = items.length;
+
+    // Semak state sedia ada untuk mengelakkan lpApi spam (punca lag utama apabila banyak tab)
+    const currentState = pageActionStateByTabId.get(tabId);
+    if (
+      currentState &&
+      currentState.shown === shouldShow &&
+      currentState.saved === saved &&
+      currentState.linkCount === linkCount
+    ) {
+      return; // Tiada perubahan, tak perlu buat lpApi call yang mahal
+    }
+
+    // Set state baru
+    pageActionStateByTabId.set(tabId, { shown: shouldShow, saved, linkCount });
+
+    // Lakukan lpApi call
+    await updateBrowserActionForTab(tabId, saved);
+
+    if (!lpApi.pageAction) return;
+
+    if (!shouldShow) {
+      await runTabUiApiCall(
+        () => lpApi.pageAction.hide(tabId),
+        tabId,
+        "pageAction.hide",
+      );
+      return;
+    }
+
+    const iconPath = saved ? PAGE_ACTION_ICON_SAVED : PAGE_ACTION_ICON_DEFAULT;
+    const shown = await runTabUiApiCall(
+      () => lpApi.pageAction.show(tabId),
+      tabId,
+      "pageAction.show",
+    );
+    if (!shown) {
+      return;
+    }
+    const iconUpdated = await runTabUiApiCall(
+      () =>
+        lpApi.pageAction.setIcon({
+          tabId,
+          path: iconPath,
+        }),
+      tabId,
+      "pageAction.setIcon",
+    );
+    if (iconUpdated) {
+      const linkCount = items.length;
+      const unsavedText = `Save to Local Pocket` + (linkCount > 0 ? ` (${linkCount})` : "");
+      await runTabUiApiCall(
+        () =>
+          lpApi.pageAction.setTitle({
+            tabId,
+            title: saved ? "Saved (click to remove)" : unsavedText,
+          }),
+        tabId,
+        "pageAction.setTitle",
+      );
+    }
+  } catch (err) {
+    if (isInvalidTabError(err)) {
+      return;
+    }
+    lpWarn("updatePageActionForTab failed", err);
+  }
+}
+
+async function updatePageActionForAllTabsNow() {
+  try {
+    const tabs = await lpApi.tabs.query({ currentWindow: true, active: true });
+    const activeTab = Array.isArray(tabs) && tabs.length > 0 ? tabs[0] : null;
+    if (!activeTab) return;
+    // Sentiasa guna getItems() untuk dapat data terkini dari cache/storage
+    await updatePageActionForTab(activeTab);
+  } catch (err) {
+    lpErr("Failed to update page action", err);
+  }
+}
+
+function updatePageActionForAllTabs(options = {}) {
+  const immediate = options.immediate === true;
+  const delay = immediate ? 0 : PAGE_ACTION_REFRESH_DEBOUNCE_MS;
+  if (pageActionRefreshTimer) {
+    clearTimeout(pageActionRefreshTimer);
+    pageActionRefreshTimer = null;
+  }
+  pageActionRefreshTimer = setTimeout(async () => {
+    pageActionRefreshTimer = null;
+    if (pageActionRefreshInFlight) {
+      pageActionRefreshQueued = true;
+      return;
+    }
+    pageActionRefreshInFlight = true;
+    try {
+      await updatePageActionForAllTabsNow();
+    } finally {
+      pageActionRefreshInFlight = false;
+      if (pageActionRefreshQueued) {
+        pageActionRefreshQueued = false;
+        updatePageActionForAllTabs();
+      }
+    }
+  }, delay);
+}
+
+async function loadSettings() {
+  currentSettings = await getSettings();
+  await refreshFloatingButtonAutoSuspendStateNow();
+  try {
+    await dedupeStoredItemsIfNeeded();
+  } catch (err) {
+    // ignore dedupe startup failure
+  }
+  await updateBadgeFromStorage();
+  updatePageActionForAllTabs({ immediate: true });
+  setupRediscoverAlarm();
+  // Set warna icon ikut mode hidden semasa
+  if (currentSettings) {
+    updateBadgeColorForHiddenMode(currentSettings.showHiddenCategories || 0);
+  }
+}
+
+function getHttpHostnameFromUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") return "";
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+    return parsed.hostname ? parsed.hostname.trim().toLowerCase() : "";
+  } catch (err) {
+    return "";
+  }
+}
+
+function resolveContextMenuHostname(info, tab) {
+  const candidates = [
+    tab && typeof tab.url === "string" ? tab.url : "",
+    info && typeof info.pageUrl === "string" ? info.pageUrl : "",
+    info && typeof info.frameUrl === "string" ? info.frameUrl : "",
+  ];
+  for (const candidate of candidates) {
+    const hostname = getHttpHostnameFromUrl(candidate);
+    if (hostname) return hostname;
+  }
+  return "";
+}
+
+function domainExceptionPatternMatchesHostname(hostname, pattern) {
+  const rawPattern =
+    typeof pattern === "string" ? pattern.trim().toLowerCase() : "";
+  if (!hostname || !rawPattern) return false;
+  const normalizedPattern =
+    typeof normalizeDomainExceptionEntry === "function"
+      ? normalizeDomainExceptionEntry(rawPattern)
+      : rawPattern;
+  if (!normalizedPattern) return false;
+  if (normalizedPattern === hostname) return true;
+  if (!normalizedPattern.startsWith("*.")) return false;
+  const base = normalizedPattern.slice(2);
+  if (!base) return false;
+  if (hostname === base) return true;
+  return hostname.endsWith(`.${base}`);
+}
+
+function isHostnameExcludedByFloatingList(hostname, patterns) {
+  const entries = Array.isArray(patterns) ? patterns : [];
+  return entries.some((pattern) =>
+    domainExceptionPatternMatchesHostname(hostname, pattern),
+  );
+}
+
+async function notifyFloatingDomainException(message) {
+  const shown = await showInPageToast(message);
+  if (shown) return;
+  if (!lpApi.notifications || !lpApi.notifications.create) return;
+  const iconUrl =
+    lpApi.runtime && lpApi.runtime.getURL
+      ? lpApi.runtime.getURL("icons/icon-default-32.png")
+      : "icons/icon-default-32.png";
+  const notificationId = `local-pocket-floating-domain-${Date.now()}`;
+  try {
+    const maybePromise = lpApi.notifications.create(notificationId, {
+      type: "basic",
+      title: "Floating button",
+      message,
+      iconUrl,
+    });
+    if (maybePromise && typeof maybePromise.then === "function") {
+      maybePromise.catch(() => { });
+    }
+  } catch (err) {
+    return;
+  }
+  setTimeout(() => {
+    try {
+      const maybePromise = lpApi.notifications.clear(notificationId);
+      if (maybePromise && typeof maybePromise.then === "function") {
+        maybePromise.catch(() => { });
+      }
+    } catch (err) {
+      // ignore clear errors
+    }
+  }, 2500);
+}
+
+async function handleFloatingDomainExceptionContextMenu(info, tab, action) {
+  const mode = action === "remove" ? "remove" : "add";
+  const hostname = resolveContextMenuHostname(info, tab);
+  if (!hostname) {
+    await notifyFloatingDomainException("Open an HTTP/HTTPS page first.");
+    return;
+  }
+  const normalizedHost =
+    typeof normalizeDomainExceptionEntry === "function"
+      ? normalizeDomainExceptionEntry(hostname)
+      : hostname;
+  if (!normalizedHost || normalizedHost.startsWith("*.")) {
+    await notifyFloatingDomainException("Failed to detect a valid domain.");
+    return;
+  }
+
+  const settings = await getSettings();
+  const currentList = Array.isArray(settings.floatingButtonDomainExceptions)
+    ? settings.floatingButtonDomainExceptions.slice()
+    : [];
+  let nextList = currentList.slice();
+
+  if (mode === "add") {
+    if (isHostnameExcludedByFloatingList(normalizedHost, currentList)) {
+      await notifyFloatingDomainException(
+        `Floating already hidden on ${normalizedHost}`,
+      );
+      return;
+    }
+    nextList.push(normalizedHost);
+  } else {
+    nextList = currentList.filter(
+      (pattern) =>
+        !domainExceptionPatternMatchesHostname(normalizedHost, pattern),
+    );
+    if (nextList.length === currentList.length) {
+      await notifyFloatingDomainException(
+        `No floating exception for ${normalizedHost}`,
+      );
+      return;
+    }
+  }
+
+  const normalizedList =
+    typeof normalizeDomainExceptionList === "function"
+      ? normalizeDomainExceptionList(nextList)
+      : Array.from(new Set(nextList));
+  await setSettings({ floatingButtonDomainExceptions: normalizedList });
+  if (mode === "add") {
+    await notifyFloatingDomainException(`Floating hidden on ${normalizedHost}`);
+    return;
+  }
+  await notifyFloatingDomainException(`Floating enabled on ${normalizedHost}`);
+}
+
+// createContextMenu moved to backgroundContextMenuCore.js
+
+lpApi.runtime.onInstalled.addListener(async (details) => {
+  await createContextMenu();
+  await loadSettings();
+
+  if (details.reason === "install") {
+    const optionsUrl =
+      lpApi.runtime && lpApi.runtime.getURL
+        ? lpApi.runtime.getURL("options.html")
+        : "";
+    if (optionsUrl && lpApi.tabs && lpApi.tabs.create) {
+      await lpApi.tabs.create({ url: optionsUrl });
+    } else if (lpApi.runtime && lpApi.runtime.openOptionsPage) {
+      await lpApi.runtime.openOptionsPage();
+    }
+  }
+});
+
+lpApi.browserAction.onClicked.addListener(async (tab) => {
+  await openCategoryPicker({ tabId: tab.id });
+});
+if (lpApi.pageAction && lpApi.pageAction.onClicked) {
+  lpApi.pageAction.onClicked.addListener(toggleSaveFromTab);
+}
+
+if (typeof setupContextMenuListeners === 'function') setupContextMenuListeners();
+
+const CATEGORY_PICKER_COMMAND_MAP = {
+  "picker-next-item": "open-next",
+  "picker-random-item": "open-random",
+  "picker-save-all-tabs": "save-all-tabs",
+  "picker-open-settings": "open-settings",
+  "picker-new-category": "new-category",
+  "picker-delete-category": "delete-category",
+  "picker-toggle-favorites": "toggle-favorites",
+  "picker-youtube-summary": "youtube-summary",
+  // New gesture-triggered picker commands
+  "toggle-pin-picker": "toggle-pin",
+  "toggle-auto-page-turn": "toggle-auto-page-turn",
+  "toggle-show-hidden-categories": "reset-to-all",
+};
+
+async function dispatchCategoryPickerCommand(command) {
+  if (!command || !lpApi.tabs || !lpApi.tabs.query || !lpApi.tabs.sendMessage) {
+    return { ok: false, reason: "unsupported" };
+  }
+  try {
+    const tabs = await lpApi.tabs.query({ active: true, currentWindow: true });
+    const targetTab = tabs && tabs[0] ? tabs[0] : null;
+    if (!targetTab || !targetTab.id) {
+      return { ok: false, reason: "no-active-tab" };
+    }
+    const response = await lpApi.tabs.sendMessage(targetTab.id, {
+      type: "category-picker-command",
+      command,
+    });
+    if (response && typeof response.ok === "boolean") {
+      return response;
+    }
+    // Jika picker tidak wujud/tiada handler, anggap gagal supaya fallback global boleh jalan.
+    const lastErrorMsg =
+      lpApi.runtime && lpApi.runtime.lastError ? lpApi.runtime.lastError.message : "";
+    return { ok: false, reason: lastErrorMsg || "picker-not-ready" };
+  } catch (err) {
+    return { ok: false, reason: "picker-not-ready" };
+  }
+}
+
+async function getActiveTabForCommands() {
+  if (!lpApi.tabs || !lpApi.tabs.query) return null;
+  try {
+    const tabs = await lpApi.tabs.query({ active: true, currentWindow: true });
+    return tabs && tabs[0] ? tabs[0] : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+async function openOptionsPageFromShortcut() {
+  try {
+    if (lpApi.runtime && lpApi.runtime.openOptionsPage) {
+      await lpApi.runtime.openOptionsPage();
+      return true;
+    }
+    if (lpApi.runtime && lpApi.runtime.getURL && lpApi.tabs && lpApi.tabs.create) {
+      await lpApi.tabs.create({ url: lpApi.runtime.getURL("options.html") });
+      return true;
+    }
+  } catch (err) {
+    return false;
+  }
+  return false;
+}
+
+async function getActiveTabUrlForCommands() {
+  const activeTab = await getActiveTabForCommands();
+  if (!activeTab) return "";
+  if (activeTab.url) return String(activeTab.url);
+  if (activeTab.pendingUrl) return String(activeTab.pendingUrl);
+  return "";
+}
+
+async function runGlobalCategoryShortcutFallback(command) {
+  if (
+    command !== "picker-next-item" &&
+    command !== "picker-random-item" &&
+    command !== "picker-youtube-summary" &&
+    command !== "picker-open-settings" &&
+    command !== "picker-save-all-tabs"
+  ) {
+    return false;
+  }
+  if (command === "picker-save-all-tabs") {
+    try {
+      const result = await saveAllTabsInWindow();
+      if (result && result.ok) {
+        if (result.added > 0) {
+          const skipped = Number.isFinite(result.skipped) ? result.skipped : 0;
+          if (skipped > 0) {
+            await showInPageToast(`Simpan ${result.added} tab. ${skipped} sudah wujud.`);
+          } else {
+            await showInPageToast(`Simpan ${result.added} tab.`);
+          }
+        } else if (result.skipped > 0) {
+          await showInPageToast("Semua tab sudah disimpan.");
+        } else {
+          await showInPageToast("Tiada tab untuk disimpan.");
+        }
+        return true;
+      } else if (result && result.busy) {
+        await showInPageToast("Sedang proses, sila tunggu...");
+        return false;
+      } else {
+        lpErr("Save all tabs failed:", result);
+        await showInPageToast("Gagal menyimpan tab.");
+        return false;
+      }
+    } catch (err) {
+      lpErr("Save all tabs exception:", err);
+      await showInPageToast("Ralat semasa menyimpan tab.");
+      return false;
+    }
+  }
+  if (command === "picker-open-settings") {
+    return openOptionsPageFromShortcut();
+  }
+  if (command === "picker-youtube-summary") {
+    const activeTab = await getActiveTabForCommands();
+    if (!activeTab) return false;
+    const activeUrl = activeTab.url
+      ? String(activeTab.url)
+      : activeTab.pendingUrl
+        ? String(activeTab.pendingUrl)
+        : "";
+    if (!isSummarizableUrl(activeUrl)) {
+      await showInPageToast("Buka link web dahulu.");
+      return false;
+    }
+    const selectedCategoryId = await getSelectedCategoryId();
+    const result = await openYouTubeSummaryInChatGpt(
+      {
+        url: activeUrl,
+        title: activeTab.title ? String(activeTab.title) : "",
+        categoryId: selectedCategoryId,
+      },
+      { tab: activeTab },
+    );
+    if (!result || !result.ok) {
+      await showInPageToast(
+        result && result.message
+          ? String(result.message)
+          : "Gagal hasilkan summary.",
+      );
+      return false;
+    }
+    return true;
+  }
+  const currentUrl = await getActiveTabUrlForCommands();
+  if (command === "picker-next-item") {
+    return openNextItemFromCurrentUrl(currentUrl);
+  }
+  return openRandomItem({
+    excludeUrl: currentUrl,
+  });
+}
+
+if (lpApi.commands && lpApi.commands.onCommand) {
+  lpApi.commands.onCommand.addListener(async (command) => {
+    try { lpLog("warn", "[JARVIS-DIAG] onCommand FIRED: " + command); } catch (_) {}
+    if (command === "picker-youtube-summary") {
+      const openMode = currentSettings && currentSettings.summaryOpenMode ? String(currentSettings.summaryOpenMode).trim() : "sidebar";
+      // Buka UI yang dipilih (sidebar/overlay/native-sidebar)
+      if (openMode === "overlay") {
+        await runToggleAiOverlayCommandAction();
+      } else if (openMode === "native-sidebar") {
+        try {
+          const port = ensureNativeFocusHelperPort();
+          if (port) {
+            port.postMessage({ action: "press_native_ai_shortcut", source: "localpocket-shortcut-summary", at: Date.now() });
+          } else {
+            await showInPageToast("Native helper tidak tersedia untuk buka sidebar AI asli.");
+          }
+        } catch (err) {
+          await showInPageToast("Gagal buka sidebar AI asli.");
+        }
+      } else {
+        // Hanya buka sidebar jika belum terbuka — jangan toggle/tutup
+        if (sidebarPanelOpen !== true) {
+          skipF6FocusForNextOpen = true; // Summary akan inject prompt, jangan ganggu focus halaman
+          const port = ensureNativeFocusHelperPort();
+          if (port) {
+            try {
+              const shortcut = await getOpenAiSidebarShortcut();
+              port.postMessage({ action: "press_custom_shortcut", shortcut, source: "localpocket-shortcut-summary", at: Date.now() });
+            } catch (err) {
+              await runOpenSidebarCommandAction({ shouldClose: false });
+            }
+          } else {
+            await runOpenSidebarCommandAction({ shouldClose: false });
+          }
+        }
+      }
+      // Hantar prompt untuk semua mode — content extraction + prompt submission
+      runGlobalCategoryShortcutFallback("picker-youtube-summary");
+      return;
+    }
+    if (command === "open-ai-sidebar") {
+      if (currentSettings && currentSettings.sidebarAiEnabled === false) {
+        return;
+      }
+      addSidebarFocusDebugLog("command-open-ai-sidebar");
+      const shouldClose = sidebarPanelOpen === true;
+      addSidebarFocusDebugLog("toggle-decision", {
+        shouldClose,
+        sidebarPanelOpen,
+        sidebarCurrentMode,
+        sidebarCurrentProvider,
+      });
+      // Kedua-dua open() dan close() MESTI dipanggil synchronously sebelum await pertama
+      // kerana Firefox hanya benarkan sidebarAction lpApi dalam user input handler
+      if (shouldClose) {
+        if (lpApi.sidebarAction && typeof lpApi.sidebarAction.close === "function") {
+          try {
+            lpApi.sidebarAction.close();
+            sidebarPanelOpen = false;
+            addSidebarFocusDebugLog("toggle-close-sync-success");
+          } catch (err) {
+            addSidebarFocusDebugLog("toggle-close-sync-error", { error: err && err.message ? err.message : String(err) });
+          }
+        } else {
+          addSidebarFocusDebugLog("toggle-close-sync-lpApi-unavailable");
+        }
+        // Selepas close, terus return — tidak perlu buat apa-apa lagi
+        broadcastJarvisSidebarState().catch(function () {});
+        return;
+      } else {
+        skipF6FocusForNextOpen = true; // User trigger manual sidebar open, jangan ganggu focus halaman
+        if (lpApi.sidebarAction && lpApi.sidebarAction.open) {
+          try { lpApi.sidebarAction.open(); } catch (err) {
+            addSidebarFocusDebugLog("toggle-open-sync-error", { error: err && err.message ? err.message : String(err) });
+          }
+        }
+      }
+      await runOpenSidebarCommandAction({ shouldClose });
+      broadcastJarvisSidebarState().catch(function () {});
+      return;
+    }
+    if (command === "toggle-notes-overlay") {
+      await runOpenNotesSidebarCommandAction();
+      return;
+    }
+    if (command === "toggle-ai-overlay") {
+      await runToggleAiOverlayCommandAction();
+      return;
+    }
+    if (command === "toggle-pomodoro-overlay") {
+      await runTogglePomodoroOverlayCommandAction();
+      return;
+    }
+    if (command === "open-jarvis-sidebar") {
+      // Firefox: tukar SELURUH panel sidebar ke jarvisSidebar.html kerana
+      // halaman extension TAK boleh di-iframe dalam sidebar Firefox.
+      // Chrome/Edge: tiada sidebarAction — muat JARVIS dalam iframe (Chrome
+      // benarkan extension page dalam iframe).
+      try { lpLog("debug", "[JARVIS] open-jarvis-sidebar: opening JARVIS sidebar"); } catch (_) {}
+      try {
+        // Kekal mod = sidebar supaya buka semula (toggle-jarvis) ingat flip.
+        // Fire-and-forget (JANGAN await) supaya sidebarAction.open() di bawah
+        // kekal dalam context gesture (user input handler) Firefox.
+        const nextJarvisSettings = Object.assign({}, currentSettings || {}, { jarvisOpenMode: "sidebar" });
+        currentSettings = nextJarvisSettings;
+        lpStoreSet({ [SETTINGS_KEY]: nextJarvisSettings }).catch(function () {});
+      } catch (e) {}
+      // Togol-tutup: jika toggleJarvisByMode minta tutup dan panel JARVIS aktif.
+      if (jarvisCloseViaToggle && currentSidebarPanel === "jarvis") {
+        jarvisCloseViaToggle = false;
+        try {
+          if (lpApi && lpApi.sidebarAction && lpApi.sidebarAction.close) {
+            await lpApi.sidebarAction.close();
+          }
+        } catch (e) {}
+        sidebarPanelOpen = false;
+        sidebarCurrentMode = "ai";
+        currentSidebarPanel = "ai";
+        try { broadcastJarvisSidebarState().catch(function () {}); } catch (e) {}
+        return;
+      }
+      jarvisCloseViaToggle = false;
+      // Tanda buka semula supaya kod lain (reset-sidebar-panel) tak tukar panel.
+      jarvisReopening = Date.now();
+      // Langkah 1: sync open() — kekal dalam gesture context Firefox. Ini buka
+      // sidebar dengan panel semasa (mungkin AI). Guna try-catch, gagal OK.
+      try {
+        if (lpApi && lpApi.sidebarAction && lpApi.sidebarAction.open) {
+          var _sao = lpApi.sidebarAction.open();
+          if (_sao && typeof _sao.catch === "function") _sao.catch(function () {});
+        }
+      } catch (e) {}
+      // Langkah 2: async setPanel + reopen — guna openLocalPocketSidebar dengan
+      // panel jarvisSidebar.html. Pada tahap ini sidebar sudah terbuka, jadi
+      // await tidak hilangkan gesture context (FX benarkan open() tanpa gesture).
+      try {
+        await openLocalPocketSidebar(null, {
+          mode: "ai",
+          forceReload: true,
+          jarvis: true,
+          panel: "jarvisSidebar.html"
+        });
+      } catch (e) {}
+      // Flags sudah diset oleh openLocalPocketSidebar (dengan jarvis: true).
+      // Pastikan jarvisReopening dikemas kini.
+      try { jarvisReopening = Date.now(); } catch (e) {}
+      broadcastJarvisSidebarState().catch(function () {});
+      return;
+    }
+    if (command === "_execute_sidebar_action") {
+      // Allow native sidebar action, but we only override focus if AI is enabled
+      // If disabled, just let the sidebar toggle. Actually, `runOpenSidebarCommandAction` will handle it.
+      addSidebarFocusDebugLog("command-execute-sidebar-action");
+      try { lpLog("debug", "[JARVIS] execute-sidebar: currentSidebarPanel=" + currentSidebarPanel + " sidebarPanelOpen=" + sidebarPanelOpen + " sidebarCurrentMode=" + sidebarCurrentMode); } catch (_) {}
+      const shouldClose = sidebarPanelOpen === true;
+      addSidebarFocusDebugLog("toggle-decision", {
+        shouldClose,
+        sidebarPanelOpen,
+        sidebarCurrentMode,
+        sidebarCurrentProvider,
+      });
+      // Kedua-dua open() dan close() MESTI dipanggil synchronously sebelum await pertama
+      if (shouldClose) {
+        if (lpApi.sidebarAction && typeof lpApi.sidebarAction.close === "function") {
+          try {
+            lpApi.sidebarAction.close();
+            sidebarPanelOpen = false;
+            addSidebarFocusDebugLog("toggle-close-sync-success");
+          } catch (err) {
+            addSidebarFocusDebugLog("toggle-close-sync-error", { error: err && err.message ? err.message : String(err) });
+          }
+        } else {
+          addSidebarFocusDebugLog("toggle-close-sync-lpApi-unavailable");
+        }
+        broadcastJarvisSidebarState().catch(function () {});
+        return;
+      } else {
+        // Guard: JARVIS sedang dipaparkan, baru dibuka, atau jarvisOpenMode aktif —
+        // jangan override panel dengan AI. Buka JARVIS sebaliknya.
+        var _jarvisMode = currentSettings && currentSettings.jarvisOpenMode === "sidebar";
+        if (currentSidebarPanel === "jarvis" || Date.now() - jarvisReopening < 1200 || _jarvisMode) {
+          try { lpLog("debug", "[JARVIS] execute-sidebar: JARVIS guard trigger (panel=" + currentSidebarPanel + " reopen=" + (Date.now() - jarvisReopening) + "ms jarvisOpenMode=" + _jarvisMode + "), redirect ke JARVIS"); } catch (_) {}
+          try {
+            if (lpApi.sidebarAction && typeof lpApi.sidebarAction.setPanel === "function") {
+              lpApi.sidebarAction.setPanel({ panel: lpApi.runtime.getURL("jarvisSidebar.html") });
+            }
+          } catch (e) {}
+          try { if (lpApi.sidebarAction && lpApi.sidebarAction.open) lpApi.sidebarAction.open(); } catch (e) {}
+          sidebarPanelOpen = true;
+          sidebarCurrentMode = "jarvis";
+          broadcastJarvisSidebarState().catch(function () {});
+          return;
+        }
+        if (lpApi.sidebarAction && lpApi.sidebarAction.open) {
+          try { lpApi.sidebarAction.open(); } catch (err) {
+            addSidebarFocusDebugLog("toggle-open-sync-error", { error: err && err.message ? err.message : String(err) });
+          }
+        }
+      }
+      await runOpenSidebarCommandAction({ shouldClose });
+      broadcastJarvisSidebarState().catch(function () {});
+      return;
+    }
+    if (command === "save-to-local-pocket") {
+      const tabs = await lpApi.tabs.query({ active: true, currentWindow: true });
+      if (tabs && tabs[0]) {
+        toggleSaveFromTab(tabs[0]);
+      }
+      return;
+    }
+    if (command === "toggle-jarvis") {
+      // Togol JARVIS (buka/tutup) mengikut default (settings.jarvisMode).
+      await toggleJarvisByMode();
+      return;
+    }
+    if (command === "save-current-tab-favorite") {
+      const activeTab = await getActiveTabForCommands();
+      if (!activeTab) return;
+      const result = await saveCurrentTabEntry(activeTab, { favorite: true });
+      if (result && result.ok) {
+        await showInPageToast("Disimpan ke Favorite.");
+      } else {
+        await showInPageToast("Gagal simpan ke Favorite.");
+      }
+      return;
+    }
+    if (command === "open-first-item") {
+      await openFirstItem();
+      return;
+    }
+    if (command === "open-random-item") {
+      await openRandomItem();
+      return;
+    }
+    if (command === "cycle-category") {
+      await cycleCategory(1);
+      return;
+    }
+    if (command === "cycle-category-prev") {
+      await cycleCategory(-1);
+      return;
+    }
+    if (command === "open-category-picker") {
+      try {
+        await toggleCategoryPicker();
+      } catch (err) {
+        lpWarn("Category picker toggle failed", err);
+      }
+      return;
+    }
+    if (command === "open-firefox-native-ai-sidebar") {
+      // Use native helper to send Ctrl+Alt+X (Firefox built-in AI sidebar shortcut)
+      try {
+        const port = ensureNativeFocusHelperPort();
+        if (port) {
+          port.postMessage({
+            action: "press_native_ai_shortcut",
+            source: "localpocket-firefox-native-ai",
+            at: Date.now(),
+          });
+        } else {
+          await showInPageToast("Native helper tidak tersedia. Pasang native helper dahulu.");
+        }
+      } catch (err) {
+        lpWarn("Failed to send native AI sidebar shortcut:", err);
+        await showInPageToast("Gagal hantar shortcut AI sidebar.");
+      }
+      return;
+    }
+    if (command === "copy-sidebar-selection-debug-log") {
+      const ok = await copySidebarSelectionDebugLogFromTabs();
+      if (ok) {
+        await showInPageToast("Log selection sidebar disalin ke clipboard.");
+      } else {
+        await showInPageToast("Gagal salin log. Buka sidebar AI dahulu.");
+      }
+      return;
+    }
+    if (command === "toggle-random-across-all") {
+      const settings = await getSettings();
+      const next = !settings.randomAcrossAllCategories;
+      await setSettings({ randomAcrossAllCategories: next });
+      await showInPageToast(
+        next
+          ? "🌐🎲 Random merentas semua kategori: AKTIF"
+          : "🎲 Random hanya dari kategori semasa"
+      );
+      return;
+    }
+    if (CATEGORY_PICKER_COMMAND_MAP[command]) {
+      const result = await dispatchCategoryPickerCommand(
+        CATEGORY_PICKER_COMMAND_MAP[command],
+      );
+      if (result && result.ok) {
+        return;
+      }
+      if (result && !result.reason) {
+        return;
+      }
+      await runGlobalCategoryShortcutFallback(command);
+      return;
+    }
+  });
+}
+
+if (lpApi.runtime && lpApi.runtime.onConnect && lpApi.runtime.onConnect.addListener) {
+  lpApi.runtime.onConnect.addListener((port) => {
+    if (!port || !SIDEBAR_AI_FOCUS_PORT_NAMES.has(port.name)) return;
+    sidebarChatFocusPorts.add(port);
+    addSidebarFocusDebugLog("sidebar-focus-port-connected", {
+      name: port.name,
+      portCount: sidebarChatFocusPorts.size,
+    });
+    if (lastObservedSidebarOpenState !== true) {
+      lastObservedSidebarOpenState = true;
+      consecutiveSidebarOpenPolls = SIDEBAR_OPEN_TRUE_POLLS_REQUIRED;
+      consecutiveSidebarClosedPolls = 0;
+      addSidebarFocusDebugLog("sidebar-open-inferred-by-port", {
+        name: port.name,
+      });
+      emitSidebarChatFocusSignal();
+      requestFocusViaSidebarPorts();
+    }
+    try {
+      port.onDisconnect.addListener(() => {
+        sidebarChatFocusPorts.delete(port);
+        lastSidebarPortDisconnectAt = Date.now();
+        addSidebarFocusDebugLog("sidebar-focus-port-disconnected", {
+          name: port.name,
+          portCount: sidebarChatFocusPorts.size,
+        });
+        if (sidebarChatFocusPorts.size === 0) {
+          setTimeout(async () => {
+            if (sidebarChatFocusPorts.size === 0) {
+              const actualOpen = await isSidebarOpen();
+              if (actualOpen === false || actualOpen === null) {
+                sidebarPanelOpen = false;
+                addSidebarFocusDebugLog("sidebar-closed-by-disconnect");
+              }
+            }
+          }, 1000);
+        }
+      });
+    } catch (err) {
+      // ignore
+    }
+    try {
+      port.postMessage({ type: "focus-input", forceFocus: true });
+      addSidebarFocusDebugLog("sidebar-focus-port-initial-pulse", {
+        name: port.name,
+      });
+    } catch (err) {
+      // ignore
+    }
+    const pendingNativeF6 = consumeNativeF6SidebarFocusOnNextPortConnect();
+    if (pendingNativeF6) {
+      addSidebarFocusDebugLog("native-f6-port-connect-consumed", {
+        trigger: pendingNativeF6.reason,
+        ageMs: Date.now() - pendingNativeF6.armedAt,
+      });
+      scheduleNativeF6SidebarFocusFromPort(port, pendingNativeF6.reason);
+    } else {
+      const now = Date.now();
+      const sinceDisconnectMs = lastSidebarPortDisconnectAt
+        ? now - lastSidebarPortDisconnectAt
+        : Number.POSITIVE_INFINITY;
+      const sinceLastReconnectF6Ms = now - lastSidebarPortReconnectF6At;
+      if (
+        sinceDisconnectMs <= SIDEBAR_PORT_RECONNECT_F6_WINDOW_MS &&
+        sinceLastReconnectF6Ms >= SIDEBAR_PORT_RECONNECT_F6_COOLDOWN_MS
+      ) {
+        lastSidebarPortReconnectF6At = now;
+        addSidebarFocusDebugLog("native-f6-port-connect-reconnect", {
+          trigger: "sidebar-port-reconnect",
+          sinceDisconnectMs,
+        });
+        scheduleNativeF6SidebarFocusFromPort(port, "sidebar-port-reconnect");
+      }
+    }
+    queueSidebarPortFocusPulses(port);
+  });
+}
+
+startSidebarOpenWatcher();
+
+async function forceUnsaveAndSaveByUrl(url, tab) {
+  if (!url || !tab || !tab.id) return;
+  try {
+    const normalized = normalizeUrl(url);
+    const items = await getItems();
+    const existing = items.find(it => it && urlsMatchForSave(normalized, it.url || ""));
+
+    if (!existing) return;
+
+    // Simpan kategori dan status kegemaran asal
+    const originalCategoryId = existing.categoryId || "";
+    const originalFavorite = !!existing.favorite;
+
+    // 1. Unsave (Padam dari senarai buat sementara waktu)
+    await removeItemByUrl(normalized);
+
+    // Beri maklum balas visual pada icon (tukar ke warna kelabu/default)
+    updatePageActionForTab(tab);
+
+    // 2. Tunggu lebih lama (1.5 saat) untuk pastikan storage benar-benar dikemaskini
+    await new Promise(r => setTimeout(r, 1500));
+
+    // 3. Save Semula (Picu ekstraksi metadata baru dari tab)
+    await saveFromTab(tab, { forcedCategoryId: originalCategoryId });
+
+    // 4. Kemas kini status kegemaran jika perlu
+    if (originalFavorite) {
+      await updateItems((current) => current.map((item) => {
+        if (item && urlsMatchForSave(normalized, item.url)) {
+          return { ...item, favorite: true };
+        }
+        return item;
+      }));
+    }
+
+    flashHint("Thumbnail dikemaskini!");
+  } catch (err) {
+    lpErr("Gagal melakukan unsave/save pantas:", err);
+  }
+}
+
+async function getOpenAiSidebarShortcut() {
+  try {
+    if (lpApi.commands && typeof lpApi.commands.getAll === "function") {
+      const commands = await lpApi.commands.getAll();
+      const cmd = commands.find(c => c.name === "open-ai-sidebar");
+      if (cmd && cmd.shortcut) {
+        return cmd.shortcut;
+      }
+    }
+  } catch (err) {
+    lpErr("Failed to get command shortcuts:", err);
+  }
+  return "Alt+Shift+I"; // Default fallback
+}
+
+// Pintasan untuk membuka panel JARVIS penuh (jarvisSidebar.html) di sidebar.
+// Berbeza daripada open-ai-sidebar (Alt+Shift+I) yang membuka panel AI biasa.
+async function getOpenJarvisSidebarShortcut() {
+  try {
+    if (lpApi.commands && typeof lpApi.commands.getAll === "function") {
+      const commands = await lpApi.commands.getAll();
+      const cmd = commands.find(c => c.name === "open-jarvis-sidebar");
+      if (cmd && cmd.shortcut) {
+        return cmd.shortcut;
+      }
+    }
+  } catch (err) {
+    lpErr("Failed to get JARVIS sidebar shortcut:", err);
+  }
+  return "Alt+Shift+J"; // Default fallback
+}
+
+function fallbackSyncOpenClose(windowId, sendResponse) {
+  // Jangan tutup sidebar jika ia sudah terbuka — hantar prompt sahaja
+  const shouldClose = false;
+  if (lpApi.sidebarAction && lpApi.sidebarAction.open) {
+    try {
+      if (windowId !== null) {
+        lpApi.sidebarAction.open({ windowId });
+      } else {
+        lpApi.sidebarAction.open();
+      }
+    } catch (err) {}
+  }
+  (async () => {
+    try {
+      const ok = await runOpenSidebarCommandAction({ shouldClose });
+      if (sendResponse) sendResponse({ ok });
+    } catch (err) {
+      if (sendResponse) {
+        sendResponse({ ok: false, error: getErrorMessage(err) });
+      }
+    }
+  })();
+  return true;
+}
+
+// When a tab navigates to a new URL (main frame), tell the JARVIS content
+// script to flush + re-seed its element hints so they never accumulate
+// against a stale DOM (performance/memory hygiene). Best-effort message.
+// Registered ONCE at top level — previously this lived inside the message
+// handler, so every unmatched message added a fresh duplicate listener
+// (memory/perf leak).
+try {
+  if (lpApi.webNavigation && lpApi.webNavigation.onCommitted && lpApi.webNavigation.onCommitted.addListener) {
+    lpApi.webNavigation.onCommitted.addListener(function (details) {
+      try {
+        if (!details || details.frameId !== 0) return; // main frame only
+        var tabId = details.tabId;
+        if (typeof tabId !== "number") return;
+        sendMessageToTabSafe(tabId, { type: "jarvis-flush-element-hints", tabId: tabId });
+      } catch (e) {}
+    });
+  }
+} catch (e) {}
+
+  // Buka JARVIS mengikut settings.jarvisOpenMode (sidebar = panel penuh,
+  // overlay = overlay terapung pada tab aktif). Dikongsi oleh mesej
+  // "open-jarvis-sidebar" dan pintasan "toggle-jarvis" (F4) supaya kedua-dua
+  // pemicu membuka JARVIS dalam mode default yang SAMA — ditetapkan butang
+  // "Tukar paparan JARVIS" di dalam panel.
+  async function openJarvisByMode(sendResponse, promptText, forceMode) {
+    // Tentu mod sasaran: guna forceMode (daripada butang flip) jika diberi,
+    // selain itu ikut settings.jarvisOpenMode (default buka JARVIS).
+    var targetMode = (forceMode === "overlay" || forceMode === "sidebar")
+      ? forceMode
+      : (currentSettings && currentSettings.jarvisOpenMode === "overlay" ? "overlay" : "sidebar");
+    try {
+      // Kekal mod JARVIS yang dibuka supaya pintasan/gestur seterusnya
+      // (toggle-jarvis / F4) buka semula dalam mod SAMA — iaitu "ingat flip
+      // terakhir" (overlay ⇄ sidebar). Tanpa ini, handler open-jarvis-overlay
+      // di bawah akan menulis semula settings dengan currentSettings yang
+      // mungkin belum dikemas kini, lalu membatalkan nilai jarvisOpenMode.
+      try {
+        const nextJarvisSettings = Object.assign({}, currentSettings || {}, { jarvisOpenMode: targetMode });
+        currentSettings = nextJarvisSettings;
+        // JANGAN `await` di sini: ia akan hilangkan context "user input" (gesture)
+        // yang diperlukan Firefox untuk sidebarAction.open()/close(). Biar tulis
+        // storage berjalan di latar (fire-and-forget) supaya panggilan buka/tutup
+        // kekal dalam gesture asal.
+        lpStoreSet({ [SETTINGS_KEY]: nextJarvisSettings }).catch(function () {});
+      } catch (e) {}
+      if (targetMode === "overlay") {
+        try {
+          const tabsArr = await lpApi.tabs.query({ active: true, currentWindow: true });
+          if (tabsArr && tabsArr.length) {
+            await sendMessageToTabSafe(tabsArr[0].id, {
+              type: "toggle-jarvis-overlay",
+              open: true,
+              prompt: (typeof promptText === "string" && promptText) ? promptText : null
+            });
+          }
+        } catch (e) {}
+        if (sendResponse) sendResponse({ ok: true });
+        return;
+      }
+      // JARVIS "sidebar" = panel penuh (jarvisSidebar.html) yang memuatkan
+      // jarvisOverlay.js dalam mod SIDEBAR_HOST — rupa & fungsi SAMA PERSIS
+      // macam overlay, cuma berlabuh di sidebar asli.
+      var nhPort = null;
+      try { nhPort = ensureNativeFocusHelperPort(); } catch (e) {}
+      if (nhPort) {
+        try {
+          var jarvisSc = await getOpenJarvisSidebarShortcut();
+          nhPort.postMessage({
+            action: "press_custom_shortcut",
+            shortcut: jarvisSc,
+            source: "localpocket-jarvis-sidebar-msg",
+            at: Date.now()
+          });
+          // Jejak supaya toggle boleh kesan & tutup panel JARVIS kemudian
+          // (native helper hanya menekan shortcut buka, bukan menogol).
+          sidebarPanelOpen = true;
+          sidebarCurrentMode = "jarvis";
+          currentSidebarPanel = "jarvis";
+          jarvisReopening = Date.now();
+          jarvisCloseViaToggle = false;
+          try { broadcastJarvisSidebarState().catch(function () {}); } catch (e) {}
+          if (sendResponse) sendResponse({ ok: true });
+          return; // Native helper berjaya — selesai di sini.
+        } catch (e) {
+          try { lpLog("warn", "[JARVIS] openJarvisByMode: native helper gagal, guna fallback — " + getErrorMessage(e)); } catch (_) {}
+          // Gagal — terus ke fallback di bawah.
+        }
+        // JANGAN return di sini: biar jatuh ke fallback supaya JARVIS tetap terbuka
+        // walaupun native helper gagal (elak flag desync + panel tak terbuka).
+      }
+      // Fallback (tiada native helper / mahu buka terus):
+      // Langkah 1: sync open() dulu untuk kekalkan gesture context (Firefox).
+      try {
+        if (lpApi && lpApi.sidebarAction && lpApi.sidebarAction.open) {
+          var _sao2 = lpApi.sidebarAction.open();
+          if (_sao2 && typeof _sao2.catch === "function") _sao2.catch(function () {});
+        }
+      } catch (e) {}
+      // Langkah 2: guna openLocalPocketSidebar dengan panel jarvisSidebar.html
+      // untuk set panel dan reopen (sidebar sudah terbuka, await selamat).
+      try {
+        await openLocalPocketSidebar(null, {
+          mode: "ai",
+          forceReload: true,
+          jarvis: true,
+          panel: "jarvisSidebar.html"
+        });
+      } catch (e) {}
+      // Flags sudah diset oleh openLocalPocketSidebar (dengan jarvis: true).
+      jarvisReopening = Date.now();
+      jarvisCloseViaToggle = false;
+      try { broadcastJarvisSidebarState().catch(function () {}); } catch (e) {}
+      if (sendResponse) sendResponse({ ok: true });
+    } catch (err) {
+      if (sendResponse) sendResponse({ ok: false, error: getErrorMessage(err) });
+    }
+  }
+
+  // Togol JARVIS (buka KALAU tertutup, tutup KALAU terbuka) mengikut
+  // settings.jarvisOpenMode. Dikongsi oleh pintasan papan kekunci "toggle-jarvis"
+  // (F4) DAN gestur "toggle-jarvis" supaya kedua-dua pemicu benar-benar togol.
+  //  - Mode "overlay": hantar mesej tanpa bendera `open` supaya overlay terapung
+  //    pada tab aktif togol sendiri (buka/tutup).
+  //  - Mode "sidebar": jika panel JARVIS sudah terbuka, tutup; jika tertutup, buka.
+  async function toggleJarvisByMode() {
+    try {
+      // Debounce: elak key-repeat / gesture berkembar buka semula panel sejurus
+      // selepas ditutup (punca "toggle buka Gemini" dan bukannya tutup).
+      const _now = Date.now();
+      if (_now - lastToggleJarvisAt < 400) return;
+      lastToggleJarvisAt = _now;
+      try { lpLog("debug", "[JARVIS] toggleJarvisByMode: jarvisOpenMode=" + (currentSettings && currentSettings.jarvisOpenMode) + " sidebarPanelOpen=" + sidebarPanelOpen + " sidebarCurrentMode=" + sidebarCurrentMode + " currentSidebarPanel=" + currentSidebarPanel); } catch (_) {}
+      if (currentSettings && currentSettings.jarvisOpenMode === "overlay") {
+        const tabsArr = await lpApi.tabs.query({ active: true, currentWindow: true });
+        if (tabsArr && tabsArr.length) {
+          await sendMessageToTabSafe(tabsArr[0].id, { type: "toggle-jarvis-overlay" });
+        }
+        return;
+      }
+      // Mode sidebar (panel penuh). Keputusan buka/tutup guna flag penjejak
+      // yang diselaraskan di semua pintu buka/tutup.
+      const jarvisSidebarOpen =
+        (sidebarPanelOpen === true && sidebarCurrentMode === "jarvis") ||
+        currentSidebarPanel === "jarvis";
+      if (jarvisSidebarOpen) {
+        // TUTUP: sidebarAction.close() HANYA dibenarkan dalam context gesture
+        // sebenar. Background tak boleh panggil terus (Firefox ~140 menolak
+        // "may only be called from a user input handler"). Jadi tekan shortcut
+        // open-jarvis-sidebar via native helper — ia menghasilkan keypress
+        // sebenar yang mencetuskan command tersebut, yang kini BERTOGGEL:
+        // bila JARVIS sudah terbuka, command tutup panel (close() dalam gesture
+        // sah). Flag disekalikan oleh command handler itu sendiri.
+        // Tandakan supaya command open-jarvis-sidebar (dicetus native helper)
+        // tahu ia perlu TUTUP, bukan buka.
+        jarvisCloseViaToggle = true;
+        let nhPort = null;
+        try { nhPort = ensureNativeFocusHelperPort(); } catch (e) {}
+        if (nhPort) {
+          try {
+            const jarvisSc = await getOpenJarvisSidebarShortcut();
+            nhPort.postMessage({
+              action: "press_custom_shortcut",
+              shortcut: jarvisSc,
+              source: "localpocket-jarvis-toggle-close",
+              at: Date.now()
+            });
+          } catch (e) {}
+          // Keselamatan: reset flag jika command tak sempat jalan (native helper gagal).
+          setTimeout(function () { jarvisCloseViaToggle = false; }, 1500);
+        } else {
+          // Fallback (tiada native helper): cuba close terus — mungkin gagal
+          // gesture, tapi elok dicuba, dan sekurang-kurangnya betulkan flag.
+          try { if (lpApi.sidebarAction && lpApi.sidebarAction.close) lpApi.sidebarAction.close().catch(function () {}); } catch (e) {}
+          sidebarPanelOpen = false;
+          sidebarCurrentMode = "ai";
+          currentSidebarPanel = "ai";
+        }
+        try { broadcastJarvisSidebarState().catch(function () {}); } catch (e) {}
+        return;
+      }
+      // Tertutup — buka (native helper menogol, atau fallback buka panel).
+      await openJarvisByMode(null);
+    } catch (err) {
+      lpWarn("toggleJarvisByMode failed", err);
+    }
+  }
+
+// ── Hover Image Search: helper to fetch an external image as data URL ──
+function fetchImageAsDataUrlInBackground(url) {
+  if (!url || typeof url !== "string") return Promise.resolve(null);
+  if (url.startsWith("data:")) return Promise.resolve(url);
+  return new Promise(function (resolve) {
+    try {
+      var xhr = new XMLHttpRequest();
+      xhr.open("GET", url, true);
+      xhr.responseType = "blob";
+      xhr.onload = function () {
+        if (xhr.status >= 200 && xhr.status < 300 && xhr.response) {
+          var reader = new FileReader();
+          reader.onloadend = function () { resolve(reader.result); };
+          reader.onerror = function () { resolve(null); };
+          reader.readAsDataURL(xhr.response);
+        } else { resolve(null); }
+      };
+      xhr.onerror = function () { resolve(null); };
+      xhr.ontimeout = function () { resolve(null); };
+      xhr.timeout = 8000;
+      xhr.send();
+    } catch (err) { resolve(null); }
+  });
+}
+// ── End Hover Image Search helper ──
+
+lpApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!message || typeof message !== "object") return;
+  // Track the most recent tab that sent a message from our content scripts / overlay
+  // so we can route replies (e.g. lp-insert-ai-text) even when sender.tab is undefined
+  // (which happens for messages relayed via an extension page like sidebar.js).
+    if (sender && sender.tab && typeof sender.tab.id === "number") {
+      lastOverlayTabId = sender.tab.id;
+    }
+    // #4 Cross-tab Context Awareness: delegasikan mesej store konteks tab ke
+    // modul tabContextStore (jika dimuat).
+    if (typeof LocalPocketTabContextStore !== "undefined" &&
+        typeof LocalPocketTabContextStore.handleMessage === "function" &&
+        LocalPocketTabContextStore.handleMessage(message, sender, sendResponse)) {
+      return true;
+    }
+     if (message.type === "jarvis-get-tab-id") {
+      if (sendResponse) sendResponse(sender && sender.tab ? sender.tab.id : null);
+     return true;
+   }
+    if (message.type === "jarvis-arm-pending-plan") {
+     // A page action (e.g. filling a search box + Enter) triggered a navigation.
+     // Arm the remaining plan on this tab so it is delivered once the newly
+     // loaded page finishes loading. Reuses the same reliable onUpdated delivery
+     // as the explicit navigate/open_url pending-plan handoff.
+     var tid = sender && sender.tab ? sender.tab.id : null;
+     if (tid && message.plan && message.plan.length && typeof armPlanOnLoad === "function") {
+       armPlanOnLoad(tid, message.plan, message.userText || "");
+     }
+     if (sendResponse) sendResponse({ ok: true });
+     return true;
+   }
+    if (message.type === "reset-sidebar-panel") {
+     // Elak revert semasa JARVIS sedang dibuka/dibuka semula: close() dalam
+     // pembukaan semula memicu pagehide yang memanggil mesej ini, dan kalau kita
+     // tukar panel ke sidebar.html (Gemini) serta-merta, penjejak "jarvis" akan
+     // tersasar & toggel gagal tutup JARVIS (buka Gemini berulang).
+     if (Date.now() - jarvisReopening < 1200) {
+       try { currentSidebarPanel = "jarvis"; } catch (e) {}
+       if (sendResponse) sendResponse({ ok: true });
+       return true;
+     }
+     // Guard tambahan: currentSidebarPanel masih "jarvis" — jangan reset panel.
+     // Ini memastikan panel JARVIS kekal sebagai panel aktif walaupun selepas
+     // pagehide, supaya bukaan sidebar seterusnya tidak tersasar ke AI.
+     if (currentSidebarPanel === "jarvis") {
+       try { lpLog("debug", "[JARVIS] reset-sidebar-panel: panel jarvis aktif, skip reset"); } catch (_) {}
+       if (sendResponse) sendResponse({ ok: true });
+       return true;
+     }
+     // Bersihkan panel tersimpan kembali ke sidebar.html (tanpa param ?jarvis=1)
+     // supaya bukaan sidebar seterusnya papar AI/Gemini, bukan JARVIS. TIDAK
+     // tutup/buka semula supaya paparan JARVIS semasa (dalam iframe) kekal.
+     (async () => {
+       try {
+         try {
+           const nextSettings = Object.assign({}, currentSettings || {}, { sidebarMode: "ai" });
+           currentSettings = nextSettings;
+           await lpStoreSet({ [SETTINGS_KEY]: nextSettings });
+         } catch (err) {}
+         try {
+           if (lpApi.sidebarAction && typeof lpApi.sidebarAction.setPanel === "function") {
+             await lpApi.sidebarAction.setPanel({ panel: lpApi.runtime.getURL("sidebar.html") });
+           }
+         } catch (e) {}
+         currentSidebarPanel = "ai"; // panel sebenar kini sidebar.html (AI/Gemini)
+         if (sendResponse) sendResponse({ ok: true });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, error: getErrorMessage(err) });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "sidebar-request-ai-focus") {
+    // Sidebar requested focus for the provider iframe. Use the reliable port
+    // channel (content script already listens for "focus-input" on its port)
+    // instead of relying on a postMessage into the cross-origin iframe.
+    emitSidebarChatFocusSignal();
+    requestFocusViaSidebarPorts();
+    if (sendResponse) sendResponse({ ok: true });
+    return true;
+  }
+  if (message.type === "get-saved-items") {
+    // Return saved articles so the notes overlay can include them in global search.
+    return lpStoreGet(ITEM_KEY).then((data) => {
+      const items = coerceArray(data && data[ITEM_KEY]);
+      if (sendResponse) sendResponse({ ok: true, items });
+      return { ok: true, items };
+    }).catch((err) => {
+      if (sendResponse) sendResponse({ ok: false, reason: "storage-error" });
+      return { ok: false, reason: "storage-error" };
+    });
+  }
+  if (message.type === "extracted") {
+    const senderTabId =
+      sender && sender.tab && sender.tab.id ? sender.tab.id : null;
+    const { hasForcedCategory, forcedCategoryId } =
+      consumePendingContextMenuCategory(senderTabId);
+    const saveOptions = hasForcedCategory ? { forcedCategoryId } : {};
+
+    // Check if this extraction is part of "save all tabs"
+    if (senderTabId && saveAllTabsIds.has(senderTabId)) {
+      saveAllTabsIds.delete(senderTabId);
+      saveAllTabsPending--;
+      if (saveAllTabsPending <= 0 && saveAllTabsResolver) {
+        saveAllTabsResolver();
+        saveAllTabsResolver = null;
+      }
+    }
+
+    return saveExtracted(
+      message.payload,
+      sender && sender.tab ? sender.tab.title : "",
+      saveOptions,
+    ).then((result) => {
+      if (result && result.ok) {
+        if (sender && sender.tab) {
+          updatePageActionForTab(sender.tab);
+        } else {
+          updatePageActionForAllTabs();
+        }
+        // Maklumkan Category Picker untuk refresh data
+        const notifyRefresh = () => {
+          if (lpApi.runtime && lpApi.runtime.sendMessage) {
+            lpApi.runtime.sendMessage({ type: "refresh-picker-ui" }).catch(() => { });
+          }
+          if (sender && sender.tab && sender.tab.id && lpApi.tabs && lpApi.tabs.sendMessage) {
+            lpApi.tabs.sendMessage(sender.tab.id, { type: "refresh-picker-ui" }).catch(() => { });
+          }
+        };
+
+        notifyRefresh();
+        // Jeda sekejap dan hantar semula untuk pastikan UI dikemas kini di Firefox
+        setTimeout(notifyRefresh, 500);
+        setTimeout(notifyRefresh, 2000);
+      }
+      if (
+        result &&
+        result.ok &&
+        currentSettings.closeOnSave &&
+        sender &&
+        sender.tab &&
+        sender.tab.id
+      ) {
+        lpApi.tabs.remove(sender.tab.id);
+      }
+      return result;
+    });
+  }
+  if (message.type === "request-badge") {
+    return updateBadgeFromStorage();
+  }
+  if (message.type === "open-options") {
+    if (lpApi.runtime && lpApi.runtime.openOptionsPage) {
+      lpApi.runtime.openOptionsPage();
+    }
+    if (sendResponse) sendResponse({ ok: true });
+    return true;
+  }
+  if (message.type === "category-picker-command") {
+    const cmd = message.command ? String(message.command) : "";
+    if (cmd) {
+      dispatchCategoryPickerCommand(cmd).then((result) => {
+        if (sendResponse) sendResponse(result);
+      }).catch(() => {
+        if (sendResponse) sendResponse({ ok: false, reason: "dispatch-failed" });
+      });
+      return true;
+    }
+  }
+  if (message.type === "open-native-helper-setup") {
+    openNativeHelperSetupPage().then((ok) => {
+      if (sendResponse) sendResponse({ ok: !!ok });
+    }).catch(() => {
+      if (sendResponse) sendResponse({ ok: false });
+    });
+    return true;
+  }
+  if (message.type && message.type.startsWith("alarm-clock-")) {
+    return _acHandleMessage(message, sender, sendResponse);
+  }
+  if (message.type && message.type.startsWith("pomodoro-")) {
+    return _pomoHandleMessage(message, sender, sendResponse);
+  }
+  if (message.type === "check-native-focus-helper-status") {
+    probeNativeFocusHelper(
+      message && Number.isFinite(message.timeoutMs)
+        ? Number(message.timeoutMs)
+        : 900,
+    ).then((result) => {
+      if (sendResponse) sendResponse(result);
+    }).catch((err) => {
+      if (sendResponse) {
+        sendResponse({
+          ok: false,
+          enabled: isNativeSidebarFocusHelperEnabled(),
+          connected: false,
+          host: NATIVE_FOCUS_HELPER_HOST,
+          error: err && err.message ? String(err.message) : String(err),
+        });
+      }
+    });
+    return true;
+  }
+  if (message.type === "get-sidebar-focus-debug-log") {
+    if (sendResponse) {
+      sendResponse({
+        ok: true,
+        report: buildSidebarFocusDebugReport(),
+      });
+    }
+    return true;
+  }
+  if (message.type === "clear-sidebar-focus-debug-log") {
+    clearSidebarFocusDebugLog();
+    addSidebarFocusDebugLog("debug-log-cleared");
+    if (sendResponse) sendResponse({ ok: true });
+    return true;
+  }
+  if (message.type === "show-sync-toast") {
+    const toastMessage = message.message || '';
+    const isError = !!message.isError;
+    const accentColor = isError ? '#ff5252' : '#48d597';
+    const subtext = isError ? 'Gagal' : 'Berjaya';
+    showInPageToast(toastMessage, subtext, accentColor, null, 4000);
+    if (sendResponse) sendResponse({ ok: true });
+    return true;
+  }
+  if (message.type === "sidebar-notes-mounted") {
+    sidebarPanelOpen = true;
+    sidebarCurrentMode = "notes";
+    sidebarCurrentProvider = "";
+    if (sendResponse) sendResponse({ ok: true });
+    return true;
+  }
+  if (message.type === "sidebar-ai-redirecting") {
+    sidebarPanelOpen = true;
+    sidebarCurrentMode = "ai";
+    if (message && message.provider) {
+      sidebarCurrentProvider = normalizeSummaryAiProvider(message.provider);
+    }
+    if (sendResponse) sendResponse({ ok: true });
+    return true;
+  }
+  if (message.type === "sidebar-ai-loaded") {
+    sidebarPanelOpen = true;
+    sidebarCurrentMode = "ai";
+    if (message && message.provider) {
+      sidebarCurrentProvider = normalizeSummaryAiProvider(message.provider);
+    }
+    // Jika ada pending prompt, hantar check segera ke sidebar tab
+    if (pendingSidebarPromptData && pendingSidebarPromptData.text) {
+      const senderTabId = sender && sender.tab && typeof sender.tab.id === "number" ? sender.tab.id : null;
+      if (senderTabId !== null) {
+        // Delay singkat supaya iframe sempat load
+        sleep(400).then(() => sendMessageToTabSafe(senderTabId, { type: "check-pending-prompt" })).catch(() => {});
+      }
+      requestPendingPromptCheckOnSidebarAiTabs(null, 6).catch(() => {});
+    }
+    if (sendResponse) sendResponse({ ok: true });
+    return true;
+  }
+  if (message.type === "is-sidebar-ai-open") {
+    if (sendResponse) sendResponse({ open: sidebarPanelOpen === true && sidebarCurrentMode === "ai" });
+    return true;
+  }
+  if (message.type === "lp-insert-ai-text") {
+    // Legacy fire-and-forget — fallback path from postMessage relay.
+    // Just forward to the overlay for append (no popover).
+    const senderTabId = sender && sender.tab && typeof sender.tab.id === "number" ? sender.tab.id : null;
+    const targetTabId = senderTabId !== null ? senderTabId : lastOverlayTabId;
+    if (targetTabId !== null && message.text) {
+      sendMessageToTabSafe(targetTabId, { type: "lp-insert-ai-text-final", text: String(message.text), mode: "append" });
+    }
+    if (sendResponse) sendResponse({ ok: true });
+    return true;
+  }
+  if (message.type === "lp-get-content-nodes") {
+    const senderTabId = sender && sender.tab && typeof sender.tab.id === "number" ? sender.tab.id : null;
+    const targetTabId = senderTabId !== null ? senderTabId : lastOverlayTabId;
+    if (targetTabId !== null) {
+      return sendMessageToTabSafe(targetTabId, { type: "lp-get-content-nodes" })
+        .then((r) => (r && typeof r === "object" && Array.isArray(r.nodes)) ? r : { ok: false, nodes: [] });
+    }
+    if (sendResponse) sendResponse({ ok: true, nodes: [] });
+    return true;
+  }
+  if (message.type === "lp-insert-ai-text-final") {
+    const senderTabId = sender && sender.tab && typeof sender.tab.id === "number" ? sender.tab.id : null;
+    const targetTabId = senderTabId !== null ? senderTabId : lastOverlayTabId;
+    if (targetTabId !== null && message.text) {
+      sendMessageToTabSafe(targetTabId, { type: "lp-insert-ai-text-final", text: String(message.text), mode: message.mode, lineIndex: message.lineIndex });
+    }
+    // Close sidebar AI panel after "+" so user can see mindmap indicator
+    if (lpApi && lpApi.sidebarAction && typeof lpApi.sidebarAction.close === "function") {
+      lpApi.sidebarAction.close().catch(() => {});
+    }
+      if (sendResponse) sendResponse({ ok: true });
+      return true;
+    }
+    if (message.type === "create-note-from-summary") {
+      // Save an entire JARVIS conversation as a new Local Pocket note. Forward
+      // to the notes overlay tab (same forwarding pattern as lp-insert-ai-text-final).
+      const senderTabId = sender && sender.tab && typeof sender.tab.id === "number" ? sender.tab.id : null;
+      const targetTabId = senderTabId !== null ? senderTabId : lastOverlayTabId;
+      if (targetTabId !== null && message.text) {
+        sendMessageToTabSafe(targetTabId, {
+          type: "create-note-from-summary",
+          title: message.title,
+          text: String(message.text)
+        });
+      }
+      if (sendResponse) sendResponse({ ok: true });
+      return true;
+    }
+    // Crop a PNG data URL to a viewport rect (device-pixel ratio aware).
+    // Used by JARVIS #3 Vision to isolate a specific element (table/chart).
+    async function cropDataUrlToRect(dataUrl, rect) {
+      return new Promise((resolve, reject) => {
+        try {
+          var img = new Image();
+          img.onload = function () {
+            try {
+              var vw = (typeof window !== "undefined" && window.innerWidth) ? window.innerWidth : img.width;
+              var vh = (typeof window !== "undefined" && window.innerHeight) ? window.innerHeight : img.height;
+              var scaleX = img.width / (vw || img.width);
+              var scaleY = img.height / (vh || img.height);
+              var sx = Math.max(0, Math.floor(rect.x * scaleX));
+              var sy = Math.max(0, Math.floor(rect.y * scaleY));
+              var sw = Math.min(img.width - sx, Math.max(1, Math.floor(rect.width * scaleX)));
+              var sh = Math.min(img.height - sy, Math.max(1, Math.floor(rect.height * scaleY)));
+              var canvas = document.createElement("canvas");
+              canvas.width = sw;
+              canvas.height = sh;
+              var ctx = canvas.getContext("2d");
+              ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+              resolve(canvas.toDataURL("image/png"));
+            } catch (e) { reject(e); }
+          };
+          img.onerror = function () { reject(new Error("image-load-failed")); };
+          img.src = dataUrl;
+        } catch (e) { reject(e); }
+      });
+    }
+
+    // #3 Vision (Gemini-optimized): shrink a screenshot/data-URL before it is
+    // forwarded to JARVIS. Full-tab PNGs are several MB of base64; Gemini's
+    // composer rejects oversized images and the cross-world injection string
+    // becomes enormous. Re-encode as JPEG at a capped dimension to stay inside
+    // Gemini's limits while keeping the visual legible for analysis.
+    function downscaleDataUrl(dataUrl, maxDim, quality) {
+      return new Promise(function (resolve) {
+        try {
+          if (typeof document === "undefined" || !document.createElement) { resolve(dataUrl); return; }
+          var img = new Image();
+          img.onload = function () {
+            try {
+              var w = img.naturalWidth || img.width || 0;
+              var h = img.naturalHeight || img.height || 0;
+              if (!w || !h) { resolve(dataUrl); return; }
+              var scale = Math.min(1, maxDim / Math.max(w, h));
+              var tw = Math.max(1, Math.round(w * scale));
+              var th = Math.max(1, Math.round(h * scale));
+              var cnv = document.createElement("canvas");
+              cnv.width = tw; cnv.height = th;
+              var ctx = cnv.getContext("2d");
+              if (!ctx) { resolve(dataUrl); return; }
+              ctx.drawImage(img, 0, 0, tw, th);
+              resolve(cnv.toDataURL("image/jpeg", quality));
+            } catch (e) { resolve(dataUrl); }
+          };
+          img.onerror = function () { resolve(dataUrl); };
+          img.src = dataUrl;
+        } catch (e) { resolve(dataUrl); }
+      });
+    }
+
+    // ── QUICK IMAGE SEARCH: shortcut triggers "Pilih imej" on the active tab ──
+    if (message.type === "hover-image-search") {
+      (async () => {
+        try {
+          // Set in-memory flag so jarvis-deliver-capture knows to auto-submit
+          window.__lpPendingQuickImageSearch = true;
+          // Relay "Pilih imej" to the active tab (fire-and-forget)
+          if (lpApi.tabs && typeof lpApi.tabs.query === "function") {
+            let tabsArr = null;
+            try { tabsArr = await promisifyTabsQuery({ active: true, lastFocusedWindow: true }); } catch (_) {}
+            if (!tabsArr || !tabsArr.length) {
+              try { tabsArr = await promisifyTabsQuery({ active: true, currentWindow: true }); } catch (_) {}
+            }
+            if (tabsArr && tabsArr.length && typeof tabsArr[0].id === "number") {
+              // Don't await — fire-and-forget; user will interact with the page
+              sendMessageToTabSafe(tabsArr[0].id, { type: "jarvis-host-capture-image" }).catch(function(){});
+            }
+          }
+          if (sendResponse) sendResponse({ ok: true });
+        } catch (err) {
+          window.__lpPendingQuickImageSearch = false;
+          try { lpLog("error", "[QuickImageSearch] error:", err); } catch (e) {}
+          if (sendResponse) sendResponse({ ok: false, error: String(err) });
+        }
+      })();
+      return true;
+    }
+    // ── End Quick Image Search ──
+
+    if (message.type === "jarvis-capture-screenshot") {
+      // Capture the visible area of the (sender) tab as a PNG data URL so JARVIS
+      // can attach a screenshot to a question (feature #6 / vision).
+      (async () => {
+        try {
+          if (!lpApi || !lpApi.tabs || typeof lpApi.tabs.captureVisibleTab !== "function") {
+            if (sendResponse) sendResponse({ ok: false, reason: "unsupported" });
+            return;
+          }
+          // Match the proven Firefox pattern (cf. search_by_image): call
+          // captureVisibleTab with ONLY the options object — NO windowId. The API
+          // then captures the active tab of the current window. Passing a window
+          // id (or a tab id) is what triggered "Invalid window ID" errors.
+          const dataUrl = await lpApi.tabs.captureVisibleTab({ format: "png" });
+          if (sendResponse) sendResponse({ ok: true, dataUrl: dataUrl });
+        } catch (err) {
+          if (sendResponse) sendResponse({ ok: false, reason: getErrorMessage(err) });
+        }
+      })();
+      return true;
+    }
+
+    if (message.type === "close-sidebar-completely") {
+      (async () => {
+        try {
+          if (lpApi.sidebarAction && typeof lpApi.sidebarAction.close === "function") {
+            await lpApi.sidebarAction.close();
+          }
+        } catch (e) {}
+        if (sendResponse) { try { sendResponse({ ok: true }); } catch (e) {} }
+      })();
+      return true;
+    }
+    // Close the native sidebar panel. Used by the sidebar-host region/image capture:
+    // the active tab relays the selection to the web page, and we hide the sidebar
+    // first so it stays out of the way (and out of the capture) while the user picks
+    // a region / image, exactly like the floating overlay hides its own panel.
+    if (message.type === "jarvis-close-sidebar") {
+      (async () => {
+        try { await closeSidebarPanel(); } catch (eClose) {}
+        if (sendResponse) { try { sendResponse({ ok: true }); } catch (e) {} }
+      })();
+      return true;
+    }
+    // Deliver a captured image back to the (already-hidden) sidebar host: stash it in
+    // storage and reopen the sidebar so the reloaded panel picks it up via
+    // pendingJarvisCapture. Used by the sidebar-host region/image capture flow, which
+    // closes the sidebar during selection and reopens it once the image is ready.
+    if (message.type === "jarvis-deliver-capture") {
+      (async () => {
+        try {
+           // Stash the capture as a fallback (in case the live restore message
+           // below is missed, the next real panel load picks it up).
+           if (message.dataUrl) {
+             try {
+               if (lpApi.storage && lpApi.storage.local && lpApi.storage.local.set) {
+                 await lpApi.storage.local.set({ pendingJarvisCapture: { dataUrl: message.dataUrl, ts: Date.now() } });
+               }
+             } catch (eStore) {}
+           }
+           // Quick image search: shortcut triggered "Pilih imej", now auto-submit to Jarvis
+           var _autoSearch = false;
+           if (window.__lpPendingQuickImageSearch) {
+             window.__lpPendingQuickImageSearch = false;
+             _autoSearch = true;
+             if (message.dataUrl) {
+               try {
+                 await lpStoreSet({ "__lpHoverImageSearchPending": { text: "cari", image: message.dataUrl, ts: Date.now() } });
+               } catch (eStore) {}
+             }
+           }
+           // Single restore-capture message (with autoSearch flag if applicable) —
+           // elak race condition dua messages berasingan.
+           try {
+             lpApi.runtime.sendMessage({
+               type: "jarvis-restore-capture",
+               dataUrl: message.dataUrl || null,
+               autoSearch: _autoSearch
+             }).catch(function(){});
+           } catch (eMsg) {}
+           // Ensure sidebar is open to show the result
+           if (_autoSearch) {
+             try {
+               if (typeof openJarvisByMode === "function") {
+                 await openJarvisByMode(null, null, "sidebar");
+               }
+             } catch (eOpen) {}
+           }
+          if (sendResponse) { try { sendResponse({ ok: true }); } catch (e) {} }
+        } catch (e) {
+          window.__lpPendingQuickImageSearch = false;
+          if (sendResponse) { try { sendResponse({ ok: false }); } catch (e2) {} }
+        }
+      })();
+      return true;
+    }
+    if (message.type === "jarvis-fetch-image") {
+      // Fetch an image URL in the background (bypassing page CORS) and return it
+      // as a base64 data URL. Used by JARVIS's drag-and-drop / "Pilih imej" capture
+      // so we can grab the REAL image source instead of a low-quality screenshot crop.
+      //
+      // IMPORTANT: use XMLHttpRequest in the privileged background context (NOT
+      // fetch with credentials). The background context is not subject to page
+      // CORS, so a plain XHR can read cross-origin image bytes that a page-side
+      // fetch (and a credentialed fetch) cannot. Using fetch(..., {credentials:
+      // "include"}) made most public CDNs fail because they send
+      // `Access-Control-Allow-Origin: *` without `Allow-Credentials`.
+      (async () => {
+        try {
+          const url = message.url;
+          if (!url || typeof url !== "string") {
+            if (sendResponse) sendResponse({ ok: false, reason: "no-url" });
+            return;
+          }
+          if (url.indexOf("data:") === 0) {
+            if (sendResponse) sendResponse({ ok: true, dataUrl: url });
+            return;
+          }
+          // Try without credentials first (works for public CDNs that return
+          // `Access-Control-Allow-Origin: *` without `Allow-Credentials`), then
+          // retry WITH credentials for hosts that require auth/cookies.
+          const fetchBlob = function (withCreds) {
+            return new Promise(function (resolve, reject) {
+              try {
+                const xhr = new XMLHttpRequest();
+                xhr.open("GET", url, true);
+                xhr.responseType = "blob";
+                if (withCreds) xhr.withCredentials = true;
+                xhr.onload = function () {
+                  if (xhr.status >= 200 && xhr.status < 300 && xhr.response) resolve(xhr.response);
+                  else reject(new Error("http-" + xhr.status));
+                };
+                xhr.onerror = function () { reject(new Error("network-or-cors")); };
+                xhr.ontimeout = function () { reject(new Error("timeout")); };
+                xhr.send();
+              } catch (xerr) {
+                reject(xerr);
+              }
+            });
+          };
+          let blob;
+          try {
+            blob = await fetchBlob(false);
+          } catch (e1) {
+            blob = await fetchBlob(true);
+          }
+          const dataUrl = await new Promise(function (resolve, reject) {
+            const reader = new FileReader();
+            reader.onload = function () { resolve(reader.result); };
+            reader.onerror = function () { reject(reader.error); };
+            reader.readAsDataURL(blob);
+          });
+          if (sendResponse) sendResponse({ ok: true, dataUrl: dataUrl });
+        } catch (err) {
+          if (sendResponse) sendResponse({ ok: false, reason: getErrorMessage(err) });
+        }
+      })();
+      return true;
+    }
+    if (message.type === "jarvis-relay-to-active-tab") {
+      (async () => {
+        try {
+          if (!lpApi.tabs || !lpApi.tabs.query) {
+            if (sendResponse) sendResponse(null);
+            return;
+          }
+          let tabsArr = null;
+          try {
+            tabsArr = await promisifyTabsQuery({ active: true, lastFocusedWindow: true });
+          } catch (_) { tabsArr = null; }
+          if (!tabsArr || !tabsArr.length) {
+            try {
+              tabsArr = await promisifyTabsQuery({ active: true, currentWindow: true });
+            } catch (_) { tabsArr = null; }
+          }
+          if (!tabsArr || !tabsArr.length || typeof tabsArr[0].id !== "number") {
+            if (sendResponse) sendResponse(null);
+            return;
+          }
+          const tabId = tabsArr[0].id;
+          const resp = await sendMessageToTabSafe(tabId, message.sub);
+          if (sendResponse) sendResponse(resp);
+        } catch (err) {
+          if (sendResponse) sendResponse(null);
+        }
+      })();
+      return true;
+    }
+    if (message.type === "open-ai-sidebar-with-prompt") {
+    (async () => {
+      if (currentSettings && currentSettings.sidebarAiEnabled === false) {
+        currentSettings.sidebarAiEnabled = true;
+        if (lpApi.storage && lpApi.storage.local && lpApi.storage.local.set) {
+          await lpStoreSet({ sidebarAiEnabled: true });
+        }
+      }
+      // "AI button action" = jarvis: buka JARVIS (overlay/sidebar ikut
+      // settings.jarvisOpenMode) dan terus hantar teks terpilih ke composer JARVIS.
+      // Prompt dibawa sekali dalam mesej buka (mode overlay) supaya selari dengan
+      // buka panel & tiada risiko hantar dua kali. Kecuali bila mesej datang DARI
+      // JARVIS sendiri (fromJarvis/fromOverlay) — kalau tak, JARVIS akan hantar
+      // prompt balik ke dirinya sendiri dan berulang tanpa henti. Dalam kes itu,
+      // biar ia jatuh ke cawangan sidebar (JARVIS guna AI sidebar untuk dapatkan
+      // jawapan provider).
+      if (currentSettings && currentSettings.aiMode === "jarvis" && message.fromJarvis !== true && message.fromOverlay !== true) {
+        try {
+          const promptText = message.prompt ? String(message.prompt) : "";
+          await openJarvisByMode(null, promptText);
+          // Mode sidebar: prompt tak boleh dibawa dalam mesej buka (panel berasingan
+          // di sidebar asli). Hantar ke panel sidebar melalui runtime message — hanya
+          // jarvisSidebar.html (SIDEBAR_HOST) akan prosesnya.
+          if (promptText && currentSettings.jarvisOpenMode === "sidebar") {
+            // Simpan prompt ke storage sebagai fallback kalau panel sidebar
+            // belum sempat daftar listener mesej (lumba masa buka / load HTML).
+            // Panel akan baca & guna ini bila ia siap dimuat.
+            try {
+              if (lpApi.storage && lpApi.storage.local && lpApi.storage.local.set) {
+                lpApi.storage.local.set({ jarvisSidebarPendingPrompt: { text: promptText, ts: Date.now() } });
+              }
+            } catch (e) {}
+            setTimeout(function () {
+              try {
+                var p = lpApi.runtime.sendMessage({ type: "jarvis-set-prompt", text: promptText, fromAiButton: true });
+                if (p && typeof p.catch === "function") p.catch(function () {});
+              } catch (e) {}
+            }, 900);
+          }
+          if (sendResponse) sendResponse({ ok: true });
+        } catch (err) {
+          if (sendResponse) sendResponse({ ok: false, error: getErrorMessage(err) });
+        }
+        return;
+      }
+            if (currentSettings && currentSettings.aiMode === "overlay" && message.fromOverlay !== true && message.fromJarvis !== true) {
+        try {
+          const promptText = message.prompt ? String(message.prompt) : "";
+          if (!promptText) {
+            if (sendResponse) sendResponse({ ok: false, reason: "empty-prompt" });
+            return;
+          }
+          const senderTabId = sender && sender.tab && typeof sender.tab.id === "number" ? sender.tab.id : null;
+          if (senderTabId !== null) {
+            await ensureOverlayInjected(senderTabId, "ai");
+            const response = await sendMessageToTabSafe(senderTabId, {
+              type: "toggle-ai-overlay",
+              selectedText: promptText
+            });
+            if (sendResponse) sendResponse({ ok: !!(response && response.ok) });
+          } else {
+            const ok = await runToggleAiOverlayCommandAction();
+            if (sendResponse) sendResponse({ ok });
+          }
+        } catch (err) {
+          if (sendResponse) sendResponse({ ok: false, error: getErrorMessage(err) });
+        }
+        return;
+      }
+skipF6FocusForNextOpen = true;
+      try {
+        const promptText = message.prompt ? String(message.prompt) : "";
+        if (!promptText) {
+          if (sendResponse) sendResponse({ ok: false, reason: "empty-prompt" });
+          return;
+        }
+
+        const overlayToken = message.overlayToken ? String(message.overlayToken) : "";
+        const fromOverlay = message.fromOverlay === true;
+
+        // Kes overlay: simpan prompt data tetapi jangan buka sidebar atau hidden tab berasingan
+        if (fromOverlay || overlayToken) {
+          const provider = message.provider || await getSummaryAiProvider();
+          const sessionId = overlayToken ? ("ai-overlay:" + overlayToken) : "ai-overlay-iframe";
+
+          if (overlayToken && sender && sender.tab && typeof sender.tab.id === "number") {
+            const senderTabId = sender.tab.id;
+            const mapping = { tabId: senderTabId, frameId: sender.frameId || 0 };
+            overlayResponseTabMap.set(overlayToken, mapping);
+            saveOverlayResponseTabMap(overlayToken, mapping);
+            setTimeout(function () {
+              overlayResponseTabMap.delete(overlayToken);
+              saveOverlayResponseTabMap(overlayToken, null);
+            }, 10 * 60 * 1000);
+          } else if (overlayToken && (!sender || !sender.tab || typeof sender.tab.id !== "number")) {
+            // Penghantar tiada sender.tab (halaman extension / JARVIS sidebar host)
+            // — balas melalui broadcast ke halaman extension.
+            const mapping = { tabless: true };
+            overlayResponseTabMap.set(overlayToken, mapping);
+            saveOverlayResponseTabMap(overlayToken, mapping);
+            setTimeout(function () {
+              overlayResponseTabMap.delete(overlayToken);
+              saveOverlayResponseTabMap(overlayToken, null);
+            }, 10 * 60 * 1000);
+          }
+
+          // Simpan pending prompt data untuk content script (iframe akan tarik ini)
+          const promptData = { text: promptText, image: message.image || null, sessionId, provider, overlayToken, timestamp: Date.now(), suppressPageContext: message.suppressPageContext === true };
+          await setPendingSidebarPromptData(promptData);
+          if (lpApi.storage && lpApi.storage.local && lpApi.storage.local.set) {
+            await lpStoreSet({ [PENDING_SIDEBAR_PROMPT_STORAGE_KEY]: promptData });
+          }
+
+          // Jika ini adalah overlayToken lama (bukan iframe), buka hidden tab
+          if (overlayToken && !fromOverlay) {
+            try {
+              const providerUrl = getProviderUrl(provider);
+              const hiddenTab = await lpApi.tabs.create({ url: providerUrl, active: false });
+              if (hiddenTab && hiddenTab.id) {
+                overlayHiddenTabMap.set(overlayToken, hiddenTab.id);
+                saveOverlayHiddenTabMap(overlayToken, hiddenTab.id);
+              }
+            } catch (tabErr) {
+              if (overlayToken && sender && sender.tab) {
+                sendMessageToTabSafe(sender.tab.id, {
+                  type: "ai-overlay-response", overlayToken,
+                  responseText: "Gagal membuka tab AI.", done: true
+                }).catch(() => {});
+              }
+            }
+          }
+          
+          if (sendResponse) sendResponse({ ok: true });
+          return;
+        }
+
+        // Kes bukan-overlay: aliran sidebar sedia ada (tidak berubah)
+        const sessionId = "sess-ai-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+        const provider = await getSummaryAiProvider();
+
+        await setPendingSidebarPromptData({
+          text: promptText,
+          image: message.image || null,
+          sessionId,
+          provider,
+          suppressPageContext: message.suppressPageContext === true
+        });
+
+        // Simpan ke storage untuk memastikan sidebar boleh tarik data jika dibuka lambat
+        if (lpApi.storage && lpApi.storage.local && lpApi.storage.local.set) {
+          await lpStoreSet({
+            [PENDING_SIDEBAR_PROMPT_STORAGE_KEY]: {
+              text: promptText,
+              image: message.image || null,
+              sessionId,
+              provider,
+              timestamp: Date.now()
+            }
+          });
+        }
+
+        const windowId = sender && sender.tab && typeof sender.tab.windowId === "number" ? sender.tab.windowId : null;
+        let ok = false;
+        // Jika sidebar sudah terbuka, jangan hantar shortcut toggle — terus hantar prompt
+        if (sidebarPanelOpen === true) {
+          ok = await runOpenSidebarCommandAction({ shouldClose: false });
+        } else {
+          const port = ensureNativeFocusHelperPort();
+          if (port) {
+            try {
+              const shortcut = await getOpenAiSidebarShortcut();
+              port.postMessage({
+                action: "press_custom_shortcut",
+                shortcut: shortcut,
+                source: "localpocket-open-ai-sidebar-msg",
+                at: Date.now()
+              });
+              ok = true;
+            } catch (err) {
+              ok = await runOpenSidebarCommandAction({ shouldClose: false });
+            }
+          } else {
+            ok = await runOpenSidebarCommandAction({ shouldClose: false });
+          }
+        }
+        requestPendingPromptCheckOnSidebarAiTabs(null, provider === "gemini" ? 14 : 8).catch(() => {});
+        if (sendResponse) sendResponse({ ok });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, error: getErrorMessage(err) });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === "toggle-ai-overlay") {
+    (async () => {
+      try {
+        // Warm up session cookies untuk provider semasa — tunggu selesai sebelum
+        // buka overlay supaya iframe sudah ada cookies yang sah.
+        // Jika warmup ambil masa terlalu lama (>3.5s), teruskan tanpa tunggu.
+        try {
+          const provider = await getSummaryAiProvider();
+          await Promise.race([
+            warmUpProviderSession(provider),
+            sleep(OVERLAY_WARMUP_MAX_WAIT_MS)
+          ]);
+        } catch (_) {}
+
+        const senderTabId = sender && sender.tab && typeof sender.tab.id === "number" ? sender.tab.id : null;
+        let ok = false;
+        if (senderTabId !== null) {
+          await ensureOverlayInjected(senderTabId, "ai");
+          const response = await sendMessageToTabSafe(senderTabId, {
+            type: "toggle-ai-overlay",
+            selectedText: message.selectedText || ""
+          });
+          ok = !!(response && response.ok);
+        }
+        if (!ok && message.selectedText) {
+          const tabs = await lpApi.tabs.query({ active: true, currentWindow: true });
+          if (tabs && tabs[0] && tabs[0].id) {
+            await ensureOverlayInjected(tabs[0].id, "ai");
+            const response = await sendMessageToTabSafe(tabs[0].id, {
+              type: "toggle-ai-overlay",
+              selectedText: message.selectedText
+            });
+            ok = !!(response && response.ok);
+          }
+        }
+        if (sendResponse) sendResponse({ ok });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, error: getErrorMessage(err) });
+      }
+    })();
+    return true;
+  }
+
+  // ── JARVIS assistant handlers ────────────────────────────────────────────
+  if (message.type === "jarvis-save-page") {
+    (async () => {
+      try {
+        const activeTab = await getActiveTabForCommands();
+        if (!activeTab) {
+          if (sendResponse) sendResponse({ ok: false, message: "Tiada tab aktif" });
+          return;
+        }
+        const result = await saveCurrentTabEntry(activeTab, {});
+        if (sendResponse) {
+          sendResponse({
+            ok: !!(result && result.ok),
+            title: result && result.title ? result.title : (activeTab.title || ""),
+            message: result && result.message ? result.message : ""
+          });
+        }
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, message: getErrorMessage(err) });
+      }
+    })();
+    return true;
+  }
+
+  async function getJarvisHiddenCategoryIds() {
+    try {
+      const cats = await getCachedCategories();
+      const hidden = new Set();
+      for (const c of (Array.isArray(cats) ? cats : [])) {
+        if (c && c.hidden && c.id) hidden.add(String(c.id));
+      }
+      return hidden;
+    } catch (e) {
+      return new Set();
+    }
+  }
+  if (message.type === "jarvis-search-library") {
+    (async () => {
+      try {
+        const query = message.query ? String(message.query).toLowerCase().trim() : "";
+        const catId = message.categoryId ? String(message.categoryId) : "";
+        const items = await getItems();
+        const hidden = await getJarvisHiddenCategoryIds();
+        let results = [];
+        results = (Array.isArray(items) ? items : []).filter(function (it) {
+          if (it && hidden.has(String(it.categoryId || ""))) return false;
+          // Tapis ikut kategori bila diminta (selari dengan jarvis-library-search).
+          if (catId && String(it.categoryId || "") !== catId) return false;
+          if (!query) return true;
+          const hay = [
+            it.title || "",
+            it.excerpt || "",
+            it.url || "",
+            it.textContent || it.content || "",
+            it.resolved_title || ""
+          ].join(" ").toLowerCase();
+          return new RegExp("\\b" + query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\b", "i").test(hay);
+        }).map(function (it) {
+          return { title: it.title || it.resolved_title || it.url || "(tanpa tajuk)", url: it.url || "", categoryId: it.categoryId || "" };
+        });
+        if (sendResponse) sendResponse({ ok: true, results: results, categoryId: catId });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, message: getErrorMessage(err), results: [] });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === "jarvis-library-search") {
+    (async () => {
+      try {
+        const kws = Array.isArray(message.keywords)
+          ? message.keywords.map(function (k) { return String(k).toLowerCase().trim(); }).filter(Boolean)
+          : [];
+        const limit = (message.limit && Number(message.limit)) || 20;
+        const catId = message.categoryId ? String(message.categoryId) : "";
+        const items = await getItems();
+        const hidden = await getJarvisHiddenCategoryIds();
+        const scored = [];
+        (Array.isArray(items) ? items : []).forEach(function (it) {
+          if (it && hidden.has(String(it.categoryId || ""))) return;
+          // Tapis ikut kategori bila diminta (pelan kategori: "senaraikan link
+          // dalam kategori B"). categoryId item dibanding terus dengan yang diberi.
+          if (catId && String(it.categoryId || "") !== catId) return;
+          const hay = [
+            it.title || "", it.excerpt || "", it.url || "",
+            it.textContent || it.content || "", it.resolved_title || ""
+          ].join(" ").toLowerCase();
+          let score = 0;
+          for (let i = 0; i < kws.length; i++) {
+            if (kws[i] && hay.indexOf(kws[i]) !== -1) score++;
+          }
+          // Bila difilter ikut kategori tapi tiada kata kunci, senaraikan SEMUA
+          // link dalam kategori tersebut (skor 1 supaya disertakan).
+          if (catId && kws.length === 0) score = 1;
+          if (score > 0) scored.push({ score: score, item: it });
+        });
+        scored.sort(function (a, b) { return b.score - a.score; });
+        const out = scored.slice(0, limit).map(function (s) {
+          return {
+            title: s.item.title || s.item.resolved_title || s.item.url || "(tanpa tajuk)",
+            url: s.item.url || "",
+            categoryId: s.item.categoryId || ""
+          };
+        });
+        if (sendResponse) sendResponse({ ok: true, items: out, categoryId: catId, totalScanned: Array.isArray(items) ? items.length : 0 });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, message: getErrorMessage(err), items: [] });
+      }
+    })();
+    return true;
+  }
+
+  // RAG search for JARVIS: like jarvis-library-search but returns the item
+  // BODY (truncated) so the conversation prompt can inject saved-article
+  // context. Reuses the same keyword scoring as jarvis-library-search.
+  if (message.type === "jarvis-rag-search") {
+    (async () => {
+      try {
+        const kws = Array.isArray(message.keywords)
+          ? message.keywords.map(function (k) { return String(k).toLowerCase().trim(); }).filter(Boolean)
+          : [];
+        const limit = (message.limit && Number(message.limit)) || 5;
+        const items = await getItems();
+        let catNameById = {};
+        try {
+          const catData = await lpApi.storage.local.get([CATEGORY_KEY]);
+          const cats = coerceArray(catData && catData[CATEGORY_KEY]);
+          (Array.isArray(cats) ? cats : []).forEach(function (c) {
+            if (c && c.id) catNameById[String(c.id)] = c.name || "";
+          });
+        } catch (e) {}
+        const hidden = await getJarvisHiddenCategoryIds();
+        const scored = [];
+        (Array.isArray(items) ? items : []).forEach(function (it) {
+          if (it && hidden.has(String(it.categoryId || ""))) return;
+          const hay = [
+            it.title || "", it.excerpt || "", it.url || "",
+            it.textContent || it.content || "", it.resolved_title || ""
+          ].join(" ").toLowerCase();
+          let score = 0;
+          for (let i = 0; i < kws.length; i++) {
+            if (kws[i] && hay.indexOf(kws[i]) !== -1) score++;
+          }
+          if (score > 0) scored.push({ score: score, item: it });
+        });
+        scored.sort(function (a, b) { return b.score - a.score; });
+        const out = scored.slice(0, limit).map(function (s) {
+          const it = s.item;
+          const textSrc = String(it.textContent || it.content || it.excerpt || "").replace(/\s+/g, " ").trim();
+          const text = textSrc.length > 800 ? textSrc.slice(0, 800) + "…" : textSrc;
+          return {
+            kind: "item",
+            title: it.title || it.resolved_title || it.url || "(tanpa tajuk)",
+            category: catNameById[String(it.categoryId || "")] || "",
+            url: it.url || "",
+            text: text
+          };
+        });
+        if (sendResponse) sendResponse({ ok: true, docs: out, totalScanned: Array.isArray(items) ? items.length : 0 });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, message: getErrorMessage(err), docs: [] });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === "jarvis-open-category") {
+    (async () => {
+      try {
+        await toggleCategoryPicker();
+        if (sendResponse) sendResponse({ ok: true });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, message: getErrorMessage(err) });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === "jarvis-pomodoro") {
+    (async () => {
+      try {
+        await runTogglePomodoroOverlayCommandAction();
+        if (sendResponse) sendResponse({ ok: true });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, message: getErrorMessage(err) });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "jarvis-get-categories") {
+    (async () => {
+      try {
+        const data = await lpApi.storage.local.get([CATEGORY_KEY]);
+        const categories = coerceArray(data && data[CATEGORY_KEY]);
+        const out = (Array.isArray(categories) ? categories : [])
+          .filter(function (cat) { return !(cat && cat.hidden); })
+          .map(function (cat) {
+            return { id: cat.id || "", name: cat.name || getCategoryLabel(cat.id || "", categories) };
+          }).filter(function (c) { return !!c.id; });
+        if (sendResponse) sendResponse({ ok: true, categories: out });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, message: getErrorMessage(err), categories: [] });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === "jarvis-set-item-category") {
+    (async () => {
+      try {
+        // Operasi TULIS (destructive) — pengesahan dibuat di UI (overlay/sidebar)
+        // sebelum memanggil ini. Di sini kita cuma sahkan parameter wajib.
+        const targetCat = message.categoryId != null ? String(message.categoryId) : "";
+        if (targetCat === "") {
+          if (sendResponse) sendResponse({ ok: false, message: "categoryId diperlukan", updated: 0, failed: [] });
+          return;
+        }
+        const rawIds = Array.isArray(message.ids) ? message.ids : (message.id != null ? [message.id] : []);
+        const idSet = new Set(rawIds.map(function (x) { return String(x); }).filter(Boolean));
+        if (idSet.size === 0) {
+          if (sendResponse) sendResponse({ ok: false, message: "tiada id item diberi", updated: 0, failed: [] });
+          return;
+        }
+        const items = Array.isArray(await getItems()) ? await getItems() : [];
+        const prev = items.map(function (it) { return Object.assign({}, it); });
+        const failed = [];
+        let updated = 0;
+        const next = items.map(function (it) {
+          const id = it && it.id != null ? String(it.id) : "";
+          if (!id || !idSet.has(id)) return it;
+          if (it.categoryId === targetCat) return it; // tiada perubahan
+          updated++;
+          return Object.assign({}, it, { categoryId: targetCat, updatedAt: new Date().toISOString() });
+        });
+        // Jika tiada yang berubah, tidak perlu tulis storage.
+        if (updated === 0) {
+          if (sendResponse) sendResponse({ ok: true, updated: 0, failed: [], message: "tiada item perlu dikemaskini" });
+          return;
+        }
+        await setItems(next, { skipDedupe: true, previousItems: prev });
+        if (sendResponse) sendResponse({ ok: true, updated: updated, failed: failed, categoryId: targetCat });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, message: getErrorMessage(err), updated: 0, failed: [] });
+      }
+    })();
+    return true;
+  }
+
+  // ── End JARVIS handlers ───────────────────────────────────────────────────
+
+  if (message.type === "jarvis-web-search") {
+    (async () => {
+      try {
+        const query = message.query ? String(message.query) : "";
+        const url = "https://www.google.com/search?q=" + encodeURIComponent(query);
+        const tab = await lpApi.tabs.create({ url: url, active: false });
+        if (sendResponse) sendResponse({ ok: !!tab, message: tab ? "" : "Gagal buka tab" });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, message: getErrorMessage(err) });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === "jarvis-browser-action") {
+    (async () => {
+      function finish(r) { if (sendResponse) sendResponse(r); }
+      try {
+        const action = message.action;
+        // Arm a one-shot listener that, once the target tab finishes loading,
+        // tells that tab's JARVIS content script to run a local action (e.g.
+        // click / fill / scroll). Needed because navigating destroys the
+        // current content-script context, so an action planned for "after
+        // navigate" can't run inline in the old page.
+        function storePending(tabId, entry) {
+          try { if (lpApi.storage && lpApi.storage.local && lpApi.storage.local.set) lpApi.storage.local.set({ ["jarvisPending:" + tabId]: entry }); } catch (e) {}
+        }
+        function deliverActionToTab(tabId, actionObj, attempt) {
+          attempt = attempt || 0;
+          var msg = { type: "jarvis-run-action", action: actionObj };
+          var retry = function () { if (attempt < 40) setTimeout(function () { deliverActionToTab(tabId, actionObj, attempt + 1); }, 250); };
+          try {
+            var p = lpApi.tabs.sendMessage(tabId, msg, function () {
+              var err = lpApi.runtime && lpApi.runtime.lastError;
+              if (err) retry();
+            });
+            if (p && typeof p.then === "function") {
+              p.then(function () {}).catch(function () { retry(); });
+            }
+          } catch (e) { retry(); }
+        }
+        function armActionOnLoad(tabId, actionObj) {
+          if (!tabId || !lpApi.tabs || !lpApi.tabs.onUpdated || !actionObj) return;
+          storePending(tabId, { kind: "action", action: actionObj });
+          function handler(updatedId, changeInfo) {
+            if (updatedId === tabId && changeInfo && changeInfo.status === "complete") {
+              lpApi.tabs.onUpdated.removeListener(handler);
+              deliverActionToTab(tabId, actionObj);
+            }
+          }
+          lpApi.tabs.onUpdated.addListener(handler);
+          // If the page already finished loading before we armed the listener
+          // (e.g. a cached/very fast navigation), fire delivery immediately.
+          try {
+            var g = lpApi.tabs.get(tabId, function (t) {
+              if (t && t.status === "complete") deliverActionToTab(tabId, actionObj);
+            });
+            if (g && typeof g.then === "function") {
+              g.then(function (t) { if (t && t.status === "complete") deliverActionToTab(tabId, actionObj); }).catch(function () {});
+            }
+          } catch (e) {}
+          setTimeout(function () { lpApi.tabs.onUpdated.removeListener(handler); }, 20000);
+        }
+        function armPlanOnLoad(tabId, planArr, planUserText) {
+          if (!tabId || !lpApi.tabs || !lpApi.tabs.onUpdated || !planArr || !planArr.length) return;
+          storePending(tabId, { kind: "plan", plan: planArr, userText: planUserText || "" });
+          console.log("[JARVIS-DEBUG] armPlanOnLoad tab=" + tabId + " plan=" + JSON.stringify(planArr));
+          function handler(updatedId, changeInfo) {
+            if (updatedId === tabId && changeInfo && changeInfo.status === "complete") {
+              console.log("[JARVIS-DEBUG] armPlanOnLoad fired complete tab=" + tabId);
+              lpApi.tabs.onUpdated.removeListener(handler);
+              deliverPlanToTab(tabId, planArr, planUserText);
+            }
+          }
+          lpApi.tabs.onUpdated.addListener(handler);
+          try {
+            var g = lpApi.tabs.get(tabId, function (t) {
+              if (t && t.status === "complete") deliverPlanToTab(tabId, planArr, planUserText);
+            });
+            if (g && typeof g.then === "function") {
+              g.then(function (t) { if (t && t.status === "complete") deliverPlanToTab(tabId, planArr, planUserText); }).catch(function () {});
+            }
+          } catch (e) {}
+          setTimeout(function () { lpApi.tabs.onUpdated.removeListener(handler); }, 20000);
+        }
+        function deliverPlanToTab(tabId, planArr, planUserText, attempt) {
+          attempt = attempt || 0;
+          var msg = { type: "jarvis-run-plan", plan: planArr, userText: planUserText || "" };
+          console.log("[JARVIS-DEBUG] deliverPlanToTab tab=" + tabId + " attempt=" + attempt + " plan=" + JSON.stringify(planArr));
+          var retry = function () { if (attempt < 40) setTimeout(function () { deliverPlanToTab(tabId, planArr, planUserText, attempt + 1); }, 250); };
+          try {
+            var p = lpApi.tabs.sendMessage(tabId, msg, function () {
+              var err = lpApi.runtime && lpApi.runtime.lastError;
+              if (err) retry();
+            });
+            if (p && typeof p.then === "function") {
+              p.then(function () {}).catch(function () { retry(); });
+            }
+          } catch (e) { retry(); }
+        }
+        if (action === "open_url") {
+          const tab = await lpApi.tabs.create({ url: message.url, active: true });
+          console.log("[JARVIS-DEBUG] open_url tab=" + (tab && tab.id) + " pendingPlan=" + (message.pendingPlan ? JSON.stringify(message.pendingPlan) : "none") + " pendingAction=" + (message.pendingAction ? JSON.stringify(message.pendingAction) : "none"));
+          if (tab && message.pendingAction) armActionOnLoad(tab.id, message.pendingAction);
+          if (tab && message.pendingPlan) armPlanOnLoad(tab.id, message.pendingPlan, message.userText);
+          return finish({ ok: !!tab });
+        }
+        if (action === "new_tab") {
+          const tab = await lpApi.tabs.create({ url: "about:newtab", active: true });
+          return finish({ ok: !!tab });
+        }
+        const activeTab = await getActiveTabForCommands();
+        if (!activeTab) return finish({ ok: false, message: "Tiada tab aktif" });
+        if (action === "navigate") {
+          if (message.url) {
+            await lpApi.tabs.update(activeTab.id, { url: message.url });
+            if (message.pendingAction) armActionOnLoad(activeTab.id, message.pendingAction);
+            if (message.pendingPlan) armPlanOnLoad(activeTab.id, message.pendingPlan, message.userText);
+            return finish({ ok: true, message: "Pergi ke " + message.url });
+          }
+          return finish({ ok: false, message: "Tiada URL." });
+        }
+        if (action === "close_tab") {
+          await lpApi.tabs.remove(activeTab.id);
+          return finish({ ok: true });
+        }
+        if (action === "close_all_tabs") {
+          const tabs = await lpApi.tabs.query({ currentWindow: true });
+          const ids = (tabs || []).map(function (t) { return t.id; }).filter(function (id) { return id !== activeTab.id; });
+          if (ids.length) await lpApi.tabs.remove(ids);
+          return finish({ ok: true, message: "Tutup " + ids.length + " tab." });
+        }
+        if (action === "reload") {
+          await lpApi.tabs.reload(activeTab.id);
+          return finish({ ok: true });
+        }
+        if (action === "back") {
+          if (lpApi.tabs.goBack) await lpApi.tabs.goBack(activeTab.id);
+          return finish({ ok: true });
+        }
+        if (action === "forward") {
+          if (lpApi.tabs.goForward) await lpApi.tabs.goForward(activeTab.id);
+          return finish({ ok: true });
+        }
+        if (action === "bookmark") {
+          if (lpApi.bookmarks && lpApi.bookmarks.create) {
+            await lpApi.bookmarks.create({ title: activeTab.title || activeTab.url, url: activeTab.url });
+            return finish({ ok: true, message: "Ditandakan." });
+          }
+          return finish({ ok: false, message: "Bookmark tak tersedia" });
+        }
+        if (action === "print") {
+          try {
+            if (lpApi.tabs && lpApi.tabs.get) {
+              const tab = await lpApi.tabs.get(activeTab.id);
+              if (tab && tab.id != null) {
+                try { await lpApi.tabs.sendMessage(tab.id, { type: "lp-trigger-print" }); } catch (e) {}
+              }
+            }
+          } catch (e) {}
+          // Fallback: open the print dialog via the active tab.
+          if (lpApi.tabs && lpApi.tabs.print) {
+            try { await lpApi.tabs.print(activeTab.id); return finish({ ok: true, message: "Cetak dibuka." }); } catch (e) {}
+          }
+          return finish({ ok: true, message: "Cetak diminta." });
+        }
+        if (action === "duplicate_tab") {
+          const tab = await lpApi.tabs.create({ url: activeTab.url, active: true, index: (activeTab.index != null ? activeTab.index + 1 : undefined) });
+          return finish({ ok: !!tab, message: tab ? "Tab dihasilkan." : "Gagal hasilkan tab." });
+        }
+        if (action === "zoom") {
+          const dir = message.direction === "out" ? -1 : 1;
+          try {
+            if (lpApi.tabs && lpApi.tabs.getZoom && lpApi.tabs.setZoom) {
+              const z = await lpApi.tabs.getZoom(activeTab.id);
+              const next = Math.min(3, Math.max(0.25, Math.round((z + dir * 0.25) * 100) / 100));
+              await lpApi.tabs.setZoom(activeTab.id, next);
+              return finish({ ok: true, message: "Zum: " + Math.round(next * 100) + "%" });
+            }
+          } catch (e) {}
+          return finish({ ok: false, message: "Zum tak tersedia." });
+        }
+        return finish({ ok: false, message: "Aksi tak dikenali: " + action });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, message: getErrorMessage(err) });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === "jarvis-addon-action") {
+    (async () => {
+      function finish(r) { if (sendResponse) sendResponse(r); }
+      try {
+        const action = message.action;
+        if (action === "open_sidebar" || action === "open_library") {
+          if (lpApi.sidebarAction && lpApi.sidebarAction.open) {
+            try { lpApi.sidebarAction.open(); } catch (e) {}
+          }
+          return finish({ ok: true, message: "Sidebar dibuka." });
+        }
+        if (action === "toggle_notes") {
+          await runOpenNotesSidebarCommandAction();
+          return finish({ ok: true, message: "Notes overlay." });
+        }
+        if (action === "toggle_pomodoro") {
+          await runTogglePomodoroOverlayCommandAction();
+          return finish({ ok: true, message: "Pomodoro overlay." });
+        }
+        if (action === "toggle_ai_overlay") {
+          await runToggleAiOverlayCommandAction();
+          return finish({ ok: true, message: "AI overlay." });
+        }
+        if (action === "open_settings") {
+          if (lpApi.runtime && lpApi.runtime.openOptionsPage) {
+            await lpApi.runtime.openOptionsPage();
+            return finish({ ok: true, message: "Tetapan dibuka." });
+          }
+          return finish({ ok: false, message: "Tetapan tak tersedia" });
+        }
+        return finish({ ok: false, message: "Aksi tak dikenali: " + action });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, message: getErrorMessage(err) });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === "ai-overlay-response") {
+    const overlayToken = message.overlayToken ? String(message.overlayToken) : "";
+    (async () => {
+      let target = overlayResponseTabMap.get(overlayToken);
+      if (!target && overlayToken) {
+        target = await getOverlayResponseTabMap(overlayToken);
+      }
+
+      if (target && target.tabless) {
+        // Balas ke halaman extension (JARVIS sidebar host — tiada sender.tab).
+        // Broadcast ke semua halaman extension melalui runtime.sendMessage.
+        try {
+          lpApi.runtime.sendMessage({
+            type: "ai-overlay-response",
+            overlayToken: overlayToken,
+            responseText: message.responseText || "",
+            responseHtml: message.responseHtml || "",
+            done: message.done === true
+          }).catch(function () { });
+        } catch (_) { }
+      } else if (target && target.tabId) {
+        sendMessageToTabSafe(target.tabId, {
+          type: "ai-overlay-response",
+          overlayToken: overlayToken,
+          responseText: message.responseText || "",
+          responseHtml: message.responseHtml || "",
+          done: message.done === true
+        }).catch(function () { });
+      }
+
+      // Tutup hidden tab apabila respons selesai
+      if (message.done === true && overlayToken) {
+        let hiddenTabId = overlayHiddenTabMap.get(overlayToken);
+        if (!hiddenTabId) {
+          hiddenTabId = await getOverlayHiddenTabMap(overlayToken);
+        }
+
+        if (hiddenTabId) {
+          overlayHiddenTabMap.delete(overlayToken);
+          saveOverlayHiddenTabMap(overlayToken, null);
+          if (lpApi.tabs && lpApi.tabs.remove) {
+            lpApi.tabs.remove(hiddenTabId).catch(function () { });
+          }
+        }
+        
+        // Cleanup mapping if done
+        overlayResponseTabMap.delete(overlayToken);
+        saveOverlayResponseTabMap(overlayToken, null);
+      }
+    })();
+    return false;
+  }
+   if (message.type === "open-jarvis-by-mode") {
+     // Dihantar oleh butang "flip" JARVIS: buka paparan JARVIS dalam mod EKSPLESIT
+     // (sidebar/overlay) tanpa mengira default settings.jarvisOpenMode — guna untuk
+     // tukar paparan secara langsung (overlay ⇄ sidebar) dengan menutup yang sedia ada.
+     var fm = (message.mode === "overlay" || message.mode === "sidebar") ? message.mode : null;
+     if (!fm) { if (sendResponse) sendResponse({ ok: false, error: "invalid mode" }); return true; }
+     openJarvisByMode(sendResponse, null, fm);
+     return true;
+   }
+   if (message.type === "open-jarvis-sidebar") {
+     // Mod "probe" (dipanggil oleh 'semak diri' JARVIS): sahkan sahaja bahawa
+     // sidebarAction wujud & boleh dibuka TANPA benar-benar membuka sidebar
+     // (buka sidebar secara paksa semasa diagnostik akan mengganggu pengguna).
+     if (message.__probe === true) {
+       var probeOk = !!(lpApi.sidebarAction && typeof lpApi.sidebarAction.open === "function");
+       if (sendResponse) sendResponse({ ok: probeOk, probed: true });
+       return true;
+     }
+     // Buka JARVIS mengikut default (settings.jarvisMode) — dikongsi dengan
+     // pintasan "toggle-jarvis" supaya kedua-dua pemicu membuka mod yang sama.
+     openJarvisByMode(sendResponse);
+     return true;
+   }
+  if (message.type === "open-jarvis-overlay") {
+    (async () => {
+      try {
+        // Keluar dari mode sidebar JARVIS — set semula ke AI biasa dan panel sidebar.
+        try {
+          const nextSettings = Object.assign({}, currentSettings || {}, { sidebarMode: "ai", jarvisOpenMode: "overlay" });
+          currentSettings = nextSettings;
+          // Fire-and-forget: elak await hilangkan context gesture untuk close() di bawah.
+          lpStoreSet({ [SETTINGS_KEY]: nextSettings }).catch(function () {});
+        } catch (err) {}
+        // Pulih panel sidebar asal sebelum menutup.
+        try {
+          if (lpApi.sidebarAction && typeof lpApi.sidebarAction.setPanel === "function") {
+            await lpApi.sidebarAction.setPanel({ panel: lpApi.runtime.getURL("sidebar.html") });
+          }
+        } catch (e) {}
+        // Tutup sidebar asli.
+        try {
+          if (lpApi.sidebarAction && typeof lpApi.sidebarAction.close === "function") {
+            await lpApi.sidebarAction.close();
+          }
+        } catch (e) {}
+        // Buka overlay JARVIS pada tab aktif.
+        let tabsArr = null;
+        try {
+          tabsArr = await promisifyTabsQuery({ active: true, lastFocusedWindow: true });
+        } catch (_) { tabsArr = null; }
+        if (!tabsArr || !tabsArr.length) {
+          try { tabsArr = await promisifyTabsQuery({ active: true, currentWindow: true }); } catch (_) {}
+        }
+        if (tabsArr && tabsArr[0] && typeof tabsArr[0].id === "number") {
+          await sendMessageToTabSafe(tabsArr[0].id, { type: "toggle-jarvis-overlay", open: true });
+        }
+        if (sendResponse) sendResponse({ ok: true });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, error: getErrorMessage(err) });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "set-sidebar-panel") {
+    (async () => {
+      try {
+        const panelFile = message.panel === "jarvis" ? "jarvisSidebar.html" : "sidebar.html";
+        const mode = message.panel === "jarvis" ? "jarvis" : "ai";
+        // Tanda buka semula supaya reset-sidebar-panel (dipicu close semasa
+        // openLocalPocketSidebar) tak tukar panel ke Gemini.
+        if (message.panel === "jarvis") jarvisReopening = Date.now();
+        try {
+          const nextSettings = Object.assign({}, currentSettings || {}, { sidebarMode: mode });
+          currentSettings = nextSettings;
+          await lpStoreSet({ [SETTINGS_KEY]: nextSettings });
+        } catch (err) {}
+        try {
+          if (lpApi.sidebarAction && typeof lpApi.sidebarAction.setPanel === "function") {
+            await lpApi.sidebarAction.setPanel({ panel: lpApi.runtime.getURL(panelFile) });
+          }
+        } catch (e) {}
+        // Jika sidebar sedang terbuka, tutup & buka semula supaya panel baharu dipakai.
+        try {
+          if (lpApi.sidebarAction && typeof lpApi.sidebarAction.close === "function") {
+            const isOpen = await isSidebarOpen(null);
+            if (isOpen === true) {
+              await lpApi.sidebarAction.close();
+              await sleep(90);
+              await openLocalPocketSidebar(null, { mode: "ai", forceReload: true, panel: panelFile, jarvis: message.panel === "jarvis" });
+            }
+          }
+        } catch (e) {}
+        if (sendResponse) sendResponse({ ok: true });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, error: getErrorMessage(err) });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "open-notes-sidebar") {
+    (async () => {
+      try {
+        const senderTabId =
+          sender && sender.tab && typeof sender.tab.id === "number"
+            ? sender.tab.id
+            : null;
+        let ok = false;
+        if (senderTabId !== null) {
+          await ensureOverlayInjected(senderTabId, "notes");
+          const response = await sendMessageToTabSafe(senderTabId, {
+            type: "toggle-notes-overlay",
+            open: true,
+          });
+          ok = !!(response && response.ok);
+        }
+        if (!ok) {
+          ok = await runOpenNotesSidebarCommandAction();
+        }
+        if (sendResponse) sendResponse({ ok });
+      } catch (err) {
+        if (sendResponse) {
+          sendResponse({ ok: false, error: getErrorMessage(err) });
+        }
+      }
+    })();
+    return true;
+  }
+  if (message.type === "open-firefox-native-ai-sidebar") {
+    (async () => {
+      try {
+        const port = ensureNativeFocusHelperPort();
+        if (port) {
+          port.postMessage({
+            action: "press_native_ai_shortcut",
+            source: "localpocket-firefox-native-ai-msg",
+            at: Date.now(),
+          });
+          if (sendResponse) sendResponse({ ok: true });
+        } else {
+          if (sendResponse) sendResponse({ ok: false, error: "Native helper not available" });
+        }
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, error: String(err) });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "open-ai-sidebar") {
+    if (currentSettings && currentSettings.sidebarAiEnabled === false) {
+      if (sendResponse) sendResponse({ ok: false, error: "AI Sidebar is disabled in settings." });
+      return false;
+    }
+    // Always open sidebar for open-ai-sidebar action, regardless of aiMode setting
+    // aiMode setting should only affect AI button behavior, not specific gesture actions
+    skipF6FocusForNextOpen = true;
+    const windowId = sender && sender.tab && typeof sender.tab.windowId === "number" ? sender.tab.windowId : null;
+
+    const port = ensureNativeFocusHelperPort();
+    if (port) {
+      (async () => {
+        try {
+          const shortcut = await getOpenAiSidebarShortcut();
+          port.postMessage({
+            action: "press_custom_shortcut",
+            shortcut: shortcut,
+            source: "localpocket-open-ai-sidebar-msg",
+            at: Date.now()
+          });
+          if (sendResponse) sendResponse({ ok: true });
+        } catch (err) {
+          lpWarn("Failed to send native Local Pocket AI sidebar shortcut:", err);
+          fallbackSyncOpenClose(windowId, sendResponse);
+        }
+      })();
+      return true;
+    }
+
+    return fallbackSyncOpenClose(windowId, sendResponse);
+  }
+  if (message.type === "favorites-debug-log") {
+    addFavoritesDebugLog(
+      message && message.event ? String(message.event) : "picker-event",
+      message && Object.prototype.hasOwnProperty.call(message, "detail")
+        ? message.detail
+        : null,
+    );
+    if (sendResponse) sendResponse({ ok: true });
+    return true;
+  }
+  if (message.type === "selection-search-open-url") {
+    const url = message && message.url ? String(message.url) : "";
+    if (!url || !lpApi.tabs || !lpApi.tabs.create) {
+      if (sendResponse) sendResponse({ ok: false });
+      return false;
+    }
+    const active = message.active !== false;
+    lpApi.tabs.create({ url, active })
+      .then(() => {
+        if (sendResponse) sendResponse({ ok: true });
+      })
+      .catch(() => {
+        if (sendResponse) sendResponse({ ok: false });
+      });
+    return true;
+  }
+  if (message.type === "get-favorites-debug-log") {
+    if (sendResponse) {
+      sendResponse({
+        ok: true,
+        report: buildFavoritesDebugReport(),
+      });
+    }
+    return true;
+  }
+  if (message.type === "clear-favorites-debug-log") {
+    clearFavoritesDebugLog();
+    addFavoritesDebugLog("debug-log-cleared");
+    if (sendResponse) sendResponse({ ok: true });
+    return true;
+  }
+  if (message.type === "items-mutate") {
+    const action = message && message.action ? String(message.action) : "";
+    const payload =
+      message && message.payload && typeof message.payload === "object"
+        ? message.payload
+        : {};
+    return queueItemsMutation(async () => {
+      try {
+        return await mutateStoredItems(action, payload);
+      } catch (err) {
+        return {
+          ok: false,
+          reason: "mutation-failed",
+          error: getErrorMessage(err),
+        };
+      }
+    });
+  }
+  if (message.type === "sidebar-opened-trigger-focus") {
+    // sidebar.js menghantar mesej ini apabila sidebar.html dimuat.
+    // Kita trigger focus pipeline supaya content script dalam iframe mendapat focus.
+    addSidebarFocusDebugLog("sidebar-opened-trigger-focus-received");
+    sidebarPanelOpen = true;
+    sidebarCurrentMode = "ai";
+    emitSidebarChatFocusSignal();
+    requestFocusViaSidebarPorts();
+    if (sendResponse) sendResponse({ ok: true });
+    return true;
+  }
+  if (message.type === "sidebar-focus-status") {
+    addSidebarFocusDebugLog("sidebar-focus-status-report", {
+      focused: !!message.focused,
+      osFocused: !!message.osFocused,
+    });
+    if (message.focused) {
+      sidebarFocusReportedAt = Date.now();
+    }
+    if (message.osFocused) {
+      sidebarOsFocusReportedAt = Date.now();
+    }
+    if (sendResponse) sendResponse({ ok: true });
+    return true;
+  }
+  if (message.type === "focus-sidebar-chat-input") {
+    addSidebarFocusDebugLog("focus-sidebar-chat-input-message", {
+      targetWindowId:
+        sender && sender.tab && typeof sender.tab.windowId === "number"
+          ? sender.tab.windowId
+          : null,
+    });
+    (async () => {
+      try {
+        const targetWindowId =
+          sender && sender.tab && typeof sender.tab.windowId === "number"
+            ? sender.tab.windowId
+            : null;
+        const ok = await focusSidebarChatInputFromAnywhere(targetWindowId);
+        if (sendResponse) sendResponse({ ok });
+      } catch (err) {
+        if (sendResponse)
+          sendResponse({ ok: false, error: getErrorMessage(err) });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "press-native-f6") {
+    // Jarvis sidebar minta F6 tulen ditekan beberapa kali (native helper).
+    const count = message && Number.isFinite(message.count) ? message.count : 3;
+    requestNativeF6Times(count, "jarvis-sidebar-open");
+    if (sendResponse) sendResponse({ ok: true });
+    return true;
+  }
+  if (message.type === "sidebar-provider-loaded") {
+    addSidebarFocusDebugLog("sidebar-provider-loaded-signal", {
+      provider: message && message.provider ? String(message.provider) : "unknown",
+    });
+    sidebarProviderLoaded = true;
+    emitSidebarChatFocusSignal();
+    requestFocusViaSidebarPorts();
+    requestFocusOnSidebarAiInputTabs(null).catch(() => {});
+    // Hantar check-pending-prompt ke tab yang baru loaded supaya prompt diproses segera
+    const loadedProvider = message && message.provider ? String(message.provider) : "";
+    const senderTabId = sender && sender.tab && typeof sender.tab.id === "number" ? sender.tab.id : null;
+    // Cuba hantar terus ke sender tab dahulu (lebih laju, mengelak isu Firefox sidebar query)
+    if (senderTabId !== null) {
+      sendMessageToTabSafe(senderTabId, { type: "check-pending-prompt" }).catch(() => {});
+    }
+    requestPendingPromptCheckOnSidebarAiTabs(null, loadedProvider === "gemini" ? 12 : 6).catch(() => {});
+    if (sendResponse) sendResponse({ ok: true });
+    return true;
+  }
+  if (message.type === "sidebar-native-f6-request") {
+    const now = Date.now();
+    if (now - lastNativeF6RetryAt < SIDEBAR_NATIVE_F6_RETRY_COOLDOWN_MS) {
+      addSidebarFocusDebugLog("native-f6-request-skipped", {
+        trigger: "sidebar-native-f6-request",
+        reason: "cooldown",
+        cooldownMs: SIDEBAR_NATIVE_F6_RETRY_COOLDOWN_MS,
+      });
+      if (sendResponse) sendResponse({ ok: false, reason: "cooldown" });
+      return true;
+    }
+    if (!sidebarPanelOpen) {
+      addSidebarFocusDebugLog("native-f6-request-skipped", {
+        trigger: "sidebar-native-f6-request",
+        reason: "sidebar-closed",
+      });
+      if (sendResponse) sendResponse({ ok: false, reason: "sidebar-closed" });
+      return true;
+    }
+    lastNativeF6RetryAt = now;
+    const trigger =
+      message && message.reason ? String(message.reason) : "sidebar-native-f6-request";
+    addSidebarFocusDebugLog("native-f6-requested", { trigger });
+    const ok = requestNativeF6SidebarFocusTwice(trigger);
+    if (sendResponse) sendResponse({ ok });
+    return true;
+  }
+
+  if (message.type === "open-picker-item") {
+    if (!message.url) return;
+    const urlToOpen = message.url;
+
+    getItems().then(items => {
+      const matched = items.find(it => it && it.url && urlsMatchForSave(urlToOpen, it.url));
+      if (matched && matched.id) {
+        const catId = matched.categoryId ? String(matched.categoryId) : "all";
+        lpStoreSet({
+          [CATEGORY_PICKER_LAST_LOCATION_KEY]: {
+            mode: "items",
+            categoryId: catId,
+            lastOpenedItemId: String(matched.id),
+            lastOpenedAt: Date.now(),
+            updatedAt: new Date().toISOString(),
+          },
+          [SELECTED_CATEGORY_KEY]: catId,
+        }).catch(() => {});
+      }
+    }).catch(() => {});
+
+    return openUrlInUserContext(urlToOpen, !!message.newTab, !!message.newTab).then(async (opened) => {
+      if (!opened || !opened.ok) {
+        return { ok: false, reason: opened && opened.reason ? opened.reason : "invalid-url" };
+      }
+      if (currentSettings.deleteAfterOpen) {
+        await removeItemByUrl(message.url);
+      }
+      if (opened.tabId || opened.tabId === 0) {
+        const items = await getItems();
+        const saved = isUrlSaved(opened.url || urlToOpen, items);
+        await setPageActionStateFast({ id: opened.tabId, url: opened.url || urlToOpen }, saved);
+      }
+      return { ok: true };
+    });
+  }
+  if (message.type === "summary-sidebar-chat") {
+    const chatUrl = message.payload && message.payload.chatUrl ? message.payload.chatUrl : "";
+    const matchedProvider = inferSummaryProviderFromChatUrl(chatUrl);
+    if (chatUrl && matchedProvider) {
+      const sourceMeta = getSummarySessionSourceMeta(
+        message && message.payload && message.payload.sessionId
+          ? message.payload.sessionId
+          : "",
+      );
+      if (sourceMeta && sourceMeta.sourceUrl && lpApi.storage && lpApi.storage.local) {
+        saveSummaryHistoryEntry(sourceMeta.sourceUrl, chatUrl, {
+          ...sourceMeta,
+          provider: sourceMeta.provider || matchedProvider,
+        }).catch(() => { });
+      }
+    }
+    if (summarySidebarTabId) {
+      try {
+        lpApi.tabs.sendMessage(summarySidebarTabId, message);
+      } catch (err) {
+        // ignore
+      }
+    }
+    if (sendResponse) sendResponse({ ok: true });
+    return false;
+  }
+  if (message.type === "request-pending-prompt") {
+    const requestedProvider = normalizeSummaryAiProvider(
+      message && message.provider ? message.provider : "chatgpt",
+    );
+    (async () => {
+      try {
+        if (!pendingSidebarPromptData) {
+          await ensurePendingSidebarPromptDataLoaded();
+        }
+        if (!pendingSidebarPromptData) {
+          if (sendResponse) {
+            sendResponse({
+              prompt: null,
+              provider: requestedProvider,
+              sessionId: "",
+            });
+          }
+          return;
+        }
+
+        const data = { ...pendingSidebarPromptData };
+        const pendingProvider = normalizeSummaryAiProvider(
+          data.provider || "chatgpt",
+        );
+        if (pendingProvider !== requestedProvider) {
+          if (sendResponse) {
+            sendResponse({
+              prompt: null,
+              provider: pendingProvider,
+              sessionId: data.sessionId ? String(data.sessionId) : "",
+            });
+          }
+          return;
+        }
+
+        clearPendingSidebarPromptData(); // Clear after serving once by matching provider.
+        clearPendingSidebarProviderOverride();
+        if (sendResponse) {
+          sendResponse({
+            prompt: data.text,
+            sessionId: data.sessionId,
+            provider: pendingProvider,
+          });
+        }
+      } catch (err) {
+        if (sendResponse) {
+          sendResponse({
+            prompt: null,
+            provider: requestedProvider,
+            sessionId: "",
+          });
+        }
+      }
+    })();
+    return true; // Keep channel open for sendResponse
+  }
+  if (message.type === "has-pending-sidebar-prompt") {
+    const response = {
+      hasPendingPrompt: !!pendingSidebarPromptData,
+      provider: pendingSidebarPromptData
+        ? normalizeSummaryAiProvider(
+          pendingSidebarPromptData.provider || "chatgpt",
+        )
+        : "chatgpt",
+    };
+    if (sendResponse) sendResponse(response);
+    return false;
+  }
+  if (message.type === "peek-pending-sidebar-provider") {
+    const provider = getPendingSidebarProviderOverride();
+    const response = {
+      hasPendingProvider: !!provider,
+      provider: provider || "chatgpt",
+    };
+    if (sendResponse) sendResponse(response);
+    return false;
+  }
+  if (message.type === "consume-pending-sidebar-provider") {
+    const provider = getPendingSidebarProviderOverride();
+    clearPendingSidebarProviderOverride();
+    const response = {
+      hasPendingProvider: !!provider,
+      provider: provider || "chatgpt",
+    };
+    if (sendResponse) sendResponse(response);
+    return false;
+  }
+  if (message.type === "sidebar-ui-switch-provider") {
+    const newProvider = normalizeSummaryAiProvider(message.provider);
+    if (newProvider) {
+      // Warm up session cookies untuk provider baru secara background
+      warmUpProviderSession(newProvider).catch(() => {});
+
+      if (pendingSidebarPromptData) {
+        pendingSidebarPromptData.provider = newProvider;
+        persistPendingSidebarPromptDataToStorage();
+      }
+
+      // Update settings properly via setSettings to ensure it persists
+      if (typeof setSettings === "function") {
+        setSettings({ sidebarAiProvider: newProvider }).then(updated => {
+          currentSettings = updated;
+        }).catch(() => {});
+      } else {
+        currentSettings.sidebarAiProvider = newProvider;
+        if (lpApi.storage && lpApi.storage.local && lpApi.storage.local.set) {
+          lpStoreSet({ [SETTINGS_KEY]: currentSettings }).catch(() => { });
+        }
+      }
+
+      // Reload sidebar or tab
+      if (IS_FIREFOX && lpApi.sidebarAction && lpApi.sidebarAction.setPanel) {
+        sidebarCurrentMode = "ai";
+        sidebarCurrentProvider = newProvider;
+        // For Firefox sidebar: the content script already navigates directly via
+        // window.location.replace(). We avoid sidebarAction.setPanel() here to
+        // prevent a race condition between the content script's direct navigation
+        // and the panel reload. The setting is already saved above, so the next
+        // sidebar open will use the correct provider.
+        if (sender && sender.tab && sender.tab.id && lpApi.tabs && lpApi.tabs.sendMessage) {
+          lpApi.tabs.sendMessage(sender.tab.id, {
+            type: "sidebar-ui-navigate-provider",
+            provider: newProvider
+          }).catch(() => { });
+        }
+      } else if (sender && sender.tab && sender.tab.id && lpApi.tabs && lpApi.tabs.update) {
+        // Chrome/Edge (floating window tab): navigate via sidebar.html so the
+        // extension page (different origin) forces a true cross-origin reload,
+        // then sidebar.html redirects to the new provider URL.
+        // Navigating directly to the provider URL (same origin as current tab)
+        // is silently ignored by Chrome/Edge when the tab is already on that domain.
+        const tabId = sender.tab.id;
+        let sidebarUrl = lpApi.runtime.getURL("sidebar.html");
+        try {
+          const sidebarUrlObj = new URL(sidebarUrl);
+          sidebarUrlObj.searchParams.set("provider", newProvider);
+          sidebarUrlObj.searchParams.set("reload", Date.now().toString(36));
+          sidebarUrl = sidebarUrlObj.toString();
+        } catch (err) { }
+
+        // We use a double-hop for maximum reliability on Chrome/Edge:
+        // 1. First navigate to a blank extension page to break the current origin.
+        // 2. Then navigate to sidebar.html which handles the final AI provider redirect.
+        lpApi.tabs.update(tabId, { url: "about:blank" }).then(() => {
+          setTimeout(() => {
+            lpApi.tabs.update(tabId, { url: sidebarUrl }).catch(() => {});
+          }, 40);
+        }).catch(() => {
+          // Fallback to direct update if blank navigation fails
+          lpApi.tabs.update(tabId, { url: sidebarUrl }).catch(() => {});
+        });
+      }
+    }
+    return true;
+  }
+  // ─── Overlay AI Popup Window Management ──────────────────────────────────
+  if (message.type === "open-ai-overlay-popup") {
+    (async () => {
+      try {
+        if (!lpApi.windows || !lpApi.windows.create) {
+          if (sendResponse) sendResponse({ ok: false });
+          return;
+        }
+        const senderTabId = sender && sender.tab && typeof sender.tab.id === "number" ? sender.tab.id : null;
+        if (senderTabId === null && sendResponse) {
+          sendResponse({ ok: false });
+          return;
+        }
+
+        // Close existing popup for this tab if any
+        const existing = overlayPopupBySenderTab.get(senderTabId);
+        if (existing) {
+          try { lpApi.windows.remove(existing.windowId).catch(() => {}); } catch (_) {}
+          overlayPopupBySenderTab.delete(senderTabId);
+        }
+
+        const provider = message.provider ? normalizeSummaryAiProvider(message.provider) : "chatgpt";
+        
+        // Use overlay wrapper instead of direct provider URL
+        const wrapperUrl = lpApi.runtime.getURL("overlay-wrapper.html") + "?provider=" + encodeURIComponent(provider);
+        let providerUrl = wrapperUrl;
+        
+        // Warmup session cookies in background
+        warmUpProviderSession(provider).catch(() => {});
+
+        // Get overlay dimensions from message or use defaults
+        const w = typeof message.width === "number" && message.width >= 340 ? message.width : 960;
+        const h = typeof message.height === "number" && message.height >= 320 ? message.height : 560;
+
+        // Position at bottom-right of screen
+        const availW = typeof screen !== "undefined" && screen && screen.availWidth ? screen.availWidth : 1440;
+        const availH = typeof screen !== "undefined" && screen && screen.availHeight ? screen.availHeight : 900;
+        const left = Math.max(0, availW - w - 20);
+        const top = Math.max(0, availH - h - 60);
+
+        const win = await lpApi.windows.create({
+          url: providerUrl,
+          type: "popup",
+          focused: false,
+          width: w,
+          height: h,
+          left: left,
+          top: top
+        });
+
+        if (!win || !win.id) {
+          if (sendResponse) sendResponse({ ok: false });
+          return;
+        }
+
+        const popupTabId = win.tabs && win.tabs[0] && win.tabs[0].id ? win.tabs[0].id : null;
+        overlayPopupBySenderTab.set(senderTabId, { windowId: win.id, tabId: popupTabId, provider: provider, currentUrl: providerUrl });
+
+        // Track URL changes in the popup tab untuk simpan last conversation
+        const urlTracker = (tabId, changeInfo, tab) => {
+          if (tabId !== popupTabId) return;
+          if (changeInfo.status === "complete" && tab && tab.url) {
+            const entry = overlayPopupBySenderTab.get(senderTabId);
+            if (entry) {
+              entry.currentUrl = tab.url;
+              try {
+                const cleanUrl = new URL(tab.url);
+                cleanUrl.searchParams.delete("lp_popup");
+                overlayLastConversationUrl.set(entry.provider, cleanUrl.toString());
+              } catch (_) {}
+            }
+          }
+        };
+        if (lpApi.tabs && lpApi.tabs.onUpdated && lpApi.tabs.onUpdated.addListener) {
+          try { lpApi.tabs.onUpdated.addListener(urlTracker); } catch (_) {}
+        }
+
+        // Listen for window close to notify overlay + save last URL
+        const onRemoved = (closedId) => {
+          if (closedId === win.id) {
+            const entry = overlayPopupBySenderTab.get(senderTabId);
+            if (entry && entry.currentUrl) {
+              try {
+                const cleanUrl = new URL(entry.currentUrl);
+                cleanUrl.searchParams.delete("lp_popup");
+                overlayLastConversationUrl.set(entry.provider, cleanUrl.toString());
+              } catch (_) {}
+            }
+            overlayPopupBySenderTab.delete(senderTabId);
+            if (lpApi.tabs && lpApi.tabs.onUpdated && lpApi.tabs.onUpdated.removeListener) {
+              try { lpApi.tabs.onUpdated.removeListener(urlTracker); } catch (_) {}
+            }
+            if (lpApi.windows && lpApi.windows.onRemoved && lpApi.windows.onRemoved.removeListener) {
+              try { lpApi.windows.onRemoved.removeListener(onRemoved); } catch (_) {}
+            }
+            try {
+              if (lpApi.tabs && lpApi.tabs.sendMessage) {
+                lpApi.tabs.sendMessage(senderTabId, { type: "ai-overlay-popup-closed" }).catch(() => {});
+              }
+            } catch (_) {}
+          }
+        };
+        if (lpApi.windows && lpApi.windows.onRemoved && lpApi.windows.onRemoved.addListener) {
+          try { lpApi.windows.onRemoved.addListener(onRemoved); } catch (_) {}
+        }
+
+        if (sendResponse) sendResponse({ ok: true, windowId: win.id });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, error: getErrorMessage(err) });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "close-ai-overlay-popup") {
+    (async () => {
+      try {
+        const senderTabId = sender && sender.tab && typeof sender.tab.id === "number" ? sender.tab.id : null;
+        if (senderTabId !== null) {
+          const entry = findOverlayEntry(senderTabId);
+          if (entry) {
+            // Save last URL before closing
+            if (entry.currentUrl) {
+              try {
+                const cleanUrl = new URL(entry.currentUrl);
+                cleanUrl.searchParams.delete("lp_popup");
+                overlayLastConversationUrl.set(entry.provider, cleanUrl.toString());
+              } catch (_) {}
+            }
+            // Cari key untuk delete (mungkin webpage tab atau popup tab)
+            for (const [k, e] of overlayPopupBySenderTab) {
+              if (e === entry) { overlayPopupBySenderTab.delete(k); break; }
+            }
+            try { lpApi.windows.remove(entry.windowId).catch(() => {}); } catch (_) {}
+          }
+        }
+        clearNativeF6SidebarFocusOnNextPortConnect();
+        sendSidebarCleanupMessage().catch(() => {});
+        if (sendResponse) sendResponse({ ok: true });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, error: getErrorMessage(err) });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "update-ai-overlay-popup") {
+    (async () => {
+      try {
+        const senderTabId = sender && sender.tab && typeof sender.tab.id === "number" ? sender.tab.id : null;
+        if (senderTabId !== null) {
+          const entry = findOverlayEntry(senderTabId);
+          if (entry && entry.tabId) {
+            const newProvider = message.provider ? normalizeSummaryAiProvider(message.provider) : "chatgpt";
+            // Use overlay wrapper URL instead of direct provider URL
+            const wrapperUrl = lpApi.runtime.getURL("overlay-wrapper.html") + "?provider=" + encodeURIComponent(newProvider);
+            entry.provider = newProvider;
+            entry.currentUrl = wrapperUrl;
+            try { 
+              await lpApi.tabs.update(entry.tabId, { url: wrapperUrl });
+              warmUpProviderSession(newProvider).catch(() => {});
+            } catch (_) {}
+          }
+        }
+        if (sendResponse) sendResponse({ ok: true });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, error: getErrorMessage(err) });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "move-ai-overlay-popup") {
+    (async () => {
+      try {
+        const senderTabId = sender && sender.tab && typeof sender.tab.id === "number" ? sender.tab.id : null;
+        if (senderTabId !== null) {
+          const entry = findOverlayEntry(senderTabId);
+          if (entry) {
+            const updateOpts = {};
+            if (typeof message.left === "number") updateOpts.left = message.left;
+            if (typeof message.top === "number") updateOpts.top = message.top;
+            if (typeof message.width === "number" && message.width >= 340) updateOpts.width = message.width;
+            if (typeof message.height === "number" && message.height >= 320) updateOpts.height = message.height;
+            if (Object.keys(updateOpts).length > 0) {
+              try { await lpApi.windows.update(entry.windowId, updateOpts); } catch (_) {}
+            }
+          }
+        }
+        if (sendResponse) sendResponse({ ok: true });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, error: getErrorMessage(err) });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "peek-pending-sidebar-prompt") {
+    if (pendingSidebarPromptData) {
+      if (sendResponse) {
+        sendResponse(
+          buildPendingSidebarPromptResponse(pendingSidebarPromptData),
+        );
+      }
+      return false;
+    }
+    (async () => {
+      try {
+        await ensurePendingSidebarPromptDataLoaded();
+      } catch (err) {
+        // ignore restore failure, return empty payload below
+      }
+      if (sendResponse) {
+        sendResponse(
+          pendingSidebarPromptData
+            ? buildPendingSidebarPromptResponse(pendingSidebarPromptData)
+            : buildNoPendingSidebarPromptResponse("chatgpt", ""),
+        );
+      }
+    })();
+    return true;
+  }
+  if (message.type === "consume-pending-sidebar-prompt") {
+    const expectedSessionId =
+      message && message.sessionId ? String(message.sessionId) : "";
+    const consumeNow = () => {
+      if (!pendingSidebarPromptData) {
+        return buildNoPendingSidebarPromptResponse("chatgpt", "");
+      }
+      const pendingSessionId = pendingSidebarPromptData.sessionId
+        ? String(pendingSidebarPromptData.sessionId)
+        : "";
+      const pendingProvider = normalizeSummaryAiProvider(
+        pendingSidebarPromptData.provider || "chatgpt",
+      );
+      if (pendingSessionId) {
+        if (!expectedSessionId || pendingSessionId !== expectedSessionId) {
+          return buildNoPendingSidebarPromptResponse(
+            pendingProvider,
+            pendingSessionId,
+          );
+        }
+      } else if (expectedSessionId) {
+        return buildNoPendingSidebarPromptResponse(pendingProvider, "");
+      }
+      const data = { ...pendingSidebarPromptData };
+      clearPendingSidebarPromptData();
+      clearPendingSidebarProviderOverride();
+      return buildPendingSidebarPromptResponse(data);
+    };
+
+    if (pendingSidebarPromptData) {
+      if (sendResponse) sendResponse(consumeNow());
+      return false;
+    }
+    (async () => {
+      try {
+        await ensurePendingSidebarPromptDataLoaded();
+      } catch (err) {
+        // ignore restore failure
+      }
+      if (sendResponse) {
+        sendResponse(consumeNow());
+      }
+    })();
+    return true;
+  }
+  if (message.type === "summary-session-submitted") {
+    const sessionId =
+      message && message.payload && message.payload.sessionId
+        ? String(message.payload.sessionId)
+        : "";
+    if (!sessionId) {
+      if (sendResponse) sendResponse({ ok: false });
+      return false;
+    }
+    const chatUrl = message.payload && message.payload.chatUrl ? message.payload.chatUrl : "";
+    const matchedProvider = inferSummaryProviderFromChatUrl(chatUrl);
+    if (chatUrl && matchedProvider) {
+      const sourceMeta = getSummarySessionSourceMeta(sessionId);
+      if (sourceMeta && sourceMeta.sourceUrl && lpApi.storage && lpApi.storage.local) {
+        saveSummaryHistoryEntry(sourceMeta.sourceUrl, chatUrl, {
+          ...sourceMeta,
+          provider: sourceMeta.provider || matchedProvider,
+        }).catch(() => { });
+      }
+    }
+    (async () => {
+      await handleSummarySessionSubmitted(sessionId);
+    })().catch((err) => { console.error("[summary-session-submitted] failed", err); });
+    if (sendResponse) sendResponse({ ok: true });
+    return false;
+  }
+  if (message.type === "summary-session-complete") {
+    const sessionId =
+      message && message.payload && message.payload.sessionId
+        ? String(message.payload.sessionId)
+        : "";
+    if (!sessionId) {
+      if (sendResponse) sendResponse({ ok: false });
+      return false;
+    }
+    const chatUrl = message.payload && message.payload.chatUrl ? message.payload.chatUrl : "";
+    const matchedProvider = inferSummaryProviderFromChatUrl(chatUrl);
+    if (chatUrl && matchedProvider) {
+      const sourceMeta = getSummarySessionSourceMeta(sessionId);
+      if (sourceMeta && sourceMeta.sourceUrl && lpApi.storage && lpApi.storage.local) {
+        saveSummaryHistoryEntry(sourceMeta.sourceUrl, chatUrl, {
+          ...sourceMeta,
+          provider: sourceMeta.provider || matchedProvider,
+        }).catch(() => { });
+      }
+    }
+    (async () => {
+      await handleSummarySessionComplete(sessionId);
+    })().catch((err) => { console.error("[summary-session-complete] failed", err); });
+    if (sendResponse) sendResponse({ ok: true });
+    return false;
+  }
+  if (message.type === "ai-category-classification-result") {
+    const payload =
+      message && message.payload && typeof message.payload === "object"
+        ? message.payload
+        : {};
+    return handleAiCategoryClassificationResultMessage(payload)
+      .then((result) => {
+        if (sendResponse) sendResponse(result);
+      })
+      .catch((err) => {
+        if (sendResponse) {
+          sendResponse({
+            ok: false,
+            reason: "classification-result-failed",
+            error: getErrorMessage(err),
+          });
+        }
+      });
+  }
+  if (message.type === "ai-category-classification-error") {
+    const payload =
+      message && message.payload && typeof message.payload === "object"
+        ? message.payload
+        : {};
+    const result = handleAiCategoryClassificationErrorMessage(payload);
+    if (sendResponse) sendResponse(result);
+    return false;
+  }
+  if (message.type === "summary-autofill-fallback") {
+    const payload =
+      message && message.payload && typeof message.payload === "object"
+        ? message.payload
+        : {};
+    const provider = normalizeSummaryAiProvider(
+      payload && payload.provider ? String(payload.provider) : "chatgpt",
+    );
+    const aiLabel = getSummaryAiProviderLabel(provider);
+    const reason =
+      payload && payload.reason ? String(payload.reason) : "unknown";
+    const copied = payload && payload.copied === true;
+    const adapterId =
+      payload && payload.adapterId ? String(payload.adapterId) : "";
+    const attempts = Number.isFinite(payload && payload.attempts)
+      ? Number(payload.attempts)
+      : 0;
+    debugWarn("summary autofill fallback", {
+      provider,
+      reason,
+      copied,
+      adapterId,
+      attempts,
+    });
+
+    const now = Date.now();
+    if (
+      now - lastSummaryAutofillFallbackNoticeAt >=
+      SUMMARY_AUTOFILL_FALLBACK_NOTICE_COOLDOWN_MS
+    ) {
+      lastSummaryAutofillFallbackNoticeAt = now;
+      if (lpApi.notifications && lpApi.notifications.create) {
+        try {
+          lpApi.notifications.create("local-pocket-summary-autofill-fallback", {
+            type: "basic",
+            iconUrl: lpApi.runtime.getURL("icons/icon48.png"),
+            title: "Auto-submit perlu bantuan manual",
+            message: buildSummaryAutofillFallbackNotificationMessage({
+              aiLabel,
+              copied,
+              reason,
+              adapterId,
+              attempts,
+            }),
+            silent: true
+          });
+        } catch (err) {
+          // ignore
+        }
+      }
+    }
+    if (sendResponse) sendResponse({ ok: true });
+    return false;
+  }
+
+  if (message.type === "remove-link-url") {
+    if (sender && sender.tab) {
+      setPageActionStateFast(sender.tab, false).catch(() => { });
+    }
+    (async () => {
+      try {
+        const url = message && message.url ? String(message.url) : "";
+        await removeItemByUrl(url);
+
+        // Maklumkan Category Picker untuk refresh data
+        if (lpApi.runtime && lpApi.runtime.sendMessage) {
+          lpApi.runtime.sendMessage({ type: "refresh-picker-ui" }).catch(() => { });
+        }
+
+        if (sendResponse) sendResponse({ ok: true });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, error: String(err) });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "save-link-url") {
+    if (sender && sender.tab) {
+      setPageActionStateFast(sender.tab, true).catch(() => { });
+    }
+    (async () => {
+      try {
+        const url = message && message.url ? String(message.url) : "";
+        let title = message && message.title ? String(message.title) : "";
+        const isYouTubeUrl = !!extractYouTubeVideoId(url);
+        const isDifferentPage = sender && sender.tab && sender.tab.url && !urlsMatchForSave(url, sender.tab.url);
+        if (!title || looksLikeUrlText(title, url) || isGenericFallbackTitleText(title) || isYouTubeUrl || isDifferentPage) {
+          const resolved = await resolveSavedItemTitle(url, title, { forceRemote: true });
+          if (resolved) title = resolved;
+        }
+        const hasExplicitCategory =
+          !!message
+          && Object.prototype.hasOwnProperty.call(message, "categoryId");
+        const hasExplicitFavorite =
+          !!message
+          && Object.prototype.hasOwnProperty.call(message, "favorite");
+        let requestedCategoryId = hasExplicitCategory
+          ? String(message.categoryId || "")
+          : null;
+
+        if (message.useActiveCategory) {
+          requestedCategoryId = await getSelectedCategoryId();
+        }
+
+        // Jika hidden categories kelihatan (>=1), paksa simpanan shortcut (Direct/Active) ke realm hidden
+        if (currentSettings.showHiddenCategories >= 1 && !hasExplicitCategory) {
+          if (!requestedCategoryId || requestedCategoryId === "all" || requestedCategoryId === "none" || requestedCategoryId === "hidden_all" || requestedCategoryId === "all_hidden") {
+            requestedCategoryId = "hidden_none";
+          } else if (requestedCategoryId !== "hidden_none") {
+            const cats = await getCachedCategories();
+            const isHidden = cats.some(c => c && c.id === requestedCategoryId && c.hidden);
+            if (!isHidden) {
+              requestedCategoryId = "hidden_none";
+            }
+          }
+        }
+
+        const requestedFavorite = hasExplicitFavorite
+          ? message.favorite === true
+          : false;
+        const thumbnailFromPage = message && message.thumbnailUrl ? String(message.thumbnailUrl) : "";
+        const result = await upsertMinimalItemFromUrl(
+          url,
+          title,
+          requestedCategoryId,
+          {
+            favorite: requestedFavorite,
+            thumbnailUrl: thumbnailFromPage
+          },
+        );
+        if (result) {
+          // Maklumkan Category Picker untuk refresh data (UI update minimal)
+          const notifyRefresh = () => {
+            if (lpApi.runtime && lpApi.runtime.sendMessage) {
+              lpApi.runtime.sendMessage({ type: "refresh-picker-ui" }).catch(() => { });
+            }
+            if (sender && sender.tab && sender.tab.id && lpApi.tabs && lpApi.tabs.sendMessage) {
+              lpApi.tabs.sendMessage(sender.tab.id, { type: "refresh-picker-ui" }).catch(() => { });
+            }
+          };
+          notifyRefresh();
+          setTimeout(notifyRefresh, 800);
+
+          // Trigger full extraction ONLY if no thumbnail was provided and URL matches current tab
+          const hasThumbnail = thumbnailFromPage || (result && result.thumbnailUrl);
+          if (sender && sender.tab && sender.tab.id && sender.tab.url && !hasThumbnail) {
+            if (urlsMatchForSave(url, sender.tab.url)) {
+              saveFromTab(sender.tab, requestedCategoryId ? { forcedCategoryId: requestedCategoryId } : {}).catch(() => { });
+            } else {
+            }
+          }
+        }
+
+        const categoryId =
+          result && result.categoryId ? String(result.categoryId) : "";
+        let categoryName = "";
+        try {
+          const categories = sortCategories(await getCachedCategories());
+          categoryName = getCategoryLabel(categoryId || "", categories);
+        } catch (err) {
+          categoryName = "";
+        }
+        const saveLabel =
+          requestedFavorite === true
+            ? "Favorite"
+            : categoryName;
+        if (sendResponse) {
+          sendResponse({
+            ok: true,
+            categoryId,
+            categoryName,
+            saveLabel,
+            favorite: !!(result && result.favorite),
+          });
+        }
+      } catch (err) {
+        if (sendResponse)
+          sendResponse({
+            ok: false,
+            error: err && err.message ? err.message : String(err),
+          });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "save-link-url-batch") {
+    (async () => {
+      try {
+        const payloads = Array.isArray(message.payloads) ? message.payloads : [];
+        if (!payloads.length) {
+          if (sendResponse) sendResponse({ ok: false });
+          return;
+        }
+
+        // Resolve active category once for all payloads that request it or have no categoryId
+        const needsActiveCategory = payloads.some(p => p.useActiveCategory || !p.categoryId || p.categoryId === "all" || p.categoryId === "none");
+        let activeCategoryId = "";
+        if (needsActiveCategory) {
+          activeCategoryId = normalizeCategoryIdForSave(await getSelectedCategoryId()) || "";
+        }
+
+        // Apply active category to payloads that need it
+        for (const p of payloads) {
+          if (p.useActiveCategory || !p.categoryId || p.categoryId === "all" || p.categoryId === "none") {
+            p.categoryId = activeCategoryId;
+          }
+        }
+
+        // Resolve titles via remote fetch untuk accuracy (parallel)
+        await Promise.all(payloads.map(async (p) => {
+          if (p.url) {
+            const resolved = await resolveSavedItemTitle(p.url, p.title || "", { forceRemote: true });
+            if (resolved) p.title = resolved;
+          }
+        }));
+
+        // Jika hidden categories kelihatan (>=1), paksa simpanan batch ke realm hidden
+        if (currentSettings.showHiddenCategories >= 1) {
+          const cats = await getCachedCategories();
+          for (const p of payloads) {
+            let cid = p.categoryId ? String(p.categoryId) : "";
+            if (!cid || cid === "all" || cid === "none" || cid === "hidden_all" || cid === "all_hidden") {
+              p.categoryId = "hidden_none";
+            } else if (cid !== "hidden_none") {
+              const isHidden = cats.some(c => c && c.id === cid && c.hidden);
+              if (!isHidden) p.categoryId = "hidden_none";
+            }
+          }
+        }
+
+        const count = await upsertMinimalItemFromUrlBatch(payloads);
+        let categoryName = "";
+        let resolvedCategoryId = payloads[0] && payloads[0].categoryId ? String(payloads[0].categoryId) : "";
+        try {
+          const categories = sortCategories(await getCachedCategories());
+          if (resolvedCategoryId) {
+            categoryName = getCategoryLabel(resolvedCategoryId, categories);
+          }
+        } catch (err) {
+          categoryName = "";
+        }
+        if (sendResponse) sendResponse({ ok: true, count, categoryName, categoryId: resolvedCategoryId });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, error: err && err.message ? err.message : String(err) });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "get-selected-category") {
+    (async () => {
+      try {
+        const categoryId = await getSelectedCategoryId();
+        const categories = sortCategories(await getCachedCategories());
+        const categoryName = categoryId ? getCategoryLabel(String(categoryId), categories) : "";
+        if (sendResponse) sendResponse({ ok: true, categoryId: categoryId || "", categoryName });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: true, categoryId: "", categoryName: "" });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "youtube-video-ended") {
+    return handleYouTubeVideoEnded(message, sender);
+  }
+  if (message.type === "open-options") {
+    try {
+      if (lpApi.runtime && lpApi.runtime.openOptionsPage) {
+        return lpApi.runtime.openOptionsPage();
+      }
+      if (lpApi.runtime && lpApi.runtime.getURL) {
+        return lpApi.tabs.create({ url: lpApi.runtime.getURL("options.html") });
+      }
+    } catch (err) {
+      // ignore
+    }
+  }
+  if (message.type === "open-sss-settings") {
+    try {
+      if (lpApi.runtime && lpApi.runtime.getURL && lpApi.tabs && lpApi.tabs.create) {
+        lpApi.tabs.create({ url: lpApi.runtime.getURL("options-sss.html") }).catch(() => {});
+      }
+    } catch (err) {
+      // ignore
+    }
+    if (sendResponse) sendResponse({ ok: true });
+    return true;
+  }
+  if (message.type === "open-chatgpt-popup") {
+    (async () => {
+      try {
+        const tabId = await findOrCreateChatGptPopupTab();
+        if (sendResponse) sendResponse({ ok: !!tabId, tabId: tabId || null });
+      } catch (err) {
+        if (sendResponse)
+          sendResponse({ ok: false, error: getErrorMessage(err) });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "fetch-thumbnail-on-demand") {
+    (async () => {
+      try {
+        lpLog("info", "[RGFIX] fetch-thumbnail-on-demand", { itemId: message.itemId, url: message.url, force: message.force });
+        // Untuk redgifs (SPA), cuba dapatkan gambar profil dari tab yang sedang dibuka
+        // (DOM sudah di-render, ada <img src="userpic.redgifs.com">). Ini paling boleh diharap.
+        let prefetched = null;
+        if (/redgifs\.com/i.test(message.url || "")) {
+          prefetched = await tryGetRedgifsUserpicFromTab(message.url);
+        } else if (/instagram\.com/i.test(message.url || "")) {
+          prefetched = await tryGetInstagramProfilePicFromTab(message.url);
+        }
+        // force: true — paksa fetch semula walaupun thumbnailUrl sudah ada (dari right-click Refresh).
+        // Kita TIDAK clear thumbnailUrl dulu supaya thumbnail sedia ada kekal jika fetch gagal,
+        // dan elak picker tunjuk gambar kosong sekejap. fetchAndSaveThumbnailDirect dengan
+        // force=true akan langkau fast-path cache dan tetap fetch semula.
+        await fetchAndSaveThumbnailDirect(message.itemId, message.url, !!message.force, prefetched);
+        // Also refresh UI after fetch
+        setTimeout(() => {
+          if (lpApi.runtime && lpApi.runtime.sendMessage) {
+            lpApi.runtime.sendMessage({ type: "refresh-picker-ui" }).catch(() => {});
+          }
+        }, 500);
+      } catch (err) {
+        // ignore
+      }
+    })();
+    return true;
+  }
+  // Handler untuk fetch senarai kandidat gambar dari halaman (untuk image picker UI)
+  if (message.type === "fetch-image-candidates") {
+    (async () => {
+      try {
+        const url = message.url ? String(message.url) : "";
+        if (!url) { if (sendResponse) sendResponse({ ok: false, candidates: [] }); return; }
+        const candidates = await fetchImageCandidatesForUrl(url);
+        if (sendResponse) sendResponse({ ok: true, candidates });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, candidates: [] });
+      }
+    })();
+    return true;
+  }
+  // Handler untuk kemaskini faviconUrl atau thumbnailUrl secara manual dari picker
+  if (message.type === "set-item-image") {
+    (async () => {
+      try {
+        const itemId = message.itemId ? String(message.itemId) : "";
+        const fields = message.fields && typeof message.fields === "object" ? message.fields : {};
+        if (!itemId || !Object.keys(fields).length) {
+          if (sendResponse) sendResponse({ ok: false, reason: "invalid-params" });
+          return;
+        }
+        const ALLOWED_FIELDS = ["thumbnailUrl", "thumbnailFetchFailed", "faviconUrl", "thumbnailManual"];
+        const items = await getItems();
+        const idx = items.findIndex(i => i && i.id === itemId);
+        if (idx < 0) {
+          if (sendResponse) sendResponse({ ok: false, reason: "item-not-found" });
+          return;
+        }
+        const updated = { ...items[idx] };
+        for (const key of ALLOWED_FIELDS) {
+          if (Object.prototype.hasOwnProperty.call(fields, key)) {
+            updated[key] = fields[key];
+          }
+        }
+        items[idx] = updated;
+        await setItems(items, { previousItems: items.slice(), skipDedupe: true });
+        if (lpApi.runtime && lpApi.runtime.sendMessage) {
+          lpApi.runtime.sendMessage({ type: "refresh-picker-ui" }).catch(() => {});
+        }
+        if (sendResponse) sendResponse({ ok: true });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, reason: String(err && err.message ? err.message : err) });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "get-item-by-id") {
+    (async () => {
+      try {
+        let item = null;
+        // Avoid loading the full item set (incl. every article's content) just
+        // to read one item — fetch it directly from IndexedDB when available (#2).
+        if (itemsIndexedDbStore && typeof itemsIndexedDbStore.get === "function") {
+          try { item = await itemsIndexedDbStore.get(message.id); } catch (_) { item = null; }
+        }
+        if (!item) {
+          const items = await getItems();
+          item = items.find(i => i && i.id === message.id) || null;
+        }
+        if (sendResponse) sendResponse({ item });
+      } catch (err) {
+        if (sendResponse) sendResponse({ item: null });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "build-backup") {
+    (async () => {
+      try {
+        const payload = await buildBackupPayload();
+        if (sendResponse) sendResponse({ ok: true, payload });
+      } catch (err) {
+        if (sendResponse)
+          sendResponse({ ok: false, error: getErrorMessage(err) });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "restore-backup") {
+    (async () => {
+      try {
+        const result = await restoreBackupPayload(message.payload);
+        if (sendResponse) sendResponse({ ok: true, result });
+      } catch (err) {
+        if (sendResponse)
+          sendResponse({ ok: false, error: getErrorMessage(err) });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === "open-youtube-summary-chatgpt") {
+    return openYouTubeSummaryInChatGpt(message, sender);
+  }
+  if (message.type === "trigger-summary-from-sidebar") {
+    return runGlobalCategoryShortcutFallback("picker-youtube-summary");
+  }
+  if (message.type === "import-summary-to-note") {
+    // Teks ringkasan sudah dihantar terus dari sidebar.js via postMessage→iframe
+    // message.summaryText = teks ringkasan AI
+    // message.summaryTitle = tajuk tab AI (optional)
+    (async () => {
+      try {
+        const summaryText = message.summaryText ? String(message.summaryText).trim() : "";
+        const summaryTitle = message.summaryTitle ? String(message.summaryTitle).slice(0, 120) : "";
+
+        if (!summaryText) {
+          if (sendResponse) sendResponse({ ok: false, reason: "no-summary-text" });
+          return;
+        }
+
+        // Bina tajuk nota
+        const noteTitle = ("Ringkasan AI" + (summaryTitle ? ": " + summaryTitle.slice(0, 80) : "")).slice(0, 120);
+
+        // Fungsi untuk semak sama ada tab sesuai untuk inject notesOverlay
+        const isValidContentTab = (tab) => {
+          if (!tab || typeof tab.id !== "number") return false;
+          const url = tab.url || tab.pendingUrl || "";
+          if (!url || url.startsWith("chrome://") || url.startsWith("chrome-extension://")
+            || url.startsWith("moz-extension://") || url.startsWith("about:")
+            || url.startsWith("edge://") || url.startsWith("data:")) return false;
+          try {
+            const h = new URL(url).hostname;
+            const isAiTab = SIDEBAR_AI_TAB_URL_PATTERNS.some(p => {
+              const domain = p.replace(/^\*:\/\/\*?\*?\.?/, "").replace(/\/\*$/, "");
+              return h === domain || h.endsWith("." + domain);
+            });
+            if (isAiTab) return false;
+          } catch (e) {}
+          return true;
+        };
+
+        // Cari tab web yang sesuai — semua windows
+        let targetTabId = null;
+
+        if (lpApi.tabs && lpApi.tabs.query) {
+          // 1. Cuba tab yang sudah ada notesOverlay di-inject
+          for (const [tabId, types] of overlayInjectedTabs) {
+            if (types && types.has("notes")) {
+              try {
+                // Semak tab masih wujud dan valid
+                const tabCheck = await sendMessageToTabSafe(tabId, { type: "ping-notes-overlay" });
+                if (tabCheck !== null) {
+                  targetTabId = tabId;
+                  break;
+                }
+              } catch (e) {}
+            }
+          }
+
+          // 2. Tab aktif dalam semua windows (elak AI tab)
+          if (targetTabId === null) {
+            let activeTabs = [];
+            try {
+              activeTabs = await lpApi.tabs.query({ active: true });
+            } catch (e) { activeTabs = []; }
+            for (const tab of (activeTabs || [])) {
+              if (isValidContentTab(tab)) {
+                targetTabId = tab.id;
+                break;
+              }
+            }
+          }
+
+          // 3. Fallback: mana-mana tab web biasa
+          if (targetTabId === null) {
+            try {
+              const allTabs = await lpApi.tabs.query({});
+              for (const tab of (allTabs || [])) {
+                if (isValidContentTab(tab)) {
+                  targetTabId = tab.id;
+                  break;
+                }
+              }
+            } catch (e) {}
+          }
+        }
+
+        if (targetTabId === null) {
+          if (sendResponse) sendResponse({ ok: false, reason: "no-target-tab" });
+          return;
+        }
+
+        // Pastikan notesOverlay di-inject
+        await ensureOverlayInjected(targetTabId, "notes");
+        await sleep(250);
+
+        // Hantar create-note-from-summary
+        let noteResp = null;
+        try {
+          noteResp = await sendMessageToTabSafe(targetTabId, {
+            type: "create-note-from-summary",
+            text: summaryText,
+            title: noteTitle
+          });
+        } catch (e) { noteResp = null; }
+
+        if (noteResp && noteResp.ok) {
+          if (sendResponse) sendResponse({ ok: true });
+        } else {
+          // Inject semula dan cuba sekali lagi
+          try {
+            try { await executeScriptSafe(targetTabId, { file: "core/markdownExportCore.js" }); } catch (e) { }
+            await executeScriptSafe(targetTabId, { file: "notesOverlay.js" });
+            await sleep(400);
+            noteResp = await sendMessageToTabSafe(targetTabId, {
+              type: "create-note-from-summary",
+              text: summaryText,
+              title: noteTitle
+            });
+            if (sendResponse) sendResponse(noteResp && noteResp.ok ? { ok: true } : { ok: false, reason: "inject-retry-failed" });
+          } catch (e) {
+            if (sendResponse) sendResponse({ ok: false, reason: "inject-error", detail: e && e.message ? e.message : String(e) });
+          }
+        }
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, reason: "unexpected-error", detail: err && err.message ? err.message : String(err) });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "save-all-tabs") {
+    return (async () => {
+      try {
+        return await saveAllTabsInWindow();
+      } catch (err) {
+        lpErr("Save all tabs failed:", err);
+        return { ok: false, reason: "save-all-tabs-error", error: err.message };
+      }
+    })();
+  }
+  if (message.type === "save-current-tab") {
+    if (!sender || !sender.tab) return { ok: false };
+    return (async () => {
+      try {
+        return await saveCurrentTabEntry(sender.tab, {
+          favorite: !!(message && message.favorite === true),
+        });
+      } catch (err) {
+        return { ok: false };
+      }
+    })();
+  }
+  if (message.type === "refresh-item-title") {
+    const rawUrl = message && message.url ? String(message.url) : "";
+    const itemId = message && message.itemId ? String(message.itemId) : "";
+    const forceRemote = message && message.forceRemote === true;
+    return refreshStoredItemTitle(rawUrl, { itemId, forceRemote }).catch(
+      () => ({ ok: false, reason: "refresh-failed" }),
+    );
+  }
+  if (message.type === "open-category-picker") {
+    let options =
+      sender && sender.tab && sender.tab.id
+        ? {
+          tabId: sender.tab.id,
+          tabUrl: sender.tab.url,
+          tabTitle: sender.tab.title,
+        }
+        : null;
+    if (message && message.forceCategories) {
+      options = { ...(options || {}), forceCategories: true };
+    }
+    Promise.resolve(toggleCategoryPicker(options || undefined))
+      .then((ok) => {
+        if (sendResponse) sendResponse({ ok: !!ok });
+      })
+      .catch((err) => {
+        const message = err && err.message ? err.message : String(err);
+        if (sendResponse) sendResponse({ ok: false, error: message });
+      });
+    return true;
+  }
+
+
+  if (message.type === "gesture-action") {
+    const action = message && message.action ? String(message.action) : "";
+    if (!action) {
+      if (sendResponse) sendResponse({ ok: false, reason: "no-action" });
+      return false;
+    }
+    let shouldClose = false;
+    if (action === "open-ai-sidebar") {
+      if (currentSettings && currentSettings.sidebarAiEnabled === false) {
+        if (sendResponse) sendResponse({ ok: false, error: "AI Sidebar is disabled in settings." });
+        return false;
+      }
+      const windowId = sender && sender.tab && typeof sender.tab.windowId === "number" ? sender.tab.windowId : null;
+
+      // Jika sidebar sudah terbuka, jangan toggle — hantar focus sahaja
+      if (sidebarPanelOpen === true) {
+        (async () => {
+          await focusSidebarChatInputFromAnywhere(windowId).catch(() => {});
+          if (sendResponse) sendResponse({ ok: true });
+        })();
+        return true;
+      }
+
+      const port = ensureNativeFocusHelperPort();
+      if (port) {
+        (async () => {
+          try {
+            const shortcut = await getOpenAiSidebarShortcut();
+            port.postMessage({
+              action: "press_custom_shortcut",
+              shortcut: shortcut,
+              source: "localpocket-gesture",
+              at: Date.now()
+            });
+        // openLocalPocketSidebar() paksa currentSidebarPanel="ai" walaupun panel
+        // sebenar ialah JARVIS — betulkan penjejak supaya toggel kenal JARVIS.
+        currentSidebarPanel = message.panel === "jarvis" ? "jarvis" : "ai";
+        sidebarCurrentMode = mode;
+        if (sendResponse) sendResponse({ ok: true });
+          } catch (err) {
+            fallbackSyncOpenClose(windowId, sendResponse);
+          }
+        })();
+        return true;
+      }
+
+      return fallbackSyncOpenClose(windowId, sendResponse);
+    }
+    (async () => {
+      try {
+        switch (action) {
+          case "open-category-picker":
+            await toggleCategoryPicker();
+            break;
+          case "toggle-notes-overlay":
+            await runOpenNotesSidebarCommandAction();
+            break;
+          case "toggle-ai-overlay":
+            await runToggleAiOverlayCommandAction();
+            break;
+          case "toggle-jarvis": {
+            // Togol JARVIS (buka/tutup) — sama seperti pintasan papan kekunci
+            // supaya gestur juga menogol panel, bukan hanya membuka.
+            await toggleJarvisByMode();
+            break;
+          }
+          case "toggle-pomodoro-overlay":
+            await runTogglePomodoroOverlayCommandAction();
+            break;
+          case "toggle-todo-overlay":
+            await runToggleTodoOverlayCommandAction();
+            break;
+          case "open-ai-sidebar":
+            await runOpenSidebarCommandAction({ shouldClose });
+            break;
+          case "open-first-item":
+            await openFirstItem();
+            break;
+          case "open-random-item":
+            await openRandomItem();
+            break;
+          case "toggle-random-across-all": {
+            const settings = await getSettings();
+            const next = !settings.randomAcrossAllCategories;
+            await setSettings({ randomAcrossAllCategories: next });
+            await showInPageToast(
+              next
+                ? "🌐🎲 Random merentas semua kategori: AKTIF"
+                : "🎲 Random hanya dari kategori semasa"
+            );
+            break;
+          }
+          case "save-to-local-pocket": {
+            const tabs = await lpApi.tabs.query({ active: true, currentWindow: true });
+            if (tabs && tabs[0]) toggleSaveFromTab(tabs[0]);
+            break;
+          }
+          case "save-current-tab-favorite": {
+            const activeTab = await getActiveTabForCommands();
+            if (activeTab) await saveCurrentTabEntry(activeTab, { favorite: true });
+            break;
+          }
+          case "cycle-category":
+            await cycleCategory(1);
+            break;
+          case "cycle-category-prev":
+            await cycleCategory(-1);
+            break;
+
+          case "picker-next-item":
+            runGlobalCategoryShortcutFallback("picker-next-item");
+            break;
+          case "picker-random-item":
+            runGlobalCategoryShortcutFallback("picker-random-item");
+            break;
+          case "picker-save-all-tabs":
+            runGlobalCategoryShortcutFallback("picker-save-all-tabs");
+            break;
+          case "picker-open-settings":
+            runGlobalCategoryShortcutFallback("picker-open-settings");
+            break;
+          case "picker-youtube-summary": {
+            const summaryMode = currentSettings && currentSettings.summaryOpenMode ? String(currentSettings.summaryOpenMode).trim() : "sidebar";
+            if (summaryMode === "overlay") {
+              await runToggleAiOverlayCommandAction();
+            } else if (summaryMode === "native-sidebar") {
+              try {
+                const port = ensureNativeFocusHelperPort();
+                if (port) {
+                  port.postMessage({ action: "press_native_ai_shortcut", source: "localpocket-gesture-summary", at: Date.now() });
+                } else {
+                  await showInPageToast("Native helper tidak tersedia untuk buka sidebar AI asli.");
+                }
+              } catch (err) {
+                await showInPageToast("Gagal buka sidebar AI asli.");
+              }
+            } else {
+              // Hanya buka sidebar jika belum terbuka — jangan toggle
+              if (sidebarPanelOpen !== true) {
+                skipF6FocusForNextOpen = true; // Summary akan inject prompt, jangan ganggu focus halaman
+                const windowId = sender && sender.tab && typeof sender.tab.windowId === "number" ? sender.tab.windowId : null;
+                const port = ensureNativeFocusHelperPort();
+                if (port) {
+                  try {
+                    const shortcut = await getOpenAiSidebarShortcut();
+                    port.postMessage({ action: "press_custom_shortcut", shortcut, source: "localpocket-gesture-summary", at: Date.now() });
+                  } catch (err) {
+                    await runOpenSidebarCommandAction({ shouldClose: false });
+                  }
+                } else {
+                  await runOpenSidebarCommandAction({ shouldClose: false });
+                }
+              }
+            }
+            // Hantar prompt untuk semua mode
+            runGlobalCategoryShortcutFallback("picker-youtube-summary");
+            break;
+          }
+          case "picker-new-category":
+            runGlobalCategoryShortcutFallback("picker-new-category");
+            break;
+          case "picker-delete-category":
+            runGlobalCategoryShortcutFallback("picker-delete-category");
+            break;
+          case "picker-toggle-favorites":
+            runGlobalCategoryShortcutFallback("picker-toggle-favorites");
+            break;
+          case "open-firefox-native-ai-sidebar": {
+            const port = ensureNativeFocusHelperPort();
+            if (port) port.postMessage({ action: "press_native_ai_shortcut", source: "gesture", at: Date.now() });
+            break;
+          }
+          // ── 10 New gesture actions ──────────────────────────────
+          case "toggle-delete-after-open": {
+            const s1 = await getSettings();
+            const next1 = !s1.deleteAfterOpen;
+            await setSettings({ deleteAfterOpen: next1 });
+            await showInPageToast(next1 ? "♻️ Delete-after-open: AKTIF" : "♻️ Delete-after-open: TIDAK AKTIF");
+            break;
+          }
+          case "toggle-auto-next": {
+            const s2 = await getSettings();
+            const next2 = !s2.youtubeAutoNext;
+            await setSettings({ youtubeAutoNext: next2 });
+            await showInPageToast(next2 ? "⏭️ Auto Next YouTube: AKTIF" : "⏭️ Auto Next YouTube: TIDAK AKTIF");
+            break;
+          }
+          case "toggle-auto-random": {
+            const s3 = await getSettings();
+            const next3 = !s3.youtubeAutoRandom;
+            await setSettings({ youtubeAutoRandom: next3 });
+            await showInPageToast(next3 ? "🔀 Auto Random YouTube: AKTIF" : "🔀 Auto Random YouTube: TIDAK AKTIF");
+            break;
+          }
+          case "open-trash": {
+            // Buka picker dalam mode trash
+            await toggleCategoryPicker({ forceOpen: true, openTrash: true });
+            break;
+          }
+          case "toggle-nav-favorites-only": {
+            const s5 = await getSettings();
+            const next5 = !s5.navigationFavoritesOnly;
+            await setSettings({ navigationFavoritesOnly: next5 });
+            await showInPageToast(next5 ? "⭐ Navigasi Favourite sahaja: AKTIF" : "⭐ Navigasi semua item: AKTIF");
+            break;
+          }
+          case "scan-duplicates": {
+            // Guna dedupeCore terus — sama seperti dedupe-items message handler
+            if (dedupeCore && typeof dedupeCore.dedupeItems === "function") {
+              try {
+                const items = await getItems();
+                const result = dedupeCore.dedupeItems(items);
+                if (result && result.deduped && Array.isArray(result.items)) {
+                  await setItems(result.items, { skipDedupe: true });
+                  await showInPageToast(`👯 Imbasan selesai. ${result.removed || 0} pendua dibuang.`);
+                } else {
+                  await showInPageToast("👯 Tiada link pendua dijumpai.");
+                }
+              } catch (err) {
+                await showInPageToast("👯 Gagal imbas pendua.");
+              }
+            } else {
+              await showInPageToast("👯 Modul dedupe tidak tersedia.");
+            }
+            break;
+          }
+          case "export-backup": {
+            try {
+              const payload = await buildBackupPayload();
+              const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+              const jsonStr = JSON.stringify(payload, null, 2);
+              const filename = "local-pocket-backup-" + stamp + ".json";
+              // Cara 1: downloads API dengan data URI
+              const dlApi = typeof browser !== "undefined" ? browser.downloads : chrome.downloads;
+              if (dlApi && typeof dlApi.download === "function") {
+                try {
+                  const b64 = btoa(unescape(encodeURIComponent(jsonStr)));
+                  const dataUri = "data:application/json;base64," + b64;
+                  await new Promise((resolve, reject) => {
+                    dlApi.download({ url: dataUri, filename, saveAs: true }, (id) => {
+                      if (chrome.runtime && chrome.runtime.lastError) {
+                        reject(new Error(chrome.runtime.lastError.message));
+                      } else {
+                        resolve(id);
+                      }
+                    });
+                  });
+                  await showInPageToast("⬆️ Backup dieksport: " + filename);
+                  break;
+                } catch (dlErr) {
+                  lpWarn("downloads API failed, trying fallback", dlErr);
+                }
+              }
+              // Cara 2: Fallback via content script (options page style)
+              const activeTab = await getActiveTabForCommands();
+              if (activeTab && activeTab.id) {
+                const b64 = btoa(unescape(encodeURIComponent(jsonStr)));
+                await lpApi.tabs.executeScript(activeTab.id, {
+                  code: `(function(){
+                    var a = document.createElement("a");
+                    a.href = "data:application/json;base64,${b64}";
+                    a.download = "${filename}";
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                  })();`
+                });
+                await showInPageToast("⬆️ Backup dieksport: " + filename);
+              } else {
+                await showInPageToast("❌ Gagal eksport backup: tiada tab aktif");
+              }
+            } catch (err) {
+              lpErr("export-backup failed", err);
+              await showInPageToast("❌ Gagal eksport backup.");
+            }
+            break;
+          }
+          case "toggle-show-hidden-categories": {
+            const s8 = await getSettings();
+            // Normalize dulu (sama seperti button handler) lepas tu cycle: 0 → 1 → 2 → 0
+            let cur8 = s8.showHiddenCategories;
+            if (cur8 === true) cur8 = 1;
+            if (!cur8 || cur8 === false) cur8 = 0;
+            const next8 = cur8 >= 2 ? 0 : cur8 + 1;
+            await setSettings({ showHiddenCategories: next8 });
+            // Kemas kini warna icon toolbar
+            updateBadgeColorForHiddenMode(next8);
+            // Toast label tunjuk state yang dicapai (bukan sebelumnya)
+            const labels8 = [
+              "👁️ Mod normal — kategori tersembunyi disembunyikan",
+              "👁️‍🗨️ Tunjuk SEMUA kategori (termasuk tersembunyi)",
+              "🙈 Tunjuk TERSEMBUNYI sahaja",
+            ];
+            await showInPageToast(labels8[next8] || "👁️ Tukar mod hidden categories");
+            // Reset picker ke "all" supaya next/random terus ambil dari pool yang betul
+            // Kalau picker terbuka, dispatch reset-to-all; kalau tidak, set selectedCategory terus
+            const resetResult = await dispatchCategoryPickerCommand("reset-to-all");
+            if (!resetResult || !resetResult.ok) {
+              // Picker tidak terbuka — set terus ke storage supaya next/random fungsi betul
+              await lpStoreSet({ selectedCategory: "all" }).catch(() => {});
+            }
+            break;
+          }
+          case "toggle-pin-picker": {
+            // Hantar command ke picker jika terbuka
+            const pinResult = await dispatchCategoryPickerCommand("toggle-pin");
+            if (!pinResult || !pinResult.ok) {
+              await showInPageToast("📌 Buka picker dahulu untuk pin/unpin.");
+            }
+            break;
+          }
+          case "toggle-auto-page-turn": {
+            // Hantar command ke picker jika terbuka
+            const pageTurnResult = await dispatchCategoryPickerCommand("toggle-auto-page-turn");
+            if (!pageTurnResult || !pageTurnResult.ok) {
+              await showInPageToast("⇅ Buka picker dahulu untuk togol auto page-turn.");
+            }
+            break;
+          }
+          case "cycle-ai-provider": {
+            // Cycle AI provider: chatgpt → claude → gemini → perplexity → copilot → grok → deepseek → poe → mistral → notebooklm → chatgpt
+            const AI_PROVIDERS = ["chatgpt","claude","gemini","perplexity","copilot","grok","deepseek","poe","mistral","notebooklm"];
+            const AI_LABELS = { chatgpt:"ChatGPT", claude:"Claude", gemini:"Gemini", perplexity:"Perplexity", copilot:"Copilot", grok:"Grok", deepseek:"DeepSeek", poe:"Poe", mistral:"Mistral", notebooklm:"NotebookLM" };
+            const sc = await getSettings();
+            const curProvider = sc.sidebarAiProvider || "chatgpt";
+            const curIdx = AI_PROVIDERS.indexOf(curProvider);
+            const nextIdx = (curIdx + 1) % AI_PROVIDERS.length;
+            const nextProvider = AI_PROVIDERS[nextIdx];
+            await setSettings({ sidebarAiProvider: nextProvider });
+            await showInPageToast("🤖 AI Provider: " + (AI_LABELS[nextProvider] || nextProvider));
+            break;
+          }
+          case "toggle-rediscover": {
+            const sr = await getSettings();
+            const nextR = !sr.rediscoverEnabled;
+            await setSettings({ rediscoverEnabled: nextR });
+            // Hantar message untuk setup/clear alarm
+            try { lpApi.runtime.sendMessage({ type: "toggle-rediscover-enabled", enabled: nextR }).catch(() => {}); } catch (_) {}
+            await showInPageToast(nextR ? "🔁 Rediscover: AKTIF" : "🔁 Rediscover: TIDAK AKTIF");
+            break;
+          }
+          case "toggle-floating-button": {
+            const sf = await getSettings();
+            const nextF = !sf.floatingButtonEnabled;
+            await setSettings({ floatingButtonEnabled: nextF });
+            await showInPageToast(nextF ? "🔘 Butang terapung: AKTIF" : "🔘 Butang terapung: TIDAK AKTIF");
+            break;
+          }
+          case "toggle-ai-selection": {
+            const sa = await getSettings();
+            const nextA = !sa.floatingAiSelectionEnabled;
+            await setSettings({ floatingAiSelectionEnabled: nextA });
+            await showInPageToast(nextA ? "✨ AI selection button: AKTIF" : "✨ AI selection button: TIDAK AKTIF");
+            break;
+          }
+          case "toggle-global-background-tab": {
+            const sg = await getSettings();
+            const nextG = !sg.globalLinkInBackgroundTab;
+            await setSettings({ globalLinkInBackgroundTab: nextG });
+            await showInPageToast(nextG ? "📑 Buka link dalam tab latar: AKTIF" : "📑 Buka link dalam tab aktif: AKTIF");
+            break;
+          }
+          case "open-gesture-settings": {
+            const gestureUrl = lpApi.runtime && lpApi.runtime.getURL ? lpApi.runtime.getURL("gesture-settings.html") : "";
+            if (gestureUrl && lpApi.tabs && lpApi.tabs.create) {
+              await lpApi.tabs.create({ url: gestureUrl });
+            }
+            break;
+          }
+          case "show-mini-categories": {
+            const activeTabMc = await getActiveTabForCommands();
+            if (activeTabMc && typeof activeTabMc.id === "number") {
+              await sendMessageToTabSafe(activeTabMc.id, { type: "show-mini-categories" });
+            }
+            break;
+          }
+          case "open-category-fullscreen": {
+            const activeTabCf = await getActiveTabForCommands();
+            if (activeTabCf && typeof activeTabCf.id === "number") {
+              await sendMessageToTabSafe(activeTabCf.id, { type: "open-category-fullscreen" });
+            }
+            break;
+          }
+          case "show-category-scroller": {
+            const activeTabCs = await getActiveTabForCommands();
+            if (activeTabCs && typeof activeTabCs.id === "number") {
+              await sendMessageToTabSafe(activeTabCs.id, { type: "show-category-scroller" });
+            }
+            break;
+          }
+          case "hover-image-search": {
+            window.__lpPendingQuickImageSearch = true;
+            const activeTabImg = await getActiveTabForCommands();
+            if (activeTabImg && typeof activeTabImg.id === "number") {
+              sendMessageToTabSafe(activeTabImg.id, { type: "jarvis-host-capture-image" }).catch(function(){});
+            }
+            break;
+          }
+          case "set-thumbnail-from-image": {
+            const activeTabThumb = await getActiveTabForCommands();
+            if (activeTabThumb && typeof activeTabThumb.id === "number") {
+              await sendMessageToTabSafe(activeTabThumb.id, {
+                type: "enter-thumbnail-selection-mode",
+                pageUrl: activeTabThumb.url || ""
+              });
+            }
+            break;
+          }
+          case "open-link-save-category-chooser": {
+            const chooserLinkUrl = message.data && message.data.linkUrl ? String(message.data.linkUrl) : "";
+            let chooserLinkText = message.data && message.data.linkText ? String(message.data.linkText).trim() : "";
+            const activeTabChooser = await getActiveTabForCommands();
+            const chooserUrl = chooserLinkUrl || (activeTabChooser && activeTabChooser.url ? activeTabChooser.url : "");
+            if (!chooserUrl) {
+              if (activeTabChooser && typeof activeTabChooser.id === "number") {
+                await sendMessageToTabSafe(activeTabChooser.id, {
+                  type: "show-toast-message",
+                  message: "⚠️ Sila buat gesture di atas link atau thumbnail!"
+                });
+              }
+              break;
+            }
+            // Resolve title for YouTube URLs and other cases where linkText is empty or looks like URL
+            const resolved = await resolveSavedItemTitle(chooserUrl, chooserLinkText, { forceRemote: true }).catch(() => null);
+            if (resolved) chooserLinkText = resolved;
+            if (activeTabChooser && typeof activeTabChooser.id === "number") {
+              await sendMessageToTabSafe(activeTabChooser.id, {
+                type: "open-category-chooser-for-link",
+                url: chooserUrl,
+                title: chooserLinkText
+              });
+            }
+            break;
+          }
+          case "quick-capture-link": {
+            const linkUrl = message.data && message.data.linkUrl ? String(message.data.linkUrl) : "";
+            const linkText = message.data && message.data.linkText ? String(message.data.linkText).trim() : "";
+            if (!linkUrl) {
+              const activeTab = await getActiveTabForCommands();
+              if (activeTab && activeTab.id) {
+                await sendMessageToTabSafe(activeTab.id, {
+                  type: "show-toast-message",
+                  message: "⚠️ Sila buat gesture di atas link atau thumbnail!"
+                });
+              }
+              break;
+            }
+            const selectedCategoryId = await getSelectedCategoryId();
+            let title = linkText;
+            const resolved = await resolveSavedItemTitle(linkUrl, linkText, { forceRemote: true }).catch(() => null);
+            if (resolved) title = resolved;
+            const result = await upsertMinimalItemFromUrl(linkUrl, title, selectedCategoryId, { favorite: false });
+
+            // Maklumkan Category Picker untuk refresh data
+            const notifyRefresh = () => {
+              if (lpApi.runtime && lpApi.runtime.sendMessage) {
+                lpApi.runtime.sendMessage({ type: "refresh-picker-ui" }).catch(() => { });
+              }
+              getActiveTabForCommands().then((tab) => {
+                if (tab && tab.id && lpApi.tabs && lpApi.tabs.sendMessage) {
+                  lpApi.tabs.sendMessage(tab.id, { type: "refresh-picker-ui" }).catch(() => { });
+                }
+              }).catch(() => {});
+            };
+            notifyRefresh();
+            setTimeout(notifyRefresh, 800);
+
+            // Show toast in the page
+            const cats = await getCachedCategories();
+            const catName = getCategoryLabel(selectedCategoryId || "", cats || []);
+            const activeTab = await getActiveTabForCommands();
+            if (activeTab && activeTab.id) {
+              await sendMessageToTabSafe(activeTab.id, {
+                type: "show-saved-link-toast",
+                categoryName: catName,
+                categoryId: selectedCategoryId
+              });
+            }
+            break;
+          }
+          default:
+            if (sendResponse) sendResponse({ ok: false, reason: "unknown-action" });
+            return;
+        }
+        if (sendResponse) sendResponse({ ok: true });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, error: err && err.message ? err.message : String(err) });
+      }
+    })();
+    return true;
+  }
+  // ── Cross-frame gesture message relay (Gesturefy-style) ────────────
+  // Frames hantar mesej ini ke background supaya disiarkan ke frame utama (frameId: 0)
+  if (message.type === "gesture-frame-relay") {
+    if (!sender || !sender.tab || !sender.tab.id) return false;
+    const tabId = sender.tab.id;
+    const subject = message.subject;
+    const data = message.data || {};
+    (async () => {
+      try {
+        switch (subject) {
+          case "mouseGestureControllerPreparePreventDefault":
+            // Siaran ke semua frame dalam tab — prevent contextmenu/click di semua iframe
+            await lpApi.tabs.sendMessage(tabId, {
+              type: "gesture-frame-broadcast",
+              subject: "mouseGestureControllerPreparePreventDefault"
+            }, { frameId: 0 }).catch(() => {});
+            break;
+          case "mouseGestureControllerNeglectPreventDefault":
+            await lpApi.tabs.sendMessage(tabId, {
+              type: "gesture-frame-broadcast",
+              subject: "mouseGestureControllerNeglectPreventDefault",
+              data: { timestamp: data.timestamp || Date.now() }
+            }, { frameId: 0 }).catch(() => {});
+            break;
+          case "mouseGestureViewInitialize":
+            await lpApi.tabs.sendMessage(tabId, {
+              type: "gesture-frame-broadcast",
+              subject: "mouseGestureViewInitialize",
+              data
+            }, { frameId: 0 }).catch(() => {});
+            break;
+          case "mouseGestureViewUpdateGestureTrace":
+            await lpApi.tabs.sendMessage(tabId, {
+              type: "gesture-frame-broadcast",
+              subject: "mouseGestureViewUpdateGestureTrace",
+              data
+            }, { frameId: 0 }).catch(() => {});
+            break;
+          case "mouseGestureViewTerminate":
+            await lpApi.tabs.sendMessage(tabId, {
+              type: "gesture-frame-broadcast",
+              subject: "mouseGestureViewTerminate"
+            }, { frameId: 0 }).catch(() => {});
+            break;
+        }
+        if (sendResponse) sendResponse({ ok: true });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "save-picker-layout") {
+    if (message.data) {
+      lpStoreSet(message.data, function () {
+        cachedPickerBaseScript = null;
+      });
+    }
+    if (sendResponse) sendResponse({ ok: true });
+    return false;
+  }
+  if (message.type === "clear-picker-cache") {
+    cachedPickerBaseScript = null;
+    if (sendResponse) sendResponse({ ok: true });
+    return false;
+  }
+  if (message.type === "category-picker-ready") {
+    (async () => {
+      try {
+        const options =
+          sender && sender.tab && sender.tab.id
+            ? {
+              tabId: sender.tab.id,
+              tabUrl: sender.tab.url,
+              tabTitle: sender.tab.title,
+            }
+            : null;
+        
+        let payload = null;
+        const tabIdStr = options && options.tabId ? String(options.tabId) : null;
+        if (tabIdStr && pendingPickerPayloads.has(tabIdStr)) {
+          const cached = pendingPickerPayloads.get(tabIdStr);
+          // Only use cached payload if it's fresh (less than 5 seconds old)
+          if (Date.now() - cached.timestamp < 5000) {
+            payload = cached.payload;
+            debugLog("category-picker-ready using cached payload for tab:", tabIdStr);
+          }
+          pendingPickerPayloads.delete(tabIdStr);
+        }
+
+        if (!payload) {
+          debugLog("category-picker-ready building fresh payload for tab:", tabIdStr);
+          const result = await buildCategoryPickerPayload(options || undefined);
+          payload = result.payload;
+        }
+
+        // Baca saved size dari storage dan tambah ke payload
+        try {
+          const savedData = await new Promise((resolve) => {
+            lpStoreGet(["lpPickerWidth", "lpPickerHeight", "lpPickerOpacity"], function (data) {
+              resolve(data || {});
+            });
+          });
+          if (savedData.lpPickerWidth) payload.savedWidth = savedData.lpPickerWidth;
+          if (savedData.lpPickerHeight) payload.savedHeight = savedData.lpPickerHeight;
+          if (savedData.lpPickerOpacity) payload.savedOpacity = savedData.lpPickerOpacity;
+        } catch (_) {}
+
+        if (sendResponse) sendResponse({ payload });
+      } catch (err) {
+        if (sendResponse) sendResponse({ payload: null });
+      }
+    })();
+    return true;
+  }
+  // Handler pantas untuk fetch next-up item — guna cachedItems terus tanpa baca storage
+  // Menggantikan floatingButton.js yang baca semua 1500+ items dari storage.local
+  if (message.type === "fetch-next-up") {
+    (async () => {
+      try {
+        const items = await getItems();
+        const settings = currentSettings || {};
+        const favOnly = settings.navigationFavoritesOnly === true;
+        const selectedCategoryData = await lpApi.storage.local.get(SELECTED_CATEGORY_KEY);
+        const selected = selectedCategoryData[SELECTED_CATEGORY_KEY]
+          ? String(selectedCategoryData[SELECTED_CATEGORY_KEY])
+          : "all";
+
+        const allItems = items.filter(it => it && it.url);
+        const filtered = favOnly ? allItems.filter(it => it && it.favorite === true) : allItems;
+
+        let pool = [];
+        if (favOnly) {
+          pool = filtered;
+        } else if (selected === "none" || selected === "hidden_none") {
+          pool = filtered.filter(it => !it.categoryId);
+        } else if (selected === "all") {
+          pool = filtered;
+        } else {
+          pool = filtered.filter(it => it.categoryId === selected);
+        }
+
+        // Hantar pool yang sudah difilter ke floatingButton untuk sorting
+        // Strip content/textContent untuk kurangkan saiz data yang dihantar
+        const lightPool = pool.map(it => ({
+          id: it.id,
+          url: it.url,
+          title: it.title || "",
+          savedAt: it.savedAt || "",
+          categoryId: it.categoryId || "",
+          favorite: it.favorite === true,
+          favoriteOrder: it.favoriteOrder,
+          manualOrder: it.manualOrder,
+          readingProgress: it.readingProgress || null,
+        }));
+
+        if (sendResponse) sendResponse({
+          ok: true,
+          pool: lightPool,
+          selected,
+          favOnly,
+          settings: {
+            favoritesSortMode: settings.favoritesSortMode || "manual",
+            navigationFavoritesOnly: favOnly,
+          },
+        });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, pool: [] });
+      }
+    })();
+    return true;
+  }
+  // Handler untuk buka URL dalam background tab (tanpa focus)
+  if (message.type === "open-url-background-tab") {
+    const url = message && message.url ? String(message.url) : "";
+    if (url) {
+      getItems().then(items => {
+        const matched = items.find(it => it && it.url && urlsMatchForSave(url, it.url));
+        if (matched && matched.id) {
+          const catId = matched.categoryId ? String(matched.categoryId) : "all";
+          lpStoreSet({
+            [CATEGORY_PICKER_LAST_LOCATION_KEY]: {
+              mode: "items",
+              categoryId: catId,
+              lastOpenedItemId: String(matched.id),
+              lastOpenedAt: Date.now(),
+              updatedAt: new Date().toISOString(),
+            },
+            [SELECTED_CATEGORY_KEY]: catId,
+          }).catch(() => {});
+        }
+      }).catch(() => {});
+    }
+    if (url && lpApi.tabs && lpApi.tabs.create) {
+      lpApi.tabs.create({ url, active: false }).catch(() => {});
+    }
+    if (sendResponse) sendResponse({ ok: true });
+    return false;
+  }
+  // Handler pantas untuk semak sama ada URL disimpan — guna urlIndexCache O(1)
+  // Menggantikan floatingButton.js yang baca semua 1500 items dari storage
+  if (message.type === "check-url-saved") {
+    const url = message && message.url ? String(message.url) : "";
+    if (!url) {
+      if (sendResponse) sendResponse({ saved: false, favorite: false });
+      return false;
+    }
+    (async () => {
+      try {
+        const items = await getItems();
+        const saved = isUrlSaved(url, items);
+        let favorite = false;
+        if (saved) {
+          const compareFn = getUrlCompareCandidatesFn();
+          const candidates = compareFn ? compareFn(url) : null;
+          let foundItem = null;
+          if (candidates && urlIndexCacheBuilt) {
+            for (const c of candidates) {
+              if (urlIndexCache.has(c)) {
+                const id = urlIndexCache.get(c);
+                foundItem = items.find(it => it && it.id === id) || null;
+                break;
+              }
+            }
+          }
+          if (!foundItem) {
+            foundItem = items.find(it => it && isUrlSaved(url, [it])) || null;
+          }
+          favorite = !!(foundItem && foundItem.favorite === true);
+        }
+        if (sendResponse) sendResponse({ saved, favorite });
+      } catch (err) {
+        if (sendResponse) sendResponse({ saved: false, favorite: false });
+      }
+    })();
+    return true;
+  }
+  // Handler untuk dapatkan metadata tab semasa (favicon, thumbnail, siteName)
+  // Digunakan oleh picker butang ↻ untuk update link dengan halaman semasa
+  if (message.type === "get-current-tab-meta") {
+    (async () => {
+      try {
+        let tabUrl = "";
+        let faviconUrl = "";
+        let thumbnailUrl = "";
+        let siteName = "";
+        let tabTitle = "";
+        if (lpApi.tabs && lpApi.tabs.query) {
+          const tabs = await lpApi.tabs.query({ active: true, currentWindow: true });
+          const tab = tabs && tabs[0] ? tabs[0] : null;
+          if (tab) {
+            tabUrl = tab.url || "";
+            tabTitle = tab.title || "";
+            faviconUrl = tab.favIconUrl || "";
+            try {
+              siteName = tabUrl ? new URL(tabUrl).hostname.replace(/^www\./, "") : "";
+            } catch (e) {}
+          }
+        }
+        if (sendResponse) sendResponse({ ok: true, tabUrl, tabTitle, faviconUrl, thumbnailUrl, siteName });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false });
+      }
+    })();
+    return true;
+  }
+
+  // Cuba fetch metadata link guna fetch()+DOMParser tanpa buka tab
+  async function fetchLinkMetaDirect(url) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
+    try {
+      const resp = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeoutId);
+      if (!resp.ok) return { ok: false };
+      const html = await resp.text();
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      const title = (doc.querySelector("title")?.textContent || "").trim();
+      const thumb = doc.querySelector('meta[property="og:image"]')?.getAttribute("content")
+        || doc.querySelector('meta[name="twitter:image"]')?.getAttribute("content")
+        || doc.querySelector('meta[property="og:image:secure_url"]')?.getAttribute("content")
+        || doc.querySelector('[itemprop="image"]')?.getAttribute("content")
+        || doc.querySelector('link[rel="image_src"]')?.getAttribute("href")
+        || "";
+      return { ok: true, title, thumbnail: thumb };
+    } catch {
+      clearTimeout(timeoutId);
+      return { ok: false };
+    }
+  }
+
+  // Handler untuk buka link dalam background tab dan extract title + thumbnail
+  // Digunakan oleh picker butang "Update This Link"
+  if (message.type === "picker-fetch-link-meta") {
+    (async () => {
+      try {
+        const targetUrl = message.url ? String(message.url) : "";
+        if (!targetUrl) {
+          if (sendResponse) sendResponse({ ok: false, reason: "no-url" });
+          return;
+        }
+        try { new URL(targetUrl); } catch (e) {
+          if (sendResponse) sendResponse({ ok: false, reason: "invalid-url" });
+          return;
+        }
+
+        // Skip direct fetch for Instagram (we need the content script logic)
+        const isInstagram = /instagram\.com/i.test(targetUrl);
+        if (!isInstagram) {
+          // Cuba fetch() + DOMParser dulu (lebih cepat, tanpa buka tab)
+          const direct = await fetchLinkMetaDirect(targetUrl);
+          if (direct.ok && (direct.title || direct.thumbnail)) {
+            if (sendResponse) sendResponse({ ok: true, title: direct.title, thumbnail: direct.thumbnail });
+            return;
+          }
+        }
+
+        // Fallback: buka background tab kalau fetch gagal
+        let fetchedTitle = "";
+        let fetchedThumbnail = "";
+        let fetchTabId = null;
+
+        try {
+          const tab = await lpApi.tabs.create({ url: targetUrl, active: false });
+          if (!tab || !tab.id) {
+            if (sendResponse) sendResponse({ ok: false, reason: "tab-create-failed" });
+            return;
+          }
+          fetchTabId = tab.id;
+
+          await new Promise((resolvePromise) => {
+            const timeoutMs = 12000;
+            let settled = false;
+            let cleanupFn = null;
+
+            const timeoutId = setTimeout(() => {
+              if (!settled) {
+                settled = true;
+                if (cleanupFn) cleanupFn();
+                resolvePromise();
+              }
+            }, timeoutMs);
+
+            const onUpdated = (tabId, changeInfo) => {
+              if (tabId !== fetchTabId || settled) return;
+              if (changeInfo.status === "complete") {
+                settled = true;
+                clearTimeout(timeoutId);
+                if (lpApi.tabs.onUpdated && lpApi.tabs.onUpdated.removeListener) {
+                  try { lpApi.tabs.onUpdated.removeListener(onUpdated); } catch (e) {}
+                }
+                executeScriptSafe(fetchTabId, {
+                  code: "(" + function() {
+                    var title = document.title || "";
+                    var thumb = "";
+                    
+                    // --- INSTAGRAM-SPECIFIC LOGIC ---
+                    var isInstagram = /instagram\.com/i.test(window.location.href);
+                    if (isInstagram) {
+                      var candidates = [];
+                      
+                      // Helper to add candidates
+                      var addCandidate = function(candidateUrl, baseScore, source) {
+                        if (!candidateUrl) return;
+                        var decodedUrl = candidateUrl.replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+                        var score = baseScore;
+                        if (!/stp=/i.test(decodedUrl)) score += 200;
+                        if (/fbcdn\.net/i.test(decodedUrl)) score += 10000;
+                        if (!/\/[sep]\d+(x\d+)?\//i.test(decodedUrl)) score += 100;
+                        candidates.push({ url: decodedUrl, score: score, source: source });
+                      };
+
+                      // 1. Check DOM first!
+                      try {
+                        var profileImgSelectors = [
+                          'img[alt*="profile"]',
+                          'img[alt*="Profile"]',
+                          'header img',
+                          'img'
+                        ];
+
+                        for (var s = 0; s < profileImgSelectors.length; s++) {
+                          var imgs = document.querySelectorAll(profileImgSelectors[s]);
+                          for (var i = 0; i < imgs.length; i++) {
+                            var img = imgs[i];
+                            if (img.width < 50 || img.height < 50) continue;
+                            var src = img.src || img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || '';
+                            if (!src) continue;
+
+                            var currentScore = 0;
+                            if ((img.alt && (img.alt.toLowerCase().includes('profile') || img.alt.toLowerCase().includes('avatar'))) ||
+                                src.toLowerCase().includes('profile') || src.toLowerCase().includes('avatar')) {
+                              currentScore += 100;
+                            }
+
+                            if (img.srcset) {
+                              var srcsetParts = img.srcset.split(',').map(function(p) { return p.trim(); });
+                              var highestRes = 0;
+                              var bestSrcsetUrl = src;
+                              for (var p = 0; p < srcsetParts.length; p++) {
+                                var part = srcsetParts[p];
+                                var parts = part.split(/\s+/);
+                                var urlPart = parts[0];
+                                var descriptor = parts[1];
+                                if (!urlPart) continue;
+                                var resolution = 0;
+                                if (descriptor && descriptor.endsWith('w')) {
+                                  resolution = parseInt(descriptor.slice(0, -1), 10);
+                                } else if (descriptor && descriptor.endsWith('x')) {
+                                  resolution = parseFloat(descriptor.slice(0, -1)) * 1000;
+                                }
+                                if (resolution > highestRes) {
+                                  highestRes = resolution;
+                                  bestSrcsetUrl = urlPart;
+                                }
+                              }
+                              currentScore += highestRes;
+                              addCandidate(bestSrcsetUrl, 15000, 'dom-srcset');
+                            } else {
+                              addCandidate(src, 14000, 'dom-src');
+                            }
+                          }
+                        }
+                      } catch(e) {}
+
+                      // 2. Try sharedData
+                      try {
+                        if (window._sharedData) {
+                          var entryData = window._sharedData.entry_data;
+                          if (entryData) {
+                            var profilePage = entryData.ProfilePage;
+                            if (profilePage && profilePage[0]) {
+                              var user = profilePage[0].graphql.user;
+                              if (user) {
+                                addCandidate(user.profile_pic_url_hd, 10000, 'sharedData-hd');
+                                addCandidate(user.profile_pic_url, 9000, 'sharedData');
+                              }
+                            }
+                          }
+                        }
+                      } catch(e) {}
+
+                      // 3. Try script tags
+                      try {
+                        var allScripts = Array.from(document.querySelectorAll('script'));
+                        for (var si = 0; si < allScripts.length; si++) {
+                          var content = allScripts[si].textContent;
+                          if (!content) continue;
+                          var patterns = [
+                            { regex: /"profile_pic_url_hd":"([^"]+)"/gi, baseScore: 8000, source: 'script-hd' },
+                            { regex: /"profilePicUrlHd":"([^"]+)"/gi, baseScore: 7000, source: 'script-picUrlHd' },
+                            { regex: /"profile_pic_url":"([^"]+)"/gi, baseScore: 6000, source: 'script' },
+                            { regex: /"profilePicUrl":"([^"]+)"/gi, baseScore: 5000, source: 'script-picUrl' }
+                          ];
+                          for (var pi = 0; pi < patterns.length; pi++) {
+                            var pat = patterns[pi];
+                            var matches = content.match(pat.regex);
+                            if (matches) {
+                              for (var mi = 0; mi < matches.length; mi++) {
+                                var match = matches[mi];
+                                var urlMatch = match.match(/:"([^"]+)"/i);
+                                if (urlMatch && urlMatch[1]) {
+                                  addCandidate(urlMatch[1], pat.baseScore, pat.source);
+                                }
+                              }
+                            }
+                          }
+                        }
+                      } catch(e) {}
+
+                      // Pick best candidate!
+                      var fbcdnCandidates = candidates.filter(function(c) { return /fbcdn\.net/i.test(c.url); });
+                      if (fbcdnCandidates.length > 0) {
+                        fbcdnCandidates.sort(function(a, b) { return b.score - a.score; });
+                        thumb = fbcdnCandidates[0].url;
+                      } else if (candidates.length > 0) {
+                        candidates.sort(function(a, b) { return b.score - a.score; });
+                        thumb = candidates[0].url;
+                      }
+                    }
+                    // --- END INSTAGRAM-SPECIFIC LOGIC ---
+
+                    if (!thumb) {
+                      var metaTags = document.querySelectorAll('meta[property="og:image"], meta[name="twitter:image"], meta[property="og:image:secure_url"], meta[itemprop="image"], link[rel="image_src"]');
+                      for (var i = 0; i < metaTags.length; i++) {
+                        var el = metaTags[i];
+                        var val = el.getAttribute('content') || el.getAttribute('href') || "";
+                        if (val && val.indexOf('data:') !== 0) { thumb = val; break; }
+                      }
+                    }
+                    if (!thumb) {
+                      var containers = document.querySelectorAll('article, .post, .entry-content, main, [role="main"]');
+                      var best = "";
+                      var bestArea = 0;
+                      for (var c = 0; c < containers.length; c++) {
+                        var imgs = containers[c].querySelectorAll('img');
+                        for (var j = 0; j < imgs.length; j++) {
+                          var img = imgs[j];
+                          if (img.src && img.src.indexOf('data:') !== 0 && img.naturalWidth > 200 && img.naturalHeight > 200) {
+                            var area = img.naturalWidth * img.naturalHeight;
+                            if (area > bestArea) { best = img.src; bestArea = area; }
+                          }
+                        }
+                      }
+                      thumb = best;
+                    }
+                    return JSON.stringify({ t: title, th: thumb });
+                  } + "()",
+                  runAt: "document_idle"
+                }).then(function(results) {
+                  try {
+                    var data = results && results[0] ? JSON.parse(results[0]) : {};
+                    fetchedTitle = data.t || "";
+                    fetchedThumbnail = data.th || "";
+                  } catch (e) {}
+                  resolvePromise();
+                }).catch(function() {
+                  resolvePromise();
+                });
+              }
+            };
+
+            if (lpApi.tabs.onUpdated && lpApi.tabs.onUpdated.addListener) {
+              lpApi.tabs.onUpdated.addListener(onUpdated);
+            }
+            cleanupFn = function() {
+              if (lpApi.tabs.onUpdated && lpApi.tabs.onUpdated.removeListener) {
+                try { lpApi.tabs.onUpdated.removeListener(onUpdated); } catch (e) {}
+              }
+            };
+
+            lpApi.tabs.get(fetchTabId).then(function(t) {
+              if (t && t.status === "complete" && !settled) {
+                settled = true;
+                clearTimeout(timeoutId);
+                if (cleanupFn) cleanupFn();
+                executeScriptSafe(fetchTabId, {
+                  code: "(" + function() {
+                    var title = document.title || "";
+                    var thumb = "";
+                    
+                    // --- INSTAGRAM-SPECIFIC LOGIC ---
+                    var isInstagram = /instagram\.com/i.test(window.location.href);
+                    if (isInstagram) {
+                      var candidates = [];
+                      
+                      // Helper to add candidates
+                      var addCandidate = function(candidateUrl, baseScore, source) {
+                        if (!candidateUrl) return;
+                        var decodedUrl = candidateUrl.replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+                        var score = baseScore;
+                        if (!/stp=/i.test(decodedUrl)) score += 200;
+                        if (/fbcdn\.net/i.test(decodedUrl)) score += 10000;
+                        if (!/\/[sep]\d+(x\d+)?\//i.test(decodedUrl)) score += 100;
+                        candidates.push({ url: decodedUrl, score: score, source: source });
+                      };
+
+                      // 1. Check DOM first!
+                      try {
+                        var profileImgSelectors = [
+                          'img[alt*="profile"]',
+                          'img[alt*="Profile"]',
+                          'header img',
+                          'img'
+                        ];
+
+                        for (var s = 0; s < profileImgSelectors.length; s++) {
+                          var imgs = document.querySelectorAll(profileImgSelectors[s]);
+                          for (var i = 0; i < imgs.length; i++) {
+                            var img = imgs[i];
+                            if (img.width < 50 || img.height < 50) continue;
+                            var src = img.src || img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || '';
+                            if (!src) continue;
+
+                            var currentScore = 0;
+                            if ((img.alt && (img.alt.toLowerCase().includes('profile') || img.alt.toLowerCase().includes('avatar'))) ||
+                                src.toLowerCase().includes('profile') || src.toLowerCase().includes('avatar')) {
+                              currentScore += 100;
+                            }
+
+                            if (img.srcset) {
+                              var srcsetParts = img.srcset.split(',').map(function(p) { return p.trim(); });
+                              var highestRes = 0;
+                              var bestSrcsetUrl = src;
+                              for (var p = 0; p < srcsetParts.length; p++) {
+                                var part = srcsetParts[p];
+                                var parts = part.split(/\s+/);
+                                var urlPart = parts[0];
+                                var descriptor = parts[1];
+                                if (!urlPart) continue;
+                                var resolution = 0;
+                                if (descriptor && descriptor.endsWith('w')) {
+                                  resolution = parseInt(descriptor.slice(0, -1), 10);
+                                } else if (descriptor && descriptor.endsWith('x')) {
+                                  resolution = parseFloat(descriptor.slice(0, -1)) * 1000;
+                                }
+                                if (resolution > highestRes) {
+                                  highestRes = resolution;
+                                  bestSrcsetUrl = urlPart;
+                                }
+                              }
+                              currentScore += highestRes;
+                              addCandidate(bestSrcsetUrl, 15000, 'dom-srcset');
+                            } else {
+                              addCandidate(src, 14000, 'dom-src');
+                            }
+                          }
+                        }
+                      } catch(e) {}
+
+                      // 2. Try sharedData
+                      try {
+                        if (window._sharedData) {
+                          var entryData = window._sharedData.entry_data;
+                          if (entryData) {
+                            var profilePage = entryData.ProfilePage;
+                            if (profilePage && profilePage[0]) {
+                              var user = profilePage[0].graphql.user;
+                              if (user) {
+                                addCandidate(user.profile_pic_url_hd, 10000, 'sharedData-hd');
+                                addCandidate(user.profile_pic_url, 9000, 'sharedData');
+                              }
+                            }
+                          }
+                        }
+                      } catch(e) {}
+
+                      // 3. Try script tags
+                      try {
+                        var allScripts = Array.from(document.querySelectorAll('script'));
+                        for (var si = 0; si < allScripts.length; si++) {
+                          var content = allScripts[si].textContent;
+                          if (!content) continue;
+                          var patterns = [
+                            { regex: /"profile_pic_url_hd":"([^"]+)"/gi, baseScore: 8000, source: 'script-hd' },
+                            { regex: /"profilePicUrlHd":"([^"]+)"/gi, baseScore: 7000, source: 'script-picUrlHd' },
+                            { regex: /"profile_pic_url":"([^"]+)"/gi, baseScore: 6000, source: 'script' },
+                            { regex: /"profilePicUrl":"([^"]+)"/gi, baseScore: 5000, source: 'script-picUrl' }
+                          ];
+                          for (var pi = 0; pi < patterns.length; pi++) {
+                            var pat = patterns[pi];
+                            var matches = content.match(pat.regex);
+                            if (matches) {
+                              for (var mi = 0; mi < matches.length; mi++) {
+                                var match = matches[mi];
+                                var urlMatch = match.match(/:"([^"]+)"/i);
+                                if (urlMatch && urlMatch[1]) {
+                                  addCandidate(urlMatch[1], pat.baseScore, pat.source);
+                                }
+                              }
+                            }
+                          }
+                        }
+                      } catch(e) {}
+
+                      // Pick best candidate!
+                      var fbcdnCandidates = candidates.filter(function(c) { return /fbcdn\.net/i.test(c.url); });
+                      if (fbcdnCandidates.length > 0) {
+                        fbcdnCandidates.sort(function(a, b) { return b.score - a.score; });
+                        thumb = fbcdnCandidates[0].url;
+                      } else if (candidates.length > 0) {
+                        candidates.sort(function(a, b) { return b.score - a.score; });
+                        thumb = candidates[0].url;
+                      }
+                    }
+                    // --- END INSTAGRAM-SPECIFIC LOGIC ---
+
+                    if (!thumb) {
+                      var metaTags = document.querySelectorAll('meta[property="og:image"], meta[name="twitter:image"], meta[property="og:image:secure_url"], meta[itemprop="image"], link[rel="image_src"]');
+                      for (var i = 0; i < metaTags.length; i++) {
+                        var el = metaTags[i];
+                        var val = el.getAttribute('content') || el.getAttribute('href') || "";
+                        if (val && val.indexOf('data:') !== 0) { thumb = val; break; }
+                      }
+                    }
+                    if (!thumb) {
+                      var containers = document.querySelectorAll('article, .post, .entry-content, main, [role="main"]');
+                      var best = "";
+                      var bestArea = 0;
+                      for (var c = 0; c < containers.length; c++) {
+                        var imgs = containers[c].querySelectorAll('img');
+                        for (var j = 0; j < imgs.length; j++) {
+                          var img = imgs[j];
+                          if (img.src && img.src.indexOf('data:') !== 0 && img.naturalWidth > 200 && img.naturalHeight > 200) {
+                            var area = img.naturalWidth * img.naturalHeight;
+                            if (area > bestArea) { best = img.src; bestArea = area; }
+                          }
+                        }
+                      }
+                      thumb = best;
+                    }
+                    return JSON.stringify({ t: title, th: thumb });
+                  } + "()",
+                  runAt: "document_idle"
+                }).then(function(results) {
+                  try {
+                    var data = results && results[0] ? JSON.parse(results[0]) : {};
+                    fetchedTitle = data.t || "";
+                    fetchedThumbnail = data.th || "";
+                  } catch (e) {}
+                  resolvePromise();
+                }).catch(function() {
+                  resolvePromise();
+                });
+              }
+            }).catch(function() {});
+          });
+        } finally {
+          if (fetchTabId !== null && lpApi.tabs && lpApi.tabs.remove) {
+            try { await lpApi.tabs.remove(fetchTabId); } catch (e) {}
+          }
+        }
+
+        if (sendResponse) sendResponse({ ok: true, title: fetchedTitle, thumbnail: fetchedThumbnail });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, reason: String(err && err.message ? err.message : err) });
+      }
+    })();
+    return true;
+  }
+
+  // Handler untuk kemaskini items tertentu dalam cachedItems tanpa replace semua
+  // Digunakan oleh picker untuk operasi yang hanya ubah data item (favorite, category, dll.)
+  if (message.type === "picker-update-items") {
+    (async () => {
+      try {
+        const changedItems = Array.isArray(message.changedItems) ? message.changedItems : [];
+        if (!changedItems.length) {
+          if (sendResponse) sendResponse({ ok: true });
+          return;
+        }
+        const items = await getItems();
+        const changedById = new Map();
+        changedItems.forEach(item => { if (item && item.id) changedById.set(String(item.id), item); });
+        const nextItems = items.map(item => {
+          if (!item || !item.id) return item;
+          return changedById.has(String(item.id)) ? changedById.get(String(item.id)) : item;
+        });
+        await setItems(nextItems, { previousItems: items, skipDedupe: true });
+        if (sendResponse) sendResponse({ ok: true });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false });
+      }
+    })();
+    return true;
+  }
+  // Handler untuk picker delete satu item — hantar hanya itemId, bukan seluruh items array
+  // Optimasasi: elakkan runtime.sendMessage dengan payload besar (1500+ item)
+  if (message.type === "picker-delete-item") {
+    (async () => {
+      try {
+        const itemId = message.itemId ? String(message.itemId) : "";
+        if (!itemId) {
+          if (sendResponse) sendResponse({ ok: false, reason: "missing-item-id" });
+          return;
+        }
+        const items = await loadItemsFromPrimaryStore();
+        const previousItems = items;
+        const nextItems = items.filter((item) => item && String(item.id) !== itemId);
+        const trashEntry = message.trashEntry || { id: itemId, deletedAt: new Date().toISOString() };
+        await setItems(nextItems, { previousItems, skipDedupe: true }, [trashEntry]);
+        if (sendResponse) sendResponse({ ok: true, count: nextItems.length });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, reason: String(err && err.message ? err.message : err) });
+      }
+    })();
+    return true;
+  }
+  // Handler untuk picker batch delete — hantar hanya array of IDs
+  if (message.type === "picker-delete-items") {
+    (async () => {
+      try {
+        const itemIds = Array.isArray(message.itemIds) ? message.itemIds : [];
+        if (!itemIds.length) {
+          if (sendResponse) sendResponse({ ok: false, reason: "no-ids" });
+          return;
+        }
+        const idSet = new Set(itemIds.map((id) => String(id)));
+        const items = await loadItemsFromPrimaryStore();
+        const previousItems = items;
+        const nextItems = items.filter((item) => !item || !idSet.has(String(item.id)));
+        const trashEntries = message.trashEntries || itemIds.map(id => ({ id, deletedAt: new Date().toISOString() }));
+        await setItems(nextItems, { previousItems, skipDedupe: true }, trashEntries.length ? trashEntries : null);
+        if (sendResponse) sendResponse({ ok: true, count: nextItems.length });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, reason: String(err && err.message ? err.message : err) });
+      }
+    })();
+    return true;
+  }
+   if (message.type === "dedupe-items") {
+    (async () => {
+      try {
+        const result = await dedupeStoredItemsIfNeeded();
+        if (sendResponse) sendResponse({ ok: true, ...result });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, error: String(err && err.message ? err.message : err) });
+      }
+    })();
+    return true;
+  }
+  // Link Health Monitor — periksa status rosak/404/redirect untuk senarai URL
+  // (biasanya semua link dalam kategori semasa). Keputusan dicache ke item.linkHealth.
+  if (message.type === "check-link-health") {
+    (async () => {
+      try {
+        const payload = Array.isArray(message.urls) ? message.urls : [];
+        const summary = { ok: 0, broken: 0, redirect: 0, error: 0, unknown: 0 };
+        if (!payload.length) {
+          if (sendResponse) sendResponse({ ok: true, checked: 0, summary: summary });
+          return;
+        }
+        const allItems = await getItems();
+        const byId = {};
+        allItems.forEach((it) => { if (it && it.id) byId[String(it.id)] = it; });
+
+        const results = await linkHealthCore.checkUrlsBatch(payload, {
+          concurrency: 16,
+          timeoutMs: 6000,
+          onProgress: (done, total, res) => {
+            if (res && res.status && summary[res.status] !== undefined) summary[res.status] += 1;
+            const item = res && res.id != null ? byId[String(res.id)] : null;
+            if (item) {
+              item.linkHealth = {
+                status: res.status,
+                statusCode: res.statusCode,
+                finalUrl: res.finalUrl,
+                error: res.error,
+                checkedAt: res.checkedAt
+              };
+            }
+            if (lpApi.runtime && lpApi.runtime.sendMessage) {
+              lpApi.runtime.sendMessage({ type: "link-health-progress", done: done, total: total }).catch(() => {});
+            }
+          }
+        });
+
+        await setItems(allItems, { previousItems: allItems.slice(), skipDedupe: true });
+
+        if (lpApi.notifications && lpApi.notifications.create) {
+          const iconUrl = lpApi.runtime && lpApi.runtime.getURL ? lpApi.runtime.getURL("icons/icon-default-32.png") : "";
+          const totalChecked = results.length;
+          const msg = totalChecked + " link: " + summary.ok + " sihat, " + summary.broken +
+            " rosak, " + summary.redirect + " redirect, " + summary.error + " ralat";
+          try {
+            lpApi.notifications.create("lp-link-health-done", {
+              type: "basic",
+              iconUrl: iconUrl,
+              title: "Local Pocket Reader — Kesihatan link",
+              message: msg
+            });
+          } catch (e) {}
+        }
+
+        if (lpApi.runtime && lpApi.runtime.sendMessage) {
+          lpApi.runtime.sendMessage({ type: "link-health-done", summary: summary, total: results.length, results: results }).catch(() => {});
+          lpApi.runtime.sendMessage({ type: "refresh-picker-ui" }).catch(() => {});
+        }
+        if (sendResponse) sendResponse({ ok: true, checked: results.length, summary: summary, results: results });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, error: String(err && err.message ? err.message : err) });
+      }
+    })();
+    return true;
+  }
+  // Handler untuk picker menulis items ke IndexedDB + storage.local secara atomic
+  // Ini menggantikan tulis terus ke storage.local dari picker supaya IndexedDB sentiasa sinkron
+  if (message.type === "picker-write-items") {
+    (async () => {
+      try {
+        const nextItems = Array.isArray(message.items) ? message.items : null;
+        if (!nextItems) {
+          if (sendResponse) sendResponse({ ok: false, reason: "invalid-items" });
+          return;
+        }
+        const previousItems = Array.isArray(message.previousItems) ? message.previousItems : null;
+        const trashItems = Array.isArray(message.trashItems) ? message.trashItems : null;
+        // skipDedupe: true — picker sudah validate data, elak O(N×candidates) dedupe scan
+        await setItems(nextItems, {
+          previousItems: previousItems || cachedItems,
+          skipDedupe: true,
+        }, trashItems);
+        if (sendResponse) sendResponse({ ok: true, count: nextItems.length });
+      } catch (err) {
+        if (sendResponse) sendResponse({ ok: false, reason: String(err && err.message ? err.message : err) });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "category-picker-load-items") {
+    (async () => {
+      try {
+        const options =
+          sender && sender.tab && sender.tab.id
+            ? {
+              tabId: sender.tab.id,
+              tabUrl: sender.tab.url,
+              tabTitle: sender.tab.title,
+            }
+            : null;
+        const payload = await buildCategoryPickerItemsPayload(message, options || undefined);
+        if (sendResponse) sendResponse({ payload });
+      } catch (err) {
+        if (sendResponse) sendResponse({ payload: null });
+      }
+    })();
+    return true;
+  }
+  if (message.type === "set-thumbnail-from-shortcut") {
+    (async () => {
+      try {
+        const imageUrl = message.imageUrl ? String(message.imageUrl) : "";
+        const pageUrl = message.pageUrl ? String(message.pageUrl) : "";
+        if (!imageUrl || !pageUrl) return;
+        const items = await getItems();
+        const idx = getExistingIndexFromUrl(pageUrl, items);
+        if (idx < 0) {
+          if (lpApi.notifications) {
+            const iconUrl = lpApi.runtime && lpApi.runtime.getURL ? lpApi.runtime.getURL("icons/icon-default-32.png") : "";
+            lpApi.notifications.create("lp-set-thumbnail-no-item", {
+              type: "basic",
+              iconUrl,
+              title: "Local Pocket Reader",
+              message: "No saved item found for this page."
+            });
+          }
+          return;
+        }
+        const updated = { ...items[idx] };
+        updated.thumbnailUrl = imageUrl;
+        updated.thumbnailFetchFailed = false;
+        updated.thumbnailManual = true;
+        items[idx] = updated;
+        await setItems(items, { previousItems: items.slice(), skipDedupe: true });
+        if (message.learn) {
+          const domain = getDomainFromUrl(pageUrl);
+          await learnDomainThumbnailPattern(domain, imageUrl, pageUrl);
+          await refreshDomainThumbnails(domain);
+        }
+        if (lpApi.runtime && lpApi.runtime.sendMessage) {
+          lpApi.runtime.sendMessage({ type: "refresh-picker-ui" }).catch(() => {});
+        }
+        if (lpApi.notifications) {
+          const iconUrl = lpApi.runtime && lpApi.runtime.getURL ? lpApi.runtime.getURL("icons/icon-default-32.png") : "";
+          lpApi.notifications.create("lp-set-thumbnail-ok", {
+            type: "basic",
+            iconUrl,
+            title: "Local Pocket Reader",
+            message: "Thumbnail updated."
+          });
+        }
+      } catch (e) {
+        lpWarn("Set thumbnail from T+right-click shortcut failed", e);
+      }
+    })();
+    return true;
+  }
+  if (message.type === "open-command-palette") {
+    (async () => {
+      let tabId = sender && sender.tab && sender.tab.id ? sender.tab.id : null;
+      if (!tabId) tabId = await getActiveTabId();
+      if (tabId) await showCommandPalette(tabId);
+    })();
+    if (sendResponse) sendResponse({ ok: true });
+    return;
+  }
+  if (message.type === "command-palette-search") {
+    const query = message.query ? String(message.query).trim().toLowerCase() : "";
+    (async () => {
+      if (!query) {
+        if (sendResponse) sendResponse({ items: [] });
+        return;
+      }
+      const items = await getItems();
+      const catData = await lpStoreGet(CATEGORY_KEY);
+      const categories = Array.isArray(catData[CATEGORY_KEY]) ? catData[CATEGORY_KEY] : [];
+      const catMap = {};
+      const hiddenCatIds = new Set();
+      categories.forEach(function(c) {
+        if (c && c.id) { catMap[c.id] = c.name || ""; }
+        if (c && c.id && c.hidden) hiddenCatIds.add(String(c.id));
+      });
+      const settingsData = await lpStoreGet(SETTINGS_KEY);
+      const userSettings = settingsData && settingsData[SETTINGS_KEY] ? settingsData[SETTINGS_KEY] : {};
+      var mode = userSettings.showHiddenCategories;
+      if (mode === true) mode = 1;
+      if (mode === false || typeof mode === "undefined") mode = 0;
+      let scopeItems = items.filter(function(item) {
+        if (!item || !item.url) return false;
+        if (mode === 2) {
+          var cid = item.categoryId ? String(item.categoryId) : "";
+          if (cid === "hidden_none") return true;
+          return !!cid && hiddenCatIds.has(cid);
+        }
+        if (mode === 0) {
+          var cid = item.categoryId ? String(item.categoryId) : "";
+          if (cid === "hidden_none") return false;
+          return !cid || !hiddenCatIds.has(cid);
+        }
+        return true;
+      });
+      const matched = scopeItems.filter(function(item) {
+        const t = (item.title || "").toLowerCase();
+        const u = (item.url || "").toLowerCase();
+        const s = (item.siteName || "").toLowerCase();
+        const c = (catMap[item.categoryId] || "").toLowerCase();
+        const d = (function(){try{return new URL(item.url||"").hostname.replace(/^www\./,"")}catch(e){return ""}})();
+        return t.indexOf(query) >= 0 || u.indexOf(query) >= 0 || s.indexOf(query) >= 0 || c.indexOf(query) >= 0 || d.indexOf(query) >= 0;
+      }).slice(0, 12).map(function(item) {
+        const domain = item.url ? (function(u){try{return new URL(u).hostname.replace(/^www\./,"")}catch(e){return u}})(item.url) : "";
+        return {
+          id: item.id || "",
+          label: item.title || domain || "Untitled",
+          url: item.url || "",
+          meta: domain,
+          faviconUrl: item.faviconUrl || "",
+          categoryName: catMap[item.categoryId] || "",
+        };
+      });
+      if (sendResponse) sendResponse({ items: matched });
+    })();
+    return true;
+  }
+  if (message.type === "command-palette-open") {
+    const url = message.url ? String(message.url) : "";
+    if (url) {
+      getItems().then(items => {
+        const matched = items.find(it => it && it.url && urlsMatchForSave(url, it.url));
+        if (matched && matched.id) {
+          lpStoreSet({
+            [CATEGORY_PICKER_LAST_LOCATION_KEY]: {
+              mode: "items",
+              categoryId: matched.categoryId ? String(matched.categoryId) : "all",
+              lastOpenedItemId: String(matched.id),
+              lastOpenedAt: Date.now(),
+              updatedAt: new Date().toISOString(),
+            },
+          }).catch(() => {});
+        }
+      }).catch(() => {});
+      if (message.currentTab) {
+        lpApi.tabs.update({ url: url }).catch(function(err) {
+          lpWarn("[LocalPocket] command-palette-open currentTab failed", err);
+        });
+      } else {
+        lpApi.tabs.create({ url: url }).catch(function(err) {
+          lpWarn("[LocalPocket] command-palette-open failed", err);
+        });
+      }
+    }
+    if (sendResponse) sendResponse({ ok: true });
+    return;
+  }
+  if (message.type === "toggle-rediscover-enabled") {
+    const enabled = message.enabled === true;
+    if (currentSettings) {
+      currentSettings.rediscoverEnabled = enabled;
+    }
+    (async () => {
+      try {
+        if (enabled) {
+          await setupRediscoverAlarm();
+          fireRediscoverNotification().catch(() => {});
+        } else {
+          if (lpApi.alarms && lpApi.alarms.clear) {
+            const p = lpApi.alarms.clear("rediscover-alarm");
+            if (p && typeof p.then === "function") await p.catch(() => {});
+          }
+        }
+      } catch (_) {}
+    })();
+    if (sendResponse) sendResponse({ ok: true });
+    return true;
+  }
+});
+
+// Trek tab yang sedang navigasi (loading → complete) sebab Firefox reset page action
+// pada setiap navigasi/refresh, jadi kita perlu paksa re-apply lpApi call.
+const tabsPendingNavigation = new Set();
+
+lpApi.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  // Tandakan tab yang mula navigasi (loading atau URL berubah)
+  if (changeInfo.status === "loading" || changeInfo.url) {
+    tabsPendingNavigation.add(tabId);
+  }
+  // Hanya update apabila tab selesai load ATAU URL berubah
+  if (changeInfo.status === "complete" || changeInfo.url) {
+    // Bila URL berubah (navigasi baru), picker lama tidak lagi wujud — clear state
+    if (changeInfo.url) {
+      setCategoryPickerOpenState(tabId, false);
+    }
+    // Debounce per-tab untuk elak multiple calls semasa redirect chain
+    if (pageActionDebounceByTabId.has(tabId)) {
+      clearTimeout(pageActionDebounceByTabId.get(tabId));
+    }
+    const timer = setTimeout(() => {
+      pageActionDebounceByTabId.delete(tabId);
+      // Hanya delete state cache jika tab sedang navigasi (Firefox reset page action)
+      if (tabsPendingNavigation.has(tabId)) {
+        tabsPendingNavigation.delete(tabId);
+        pageActionStateByTabId.delete(tabId);
+      }
+      // Sentiasa dapatkan data terkini, elakkan cache lapuk
+      updatePageActionForTab(tab);
+    }, PAGE_ACTION_TAB_DEBOUNCE_MS);
+    pageActionDebounceByTabId.set(tabId, timer);
+  }
+});
+
+lpApi.tabs.onActivated.addListener(async (activeInfo) => {
+  try {
+    const tabId = activeInfo.tabId;
+    // Debounce untuk elak rapid tab switching
+    if (pageActionDebounceByTabId.has(tabId)) {
+      clearTimeout(pageActionDebounceByTabId.get(tabId));
+    }
+    const timer = setTimeout(async () => {
+      pageActionDebounceByTabId.delete(tabId);
+      try {
+        const tab = await lpApi.tabs.get(tabId);
+        // Sentiasa guna getItems() untuk dapat data terkini, elakkan rujukan cache lapuk
+        updatePageActionForTab(tab);
+      } catch (err) {
+        // ignore invalid tab
+      }
+    }, PAGE_ACTION_TAB_DEBOUNCE_MS);
+    pageActionDebounceByTabId.set(tabId, timer);
+  } catch (err) {
+    // ignore
+  }
+});
+
+if (lpApi.tabs && lpApi.tabs.onRemoved && lpApi.tabs.onRemoved.addListener) {
+  lpApi.tabs.onRemoved.addListener((tabId) => {
+    if (!tabId && tabId !== 0) return;
+    pageActionStateByTabId.delete(tabId);
+    contentScriptInjectedTabs.delete(tabId);
+    overlayInjectedTabs.delete(tabId);
+    clearPendingContextMenuCategory(tabId);
+    // Bersihkan debounce timer jika ada
+    if (pageActionDebounceByTabId.has(tabId)) {
+      clearTimeout(pageActionDebounceByTabId.get(tabId));
+      pageActionDebounceByTabId.delete(tabId);
+    }
+    // Bersihkan picker state untuk tab yang ditutup
+    setCategoryPickerOpenState(tabId, false);
+    _toggleCategoryPickerLastAt.delete(String(tabId));
+    // Kurangkan kiraan tab dalam memori
+    currentEligibleTabCount = Math.max(0, currentEligibleTabCount - 1);
+    // DISABLED: scheduleFloatingButtonAutoSuspendRefresh(); // Removed - caused performance issues with many tabs
+  });
+}
+
+async function fireRediscoverNotification() {
+  try {
+    const current = currentSettings || await getSettings();
+    if (!current.rediscoverEnabled) return;
+
+    const items = await getItems();
+    if (!Array.isArray(items) || !items.length) return;
+
+    const cats = await getCachedCategories();
+    const hiddenCatIds = new Set();
+    for (const cat of cats || []) {
+      if (cat && cat.id && cat.hidden) hiddenCatIds.add(String(cat.id));
+    }
+
+    const showHidden = current.showHiddenCategories || 0;
+    let filtered = items.filter((item) => {
+      if (!item || !item.id || !item.url) return false;
+      const catId = item.categoryId ? String(item.categoryId) : "";
+      const isHidden = catId === "hidden_none" || hiddenCatIds.has(catId);
+      if (showHidden === 2) return isHidden;
+      if (showHidden === 0) return !isHidden;
+      return true;
+    });
+
+    filtered.sort((a, b) => {
+      const ta = a.savedAt || "";
+      const tb = b.savedAt || "";
+      return ta < tb ? -1 : ta > tb ? 1 : 0;
+    });
+
+    if (!filtered.length) return;
+
+    let targetItem = null;
+
+    if (current.rediscoverMode === "random") {
+      const idx = Math.floor(Math.random() * filtered.length);
+      targetItem = filtered[idx];
+    } else {
+      const cursor = current.rediscoverCursor || null;
+      let cursorIdx = -1;
+      if (cursor) {
+        cursorIdx = filtered.findIndex((it) => it.id === cursor);
+      }
+      const nextIdx = cursorIdx < 0 ? 0 : (cursorIdx + 1) % filtered.length;
+      targetItem = filtered[nextIdx];
+      current.rediscoverCursor = targetItem.id;
+      try {
+        await lpStoreSet({ [SETTINGS_KEY]: current });
+      } catch (err) { /* ignore */ }
+    }
+
+    if (!targetItem) return;
+
+    const title = targetItem.title || "Link tanpa tajuk";
+    const url = targetItem.url || "";
+    const excerpt = targetItem.excerpt || "";
+    const rawDismissMs = typeof current.rediscoverDismissAfterMs === "number"
+      ? current.rediscoverDismissAfterMs
+      : 8000;
+    const dismissMs = rawDismissMs > 0 ? rawDismissMs : 0;
+
+    // Cuba hantar in-page toast ke active tab dahulu
+    let sentToPage = false;
+    try {
+      const activeTab = await getActiveTabForCommands();
+      if (activeTab && activeTab.id) {
+        const toastColor = typeof current.rediscoverColor === "string" && current.rediscoverColor
+          ? current.rediscoverColor
+          : "#8b5cf6";
+        const thumbnailUrl = targetItem.thumbnailUrl || targetItem.youtubeThumbnailUrl || buildYouTubeThumbnailUrl(targetItem.url || "") || targetItem.faviconUrl || "";
+        const toastRight = typeof current.rediscoverToastRight === "number" ? current.rediscoverToastRight : 16;
+        const toastBottom = typeof current.rediscoverToastBottom === "number" ? current.rediscoverToastBottom : 16;
+        const categoryName = getCategoryLabel(targetItem.categoryId ? String(targetItem.categoryId) : "all", cats || []);
+        const targetCatId = targetItem.categoryId ? String(targetItem.categoryId) : "";
+        const catFiltered = filtered.filter((it) => {
+          const itCatId = it.categoryId ? String(it.categoryId) : "";
+          return itCatId === targetCatId;
+        });
+        const itemIndex = catFiltered.findIndex((it) => it.id === targetItem.id) + 1;
+        const totalItems = catFiltered.length;
+        const response = await sendMessageToTabSafe(activeTab.id, {
+          type: "show-rediscover-toast",
+          title,
+          url,
+          excerpt,
+          dismissMs,
+          color: toastColor,
+          thumbnailUrl,
+          toastRight,
+          toastBottom,
+          itemId: targetItem.id ? String(targetItem.id) : "",
+          categoryId: targetItem.categoryId ? String(targetItem.categoryId) : "all",
+          categoryName,
+          itemIndex,
+          totalItems,
+        });
+        if (response && response.ok) sentToPage = true;
+      }
+    } catch (err) { /* ignore */ }
+
+    // Fallback: OS notification jika in-page toast gagal
+    if (!sentToPage) {
+      const iconUrl = (lpApi.runtime && lpApi.runtime.getURL)
+        ? lpApi.runtime.getURL("icons/icon48.png")
+        : "icons/icon48.png";
+      try {
+        const notifOptions = {
+          type: "basic",
+          iconUrl,
+          title: "Rediscover: " + title,
+          message: excerpt.length > 120 ? excerpt.slice(0, 117) + "..." : excerpt,
+        };
+        const maybePromise = lpApi.notifications.create("rediscover-item", notifOptions);
+        if (maybePromise && typeof maybePromise.then === "function") {
+          await maybePromise.catch((err) => {
+            lpErr("Rediscover notification create error:", err);
+          });
+        }
+      } catch (err) {
+        lpErr("Rediscover notification create threw:", err);
+      }
+      if (dismissMs > 0) {
+        setTimeout(() => {
+          try {
+            const maybePromise = lpApi.notifications.clear("rediscover-item");
+            if (maybePromise && typeof maybePromise.then === "function") {
+              maybePromise.catch(() => {});
+            }
+          } catch (err) { /* ignore */ }
+        }, dismissMs);
+      }
+    }
+  } catch (err) {
+    lpErr("Rediscover notification error:", err);
+  }
+}
+
+async function setupRediscoverAlarm() {
+  try {
+    // Baca terus dari storage supaya sentiasa guna nilai terkini
+    const current = await getSettings().catch(() => currentSettings || {});
+    if (lpApi.alarms && lpApi.alarms.clear) {
+      try {
+        const maybePromise = lpApi.alarms.clear("rediscover-alarm");
+        if (maybePromise && typeof maybePromise.then === "function") {
+          await maybePromise;
+        }
+      } catch (err) { /* ignore */ }
+    }
+    // Bersihkan setTimeout-based timer jika ada
+    if (typeof _rediscoverSecondsTimer !== "undefined" && _rediscoverSecondsTimer) {
+      clearTimeout(_rediscoverSecondsTimer);
+      _rediscoverSecondsTimer = null;
+    }
+    if (!current.rediscoverEnabled) return;
+    // interval disimpan dalam SAAT; convert ke minit untuk alarms lpApi
+    const intervalSecs = typeof current.rediscoverInterval === "number" && current.rediscoverInterval > 0
+      ? current.rediscoverInterval
+      : 86400; // default 1 hari
+    // Jika < 60 saat, guna setTimeout kerana Chrome alarms minimum ~1 minit
+    if (intervalSecs < 60) {
+      const intervalMs = intervalSecs * 1000;
+      function scheduleNext() {
+        _rediscoverSecondsTimer = setTimeout(async () => {
+          await fireRediscoverNotification();
+          const latest = await getSettings().catch(() => currentSettings || {});
+          if (latest.rediscoverEnabled) {
+            const latestSecs = typeof latest.rediscoverInterval === "number" ? latest.rediscoverInterval : 86400;
+            if (latestSecs < 60) {
+              scheduleNext();
+            } else {
+              setupRediscoverAlarm();
+            }
+          }
+        }, intervalMs);
+      }
+      scheduleNext();
+      return;
+    }
+    const intervalMinutes = intervalSecs / 60;
+    if (lpApi.alarms && lpApi.alarms.create) {
+      const maybePromise = lpApi.alarms.create("rediscover-alarm", {
+        delayInMinutes: intervalMinutes,
+        periodInMinutes: intervalMinutes,
+      });
+      if (maybePromise && typeof maybePromise.then === "function") {
+        await maybePromise.catch(() => {});
+      }
+    }
+  } catch (err) { /* ignore */ }
+}
+
+let _rediscoverSecondsTimer = null;
+
+if (lpApi.alarms && lpApi.alarms.onAlarm && lpApi.alarms.onAlarm.addListener) {
+  lpApi.alarms.onAlarm.addListener((alarm) => {
+    if (!alarm) return;
+    
+    if (alarm.name === "rediscover-alarm") {
+      fireRediscoverNotification().catch(() => {});
+    }
+  });
+}
+
+
+
+if (lpApi.alarms && lpApi.alarms.onAlarm && lpApi.alarms.onAlarm.addListener) {
+  lpApi.alarms.onAlarm.addListener((alarm) => {
+    if (!alarm || alarm.name.indexOf(_AC_ALARM_PREFIX) !== 0) return;
+    const id = alarm.name.slice(_AC_ALARM_PREFIX.length);
+    _acLoad().then(() => {
+      const a = (_acAlarms || []).filter((x) => x.id === id)[0];
+      if (a && a.enabled) _acFire(a);
+      else _acClearAlarm(id);
+    }).catch(() => {});
+  });
+}
+
+if (lpApi.notifications && lpApi.notifications.onClicked && lpApi.notifications.onClicked.addListener) {
+  lpApi.notifications.onClicked.addListener((notificationId) => {
+    if (notificationId === "rediscover-item") {
+      try {
+        const settings = currentSettings || {};
+        const cursor = settings.rediscoverCursor || "";
+        if (!cursor) return;
+        getItems().then((items) => {
+          const item = Array.isArray(items) ? items.find((it) => it && it.id === cursor) : null;
+          if (item && item.url && lpApi.tabs && lpApi.tabs.create) {
+            const itemId = item.id ? String(item.id) : "";
+            const catId = item.categoryId ? String(item.categoryId) : "all";
+            if (itemId) {
+              lpStoreSet({
+                [CATEGORY_PICKER_LAST_LOCATION_KEY]: {
+                  mode: "items",
+                  categoryId: catId,
+                  lastOpenedItemId: itemId,
+                  lastOpenedAt: Date.now(),
+                  updatedAt: new Date().toISOString(),
+                },
+                [SELECTED_CATEGORY_KEY]: catId,
+              }).catch(() => {});
+            }
+            lpApi.tabs.create({ url: item.url }).catch(() => {});
+          }
+        }).catch(() => {});
+      } catch (err) { /* ignore */ }
+      return;
+    }
+    if (notificationId !== "lp-native-focus-helper-error") return;
+    openNativeHelperSetupPage().catch(() => { });
+  });
+}
+
+if (lpApi.tabs && lpApi.tabs.onCreated && lpApi.tabs.onCreated.addListener) {
+  lpApi.tabs.onCreated.addListener((tab) => {
+    // Track tab count dalam memori — elak tabs.query({}) penuh setiap kali
+    if (tab && isFloatingButtonEligibleTabUrl(tab.url || tab.pendingUrl || "")) {
+      currentEligibleTabCount = Math.max(0, currentEligibleTabCount + 1);
+    }
+    // DISABLED: scheduleFloatingButtonAutoSuspendRefresh(); // Removed - caused performance issues with many tabs
+  });
+}
+
+if (lpApi.tabs && lpApi.tabs.onUpdated && lpApi.tabs.onUpdated.addListener) {
+  lpApi.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (!changeInfo || typeof changeInfo !== "object") return;
+    if (typeof changeInfo.url === "string") {
+      contentScriptInjectedTabs.delete(tabId);
+      overlayInjectedTabs.delete(tabId);
+    }
+    // DISABLED: scheduleFloatingButtonAutoSuspendRefresh(); // Removed - caused performance issues with many tabs
+  });
+}
+
+lpApi.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  if (changes[SETTINGS_KEY]) {
+    const prevHiddenMode = currentSettings ? currentSettings.showHiddenCategories : 0;
+    currentSettings = mergeSettings(changes[SETTINGS_KEY].newValue);
+    cachedPickerBaseScript = null;
+    if (!isNativeSidebarFocusHelperEnabled()) {
+      disconnectNativeFocusHelperPort();
+    }
+    scheduleBadgeUpdate();
+    updatePageActionForAllTabs();
+    createContextMenu().catch(() => { });
+    setupRediscoverAlarm();
+    // Kemas kini warna badge ikut mode hidden
+    const newHiddenMode = currentSettings.showHiddenCategories || 0;
+    if (prevHiddenMode !== newHiddenMode) {
+      updateBadgeColorForHiddenMode(newHiddenMode);
+    }
+  }
+  if (changes[CATEGORY_KEY]) {
+    cachedCategories = Array.isArray(changes[CATEGORY_KEY].newValue) ? changes[CATEGORY_KEY].newValue : [];
+  }
+  if (changes[ITEM_KEY] || changes[SELECTED_CATEGORY_KEY]) {
+    if (changes[ITEM_KEY]) {
+      const incomingItems = coerceArray(changes[ITEM_KEY].newValue);
+      const incomingCount = incomingItems.length;
+      // Guna oldValue untuk detect perubahan sebenar — lebih tepat dari cachedItems.length
+      // kerana cachedItems mungkin sudah dikemas kini oleh setItems sebelum onChanged berlaku
+      const oldItems = changes[ITEM_KEY].oldValue;
+      const oldCount = Array.isArray(oldItems) ? oldItems.length : (hasCachedItems ? cachedItems.length : -1);
+      const prevCount = hasCachedItems ? cachedItems.length : -1;
+
+      if (!hasCachedItems) {
+        cachedItems = incomingItems;
+        hasCachedItems = true;
+        buildUrlIndexCache(cachedItems);
+      } else if (incomingCount < prevCount) {
+        // Item dipadam dari luar pipeline — kemaskini cache, sync IndexedDB, reset cursor
+        cachedItems = incomingItems;
+        buildUrlIndexCache(cachedItems);
+        nextSequenceCursorByCategory.clear();
+        Promise.resolve(isItemsIndexedDbAvailable())
+          .then((available) => {
+            if (!available || !itemsIndexedDbStore || typeof itemsIndexedDbStore.replaceAll !== "function") return;
+            return itemsIndexedDbStore.replaceAll(cachedItems);
+          })
+          .catch(() => { });
+      } else {
+        // Item ditambah, dipindah kategori, atau perubahan lain — kemaskini cache
+        // Jangan clear cursor (fix: quicksave tidak harus reset navigasi)
+        cachedItems = incomingItems;
+        buildUrlIndexCache(cachedItems);
+        if (incomingCount > prevCount) {
+          for (const [key, index] of nextSequenceCursorByCategory) {
+            if (index >= incomingCount) {
+              nextSequenceCursorByCategory.set(key, Math.max(0, incomingCount - 1));
+            }
+          }
+        }
+      }
+
+      // Sentiasa update badge apabila item berubah (termasuk pindah kategori — count sama)
+      scheduleBadgeUpdate();
+      // Hanya refresh page action icon apabila bilangan item berubah (save/delete baru)
+      // Skip untuk perubahan data sahaja (thumbnail, title, progress) — elak O(N) cache rebuild
+      // pada setiap save thumbnail update
+      if (incomingCount !== oldCount) {
+        updatePageActionForAllTabs();
+      }
+    } else if (changes[SELECTED_CATEGORY_KEY]) {
+      // Hanya kategori terpilih berubah — kemaskini cache dalam memori
+      cachedSelectedCategoryId = changes[SELECTED_CATEGORY_KEY].newValue
+        ? String(changes[SELECTED_CATEGORY_KEY].newValue)
+        : "";
+      scheduleBadgeUpdate();
+      const newCategoryId = cachedSelectedCategoryId;
+      if (newCategoryId && lpApi.tabs && lpApi.tabs.query) {
+        // Hantar hanya ke active tab — picker hanya ada di satu tab
+        lpApi.tabs.query({ currentWindow: true, active: true }).then((tabs) => {
+          if (!tabs || !tabs.length) return;
+          const tab = tabs[0];
+          if (!tab || !tab.id) return;
+          lpApi.tabs.sendMessage(tab.id, {
+            type: "category-picker-command",
+            command: "switch-category",
+            categoryId: newCategoryId,
+          }).catch(() => {});
+        }).catch(() => {});
+      }
+    }
+  }
+});
+
+loadSettings();
+createContextMenu();
+
+// Log identity redirect URL on startup — needed for Google OAuth registration
+(function() {
+  try {
+    if (lpApi.identity && lpApi.identity.getRedirectURL) {
+      var redirectUrl = lpApi.identity.getRedirectURL();
+      lpLog("info", '[SupabaseAuth] ===================================================');
+      lpLog("info", '[SupabaseAuth] Identity Redirect URL:', redirectUrl);
+      lpLog("info", '[SupabaseAuth] Register this URL in:');
+      lpLog("info", '[SupabaseAuth]   1. Google Cloud Console -> OAuth Client -> Authorized redirect URIs');
+      lpLog("info", '[SupabaseAuth]   2. Supabase Dashboard -> Authentication -> URL Configuration -> Redirect URLs');
+      lpLog("info", '[SupabaseAuth] ===================================================');
+    } else {
+      lpWarn('[SupabaseAuth] browser.identity.getRedirectURL not available');
+    }
+  } catch(e) { /* ignore */ }
+})();
+
+
+// Auto-sync on data change — jalan terus di background, tak perlu options page
+(function() {
+  var _backSyncTimer = null;
+  var _backSyncRunning = false;
+  var _backSyncNeeded = false;
+  var _backForceBackup = false; // true when a non-incremental key changed (e.g. selectedCategory, pomodoroState)
+
+  // Fix #5: Full backup cooling period — avoid uploading 7.5MB on every single
+  // incremental change. Full backup runs at most once every 5 minutes.
+  var _BACK_FULL_BACKUP_COOLDOWN_MS = 5 * 60 * 1000;
+  var _backLastFullBackupAt = 0;
+
+  // Fix #4: Cache of known summary_history_* keys — rebuilt lazily from storage.
+  // Avoids calling storage.local.get(null) (reads ALL storage) on every sync cycle.
+  var _backSummaryHistoryKeys = null; // null = not yet loaded; [] = loaded but empty
+  var _backSummaryHistoryKeysLoadedAt = 0;
+  var _BACK_SUMMARY_HISTORY_KEYS_TTL_MS = 10 * 60 * 1000; // refresh every 10 min
+
+  // _backFullBackupTimer — no longer needed, full backup runs inline after incremental sync
+  var _BACK_AUTO_SYNC_DEBOUNCE_MS = 500;
+  var _BACK_AUTO_SYNC_QUEUE_DELAY_MS = 3000;
+  var _BACK_AUTO_SYNC_DATA_KEYS = {
+    // Core data
+    'items':1,'categories':1,'selectedCategory':1,
+    // Notes
+    'sidebarNotes':1,'sidebarNoteFolders':1,'sidebarNotesUi':1,'sidebarNoteAttachments':1,
+    'sidebarNotesTrash':1,
+    // Other content
+      'trashItems':1,'summaryPromptTemplates':1,'summaryPromptHistory':1,'settings':1,
+    // Summary / history
+    'summaryModePreference':1,'summaryHistoryIndex':1,'categoryPickerLastLocation':1,
+    'summaryHistory':1,
+    // Pomodoro
+    'pomodoroState':1,'pomodoroHistory':1,
+    // UI preferences
+    'lpPickerWidth':1,'lpPickerHeight':1,'lpPickerOpacity':1,'floatingSizeOverride':1,
+    '__lpSelectionSearchPopupPosition':1,
+    // Feature flags
+    'sidebarAiEnabled':1,'cloud_auto_sync':1,'cloud_sync_notification':1,
+    // Summary preferences (standalone keys). summaryCustomPrompt is NOT here —
+    // it lives inside `settings`, so changes trigger via the `settings` key.
+    'summaryTonePreference':1,
+    // JARVIS data — changes must trigger sync (and force the cloud blob re-upload,
+    // since the incremental per-doc path does not cover JARVIS — see _BACK_FORCE_BACKUP_KEYS).
+    'jarvisSessions':1,'jarvisConversations':1,'jarvisLearnedCommands':1,
+    'jarvisElementMemory':1,'jarvisElementHintsCache':1,'jarvisMacros':1,
+    'jarvisBottomHidden':1,'jarvisFontPrefs':1,'jarvisPromptTemplates':1
+  };
+
+  // Keys whose changes should trigger a full backup update even if
+  // firestoreSyncCore.syncAllData() reports zero incremental writes
+  // (these types are not handled by the incremental path).
+  var _BACK_FORCE_BACKUP_KEYS = {
+    'selectedCategory':1,'summaryModePreference':1,'summaryHistoryIndex':1,
+    'categoryPickerLastLocation':1,'summaryHistory':1,
+    'pomodoroState':1,'pomodoroHistory':1,
+    'lpPickerWidth':1,'lpPickerHeight':1,'lpPickerOpacity':1,'floatingSizeOverride':1,
+    '__lpSelectionSearchPopupPosition':1,
+    'sidebarAiEnabled':1,'cloud_auto_sync':1,'cloud_sync_notification':1,'sidebarNotesTrash':1,
+    'summaryTonePreference':1,
+    // JARVIS data — not handled by the incremental per-doc path, so any change must
+    // force a full cloud blob re-upload (which already carries the JARVIS section).
+    'jarvisSessions':1,'jarvisConversations':1,'jarvisLearnedCommands':1,
+    'jarvisElementMemory':1,'jarvisElementHintsCache':1,'jarvisMacros':1,
+    'jarvisBottomHidden':1,'jarvisFontPrefs':1,'jarvisPromptTemplates':1
+  };
+
+  var _backSupabaseReady = false;
+  var _backAuthReady = null;
+
+  function _backInitSupabase() {
+    if (_backSupabaseReady) return true;
+    try {
+      var _cfg = (typeof supabaseConfig !== 'undefined') ? supabaseConfig : null;
+      if (!_cfg || !_cfg.url || _cfg.anonKey === 'PASTE_YOUR_ANON_KEY_HERE') {
+        lpLog("info", '[AutoSync] Supabase config not available');
+        return false;
+      }
+      if (typeof supabase === 'undefined' || !supabase.createClient) {
+        lpLog("info", '[AutoSync] Supabase SDK not loaded');
+        return false;
+      }
+
+      // Initialize auth + sync cores
+      var authMod = typeof LocalPocketSupabaseAuthCore !== 'undefined'
+        ? LocalPocketSupabaseAuthCore
+        : (typeof LocalPocketFirebaseAuthCore !== 'undefined' ? LocalPocketFirebaseAuthCore : null);
+      if (authMod && typeof authMod.initializeSupabaseAuth === 'function') {
+        authMod.initializeSupabaseAuth(_cfg);
+      }
+      if (typeof LocalPocketSupabaseSyncCore !== 'undefined') {
+        LocalPocketSupabaseSyncCore.initializeSync();
+      }
+
+      _backSupabaseReady = true;
+      lpLog("info", '[AutoSync] Supabase initialized');
+
+      // Fix #5: _backAuthReady resolves on both signed-in and signed-out,
+      // with 5s timeout to avoid blocking sync forever on unauthenticated devices.
+      _backAuthReady = new Promise(function(resolve) {
+        var settled = false;
+        var tid = setTimeout(function() {
+          if (settled) return;
+          settled = true;
+          resolve(null);
+        }, 5000);
+        if (authMod && typeof authMod.waitForAuthReady === 'function') {
+          authMod.waitForAuthReady(4000).then(function() {
+            if (settled) return;
+            settled = true;
+            clearTimeout(tid);
+            authMod.getCurrentUser ? authMod.getCurrentUser().then(resolve).catch(function() { resolve(null); }) : resolve(null);
+          }).catch(function() {
+            if (!settled) { settled = true; clearTimeout(tid); resolve(null); }
+          });
+        } else {
+          clearTimeout(tid);
+          settled = true;
+          resolve(null);
+        }
+      });
+
+      return true;
+    } catch (e) { lpErr('[AutoSync] Supabase init error:', e); return false; }
+  }
+
+  function _backInitCloudSync() {
+    if (!_backSupabaseReady) return false;
+    // supabaseSyncCore is already initialised in _backInitSupabase
+    var hasSync = typeof LocalPocketSupabaseSyncCore !== 'undefined';
+    lpLog("info", '[AutoSync] Cloud sync init:', hasSync ? 'OK' : 'FAILED');
+    return hasSync;
+  }
+
+  // ── JARVIS memory pref auto-pull (cross-device Layer 5) ──
+  // Pulls `jarvisPrefs` from the cloud (user_preferences table) on auth-ready /
+  // login so a fresh device gets JARVIS memory without opening the dashboard.
+  // Last-write-wins: if local is newer we skip to avoid clobbering local edits.
+  function _backPullJarvisPrefs() {
+    var PS = (typeof LocalPocketPreferenceSync !== 'undefined') ? LocalPocketPreferenceSync : null;
+    var ML = (typeof LocalPocketMemoryLayers !== 'undefined') ? LocalPocketMemoryLayers : null;
+    if (!PS || !PS.isReady || !PS.isReady()) return;
+    PS.pull().then(function (res) {
+      if (!res || !res.ok || !res.profile) return;
+      var apply = function () {
+        try {
+          if (ML && typeof ML.importProfile === 'function') {
+            ML.importProfile(res.profile);
+          } else {
+            lpApi.storage.local.set({ jarvisPrefs: res.profile }).catch(function () {});
+          }
+          lpLog('info', '[JarvisPrefs] Auto-pulled from cloud');
+        } catch (e) { lpErr('[JarvisPrefs] Auto-pull apply error:', e); }
+      };
+      // Guard: don't clobber newer local edits (last-write-wins by updatedAt).
+      try {
+        lpStoreGet('jarvisPrefs', function (r) {
+          var local = r && r.jarvisPrefs;
+          var localTs = local && local.updatedAt ? local.updatedAt : 0;
+          var cloudTs = res.profile.updatedAt ? res.profile.updatedAt : 0;
+          if (localTs && cloudTs && cloudTs <= localTs) {
+            lpLog('info', '[JarvisPrefs] Auto-pull skipped (local newer than cloud)');
+            return;
+          }
+          apply();
+        });
+      } catch (e) { apply(); }
+    }).catch(function (err) { lpErr('[JarvisPrefs] Auto-pull error:', err); });
+  }
+
+  function _backRunSync() {
+    if (_backSyncRunning) { _backSyncNeeded = true; return; }
+    _backSyncRunning = true;
+    _backSyncTimer = null;
+    lpLog("info", '[AutoSync] Starting sync...');
+
+    lpStoreGet(['cloud_auto_sync', 'firebase_user_uid'], function(r) {
+      if (r.cloud_auto_sync === false) {
+        lpLog("info", '[AutoSync] Auto-sync disabled');
+        _backSyncRunning = false;
+        return;
+      }
+      if (!r.firebase_user_uid) {
+        lpLog("info", '[AutoSync] User not authenticated (no UID)');
+        _backSyncRunning = false;
+        return;
+      }
+      // Use supabaseSyncCore (registered as both LocalPocketSupabaseSyncCore and LocalPocketCloudSyncCore)
+      var _cloudSyncMod = typeof LocalPocketSupabaseSyncCore !== 'undefined'
+        ? LocalPocketSupabaseSyncCore
+        : (typeof LocalPocketCloudSyncCore !== 'undefined' ? LocalPocketCloudSyncCore : null);
+      if (!_cloudSyncMod) {
+        lpLog("info", '[AutoSync] SyncCore not available');
+        _backSyncRunning = false;
+        return;
+      }
+
+      function _doUpload() {
+        lpLog("info", '[AutoSync] Starting incremental sync via SupabaseSyncCore');
+        var core = typeof LocalPocketSupabaseSyncCore !== 'undefined'
+          ? LocalPocketSupabaseSyncCore
+          : (typeof LocalPocketFirestoreSyncCore !== 'undefined' ? LocalPocketFirestoreSyncCore : null);
+        if (!core) {
+          lpLog("info", '[AutoSync] SyncCore not available, using legacy backup');
+          _cloudSyncMod.uploadBackup(r.firebase_user_uid).then(function(res) {
+            if (res && res.success) {
+              lpLog("info", '[AutoSync] Legacy upload SUCCESS, size:', res.size);
+              lpStoreSet({ cloud_last_sync_time: Date.now() });
+              lpStoreRemove('pending_auto_sync_needed');
+              try { showSyncToast('Auto-sync completed', false, 3500); } catch (_) {}
+            } else {
+              lpLog("info", '[AutoSync] Legacy upload FAILED:', JSON.stringify(res));
+              try { showSyncToast('Auto-sync failed', true, 4000); } catch (_) {}
+            }
+          }).catch(function(err) {
+            lpErr('[AutoSync] Legacy upload ERROR:', err.message);
+            try { showSyncToast('Auto-sync failed', true, 4000); } catch (_) {}
+          }).finally(function() {
+            _backSyncRunning = false;
+            if (_backSyncNeeded) { _backSyncNeeded = false; _backSyncTimer = setTimeout(_backRunSync, _BACK_AUTO_SYNC_QUEUE_DELAY_MS); }
+          });
+          return;
+        }
+        var _progressTypes = {};
+        var _backTotalSynced = 0;
+        var _forceBackup = _backForceBackup; // capture and reset before async work
+        _backForceBackup = false;
+        var _syncOk = false; // reflects whether the whole sync cycle actually succeeded
+        core.syncAllData(function(p) {
+          if (p && p.dataType) {
+            _progressTypes[p.dataType] = p.status;
+            lpLog("info", '[AutoSync]', p.dataType, p.status, 'synced:', p.synced, 'failed:', p.failed);
+          }
+          if (p && p.status === 'complete') _backTotalSynced = p.synced || 0;
+        }).then(function(result) {
+          // A single failed/oversized item must NOT block the rest of the cycle.
+          // We always run the full backup (safety-net blob) and the per-doc
+          // "remaining" sync (notes, folders, pomodoro, UI prefs, flags, …).
+          var _resultOk = !!(result && result.success);
+          _syncOk = _resultOk;
+          if (!_resultOk) {
+            lpLog("info", '[AutoSync] Incremental sync reported failures:', JSON.stringify(result));
+          }
+
+          var _backupPromise;
+          // Backup when data changed, when a non-incremental key changed (force),
+          // or when there were failures (blob backup is the safety net).
+          var _shouldBackup = _backTotalSynced > 0 || _forceBackup || !_resultOk;
+          if (!_shouldBackup) {
+            lpLog("info", '[AutoSync] No data changed, skipping full backup');
+            _backupPromise = Promise.resolve();
+          } else {
+            var _now = Date.now();
+            var _sinceLastBackup = _now - _backLastFullBackupAt;
+            if (_sinceLastBackup < _BACK_FULL_BACKUP_COOLDOWN_MS && !_forceBackup) {
+              lpLog("info", '[AutoSync] Full backup skipped (cooldown, last backup ' + Math.round(_sinceLastBackup / 1000) + 's ago)');
+              _backupPromise = Promise.resolve();
+            } else {
+              var _reason = _backTotalSynced > 0 ? 'incremental sync done' : (_resultOk ? 'non-incremental key changed' : 'partial failure safety backup');
+              lpLog("info", '[AutoSync] ' + _reason + ', updating full backup...');
+              _backupPromise = _cloudSyncMod.uploadBackup(r.firebase_user_uid).then(function(res) {
+                if (res && res.success) {
+                  // Only start the cooldown after a backup that actually succeeded.
+                  _backLastFullBackupAt = Date.now();
+                  lpLog("info", '[AutoSync] Full backup updated: OK size=' + res.size);
+                } else {
+                  lpLog("info", '[AutoSync] Full backup update result:', JSON.stringify(res));
+                }
+              });
+            }
+          }
+          return _backupPromise.then(function() {
+            // All sync types are now pushed by LocalPocketSupabaseSyncCore.syncAllData
+            // (single source of truth). The old per-type _backSyncRemaining pass is
+            // redundant and intentionally skipped.
+            return Promise.resolve();
+          });
+        }).catch(function(err) {
+          _syncOk = false;
+          lpErr('[AutoSync] Sync ERROR:', err.message);
+          try { showSyncToast('Auto-sync failed: ' + (err.message||''), true, 4000); } catch (_) {}
+        }).finally(function() {
+          _backSyncRunning = false;
+          if (_backSyncNeeded) {
+            _backSyncNeeded = false;
+            _backSyncTimer = setTimeout(_backRunSync, _BACK_AUTO_SYNC_QUEUE_DELAY_MS);
+          }
+          if (_syncOk) {
+            lpStoreSet({ cloud_last_sync_time: Date.now() });
+            lpStoreRemove('pending_auto_sync_needed');
+            try { showSyncToast('Auto-sync completed', false, 3500); } catch (_) { lpLog("info", '[AutoSync] Toast failed (no active tab?)'); }
+          } else {
+            lpLog("info", '[AutoSync] Sync cycle had failures — leaving pending flag; will retry');
+            try { showSyncToast('Auto-sync incomplete, will retry', true, 4000); } catch (_) {}
+          }
+        });
+      }
+
+      function _backSyncRemaining() {
+        var _core = typeof LocalPocketSupabaseSyncCore !== 'undefined' ? LocalPocketSupabaseSyncCore : null;
+        if (!_core) return Promise.resolve();
+        return new Promise(function(outerResolve) {
+          lpStoreGet([
+            'sidebarNotes','trashItems','sidebarNoteFolders','sidebarNotesUi',
+            'summaryPromptTemplates','summaryPromptHistory','sidebarNoteAttachments',
+            'selectedCategory','summaryModePreference','summaryHistoryIndex',
+            'categoryPickerLastLocation','pomodoroState','pomodoroHistory',
+            'lpPickerWidth','lpPickerHeight','lpPickerOpacity','floatingSizeOverride',
+            'summaryHistory','sidebarNotesTrash','sidebarAiEnabled',
+            'cloud_auto_sync','cloud_sync_notification','__lpSelectionSearchPopupPosition',
+            'jarvisSessions','jarvisConversations','jarvisLearnedCommands',
+            'jarvisElementMemory','jarvisElementHintsCache','jarvisMacros',
+            'jarvisBottomHidden','jarvisFontPrefs','jarvisPromptTemplates'
+          ], function(_r) {
+
+            // ── Build task groups ────────────────────────────────────────────
+            // GROUP A: independent tasks that can run in parallel (no ordering dep)
+            var _parallelTasks = [];
+            // GROUP B: summary_history_* — sequential with 1200ms gap (Firestore write stream)
+            var _histTasks = [];
+
+            // Notes list (consolidated)
+            if (Array.isArray(_r.sidebarNotes) && _r.sidebarNotes.length > 0) {
+              _parallelTasks.push(function() { return _core.syncData('notesList', { items: _r.sidebarNotes }, 'all-items'); });
+            }
+            if (Array.isArray(_r.trashItems)) { _parallelTasks.push(function() { return _core.syncData('trash', { items: _r.trashItems }, 'all-items'); }); }
+            if (Array.isArray(_r.sidebarNoteFolders)) { _parallelTasks.push(function() { return _core.syncData('noteFolders', { items: _r.sidebarNoteFolders }, 'all-items'); }); }
+            if (_r.sidebarNotesUi && typeof _r.sidebarNotesUi === 'object') { _parallelTasks.push(function() { return _core.syncData('notesUi', _r.sidebarNotesUi, 'state'); }); }
+            if (Array.isArray(_r.summaryPromptTemplates)) { _parallelTasks.push(function() { return _core.syncData('promptTemplates', { items: _r.summaryPromptTemplates }, 'all-items'); }); }
+            if (Array.isArray(_r.summaryPromptHistory)) { _parallelTasks.push(function() { return _core.syncData('promptHistory', { items: _r.summaryPromptHistory }, 'all-items'); }); }
+            // Keyboard shortcuts (from chrome.commands API, not storage) — push so cloud copy stays fresh
+            _parallelTasks.push(function() {
+              return new Promise(function(resolve) {
+                if (!lpApi.commands || !lpApi.commands.getAll) return resolve();
+                lpApi.commands.getAll().then(function(cmds) {
+                  if (Array.isArray(cmds) && cmds.length) {
+                    var _shortcuts = cmds.map(function(c) { return { name: c.name, shortcut: c.shortcut }; });
+                    _core.syncData('shortcuts', { items: _shortcuts }, 'all-items').then(resolve).catch(resolve);
+                  } else { resolve(); }
+                }).catch(function() { resolve(); });
+              });
+            });
+            if (_r.sidebarNoteAttachments && typeof _r.sidebarNoteAttachments === 'object') { _parallelTasks.push(function() { return _core.syncData('attachments', _r.sidebarNoteAttachments, 'all-items'); }); }
+
+            // UI state — grouped into one document
+            var _uiState = {};
+            if (_r.selectedCategory !== undefined) _uiState.selectedCategory = _r.selectedCategory;
+            if (_r.summaryModePreference !== undefined) _uiState.summaryModePreference = _r.summaryModePreference;
+            if (_r.summaryHistoryIndex !== undefined) _uiState.summaryHistoryIndex = _r.summaryHistoryIndex;
+            if (_r.categoryPickerLastLocation !== undefined) _uiState.categoryPickerLastLocation = _r.categoryPickerLastLocation;
+            if (Object.keys(_uiState).length > 0) { _parallelTasks.push(function() { return _core.syncData('uiState', _uiState, 'state'); }); }
+
+            // Pomodoro
+            if (_r.pomodoroState && typeof _r.pomodoroState === 'object') { _parallelTasks.push(function() { return _core.syncData('pomodoro', _r.pomodoroState, 'state'); }); }
+            if (Array.isArray(_r.pomodoroHistory)) { _parallelTasks.push(function() { return _core.syncData('pomodoro', { items: _r.pomodoroHistory }, 'history'); }); }
+
+            // UI prefs — grouped into one document
+            var _uiPrefs = {};
+            if (_r.lpPickerWidth !== undefined) _uiPrefs.lpPickerWidth = _r.lpPickerWidth;
+            if (_r.lpPickerHeight !== undefined) _uiPrefs.lpPickerHeight = _r.lpPickerHeight;
+            if (_r.lpPickerOpacity !== undefined) _uiPrefs.lpPickerOpacity = _r.lpPickerOpacity;
+            if (_r.floatingSizeOverride !== undefined) _uiPrefs.floatingSizeOverride = _r.floatingSizeOverride;
+            if (_r['__lpSelectionSearchPopupPosition'] !== undefined) _uiPrefs.selectionPopupPosition = _r['__lpSelectionSearchPopupPosition'];
+            if (Object.keys(_uiPrefs).length > 0) { _parallelTasks.push(function() { return _core.syncData('uiPrefs', _uiPrefs, 'layout'); }); }
+
+            // Feature flags — grouped into one document
+            var _flags = {};
+            if (_r.sidebarAiEnabled !== undefined) _flags.sidebarAiEnabled = _r.sidebarAiEnabled;
+            if (_r.cloud_auto_sync !== undefined) _flags.cloudAutoSync = _r.cloud_auto_sync;
+            if (_r.cloud_sync_notification !== undefined) _flags.cloudSyncNotification = _r.cloud_sync_notification;
+            if (Object.keys(_flags).length > 0) { _parallelTasks.push(function() { return _core.syncData('featureFlags', _flags, 'flags'); }); }
+
+            // Notes trash + summary history flat
+            if (Array.isArray(_r.sidebarNotesTrash)) { _parallelTasks.push(function() { return _core.syncData('notesTrash', { items: _r.sidebarNotesTrash }, 'all-items'); }); }
+            if (Array.isArray(_r.summaryHistory)) { _parallelTasks.push(function() { return _core.syncData('summaryHistoryFlat', { items: _r.summaryHistory }, 'all-items'); }); }
+
+            // JARVIS memory + conversation history — grouped into one document
+            var _jarvisData = {};
+            if (_r.jarvisSessions && typeof _r.jarvisSessions === 'object') _jarvisData.sessions = _r.jarvisSessions;
+            if (Array.isArray(_r.jarvisConversations)) _jarvisData.conversations = _r.jarvisConversations;
+            if (Array.isArray(_r.jarvisLearnedCommands)) _jarvisData.learnedCommands = _r.jarvisLearnedCommands;
+            if (_r.jarvisElementMemory && typeof _r.jarvisElementMemory === 'object') _jarvisData.elementMemory = _r.jarvisElementMemory;
+            if (_r.jarvisElementHintsCache && typeof _r.jarvisElementHintsCache === 'object') _jarvisData.elementHintsCache = _r.jarvisElementHintsCache;
+            if (_r.jarvisMacros && typeof _r.jarvisMacros === 'object') _jarvisData.macros = _r.jarvisMacros;
+            if (_r.jarvisBottomHidden !== undefined) _jarvisData.bottomHidden = _r.jarvisBottomHidden;
+            if (_r.jarvisFontPrefs && typeof _r.jarvisFontPrefs === 'object') _jarvisData.fontPrefs = _r.jarvisFontPrefs;
+            if (Array.isArray(_r.jarvisPromptTemplates)) _jarvisData.promptTemplates = _r.jarvisPromptTemplates;
+            if (Object.keys(_jarvisData).length > 0) { _parallelTasks.push(function() { return _core.syncData('jarvis', _jarvisData, 'all-items'); }); }
+
+            if (_parallelTasks.length === 0 && _backSummaryHistoryKeys !== null && _backSummaryHistoryKeys.length === 0) {
+              lpLog("info", '[AutoSync] Extra types synced: 0 / 0');
+              outerResolve();
+              return;
+            }
+
+            // Fix #4: Get summary_history_* keys from cache instead of storage.local.get(null).
+            // Cache is invalidated after TTL or when a summary_history_* key changes.
+            var _now = Date.now();
+            var _needsKeyRefresh = _backSummaryHistoryKeys === null ||
+              (_now - _backSummaryHistoryKeysLoadedAt > _BACK_SUMMARY_HISTORY_KEYS_TTL_MS);
+
+            function _runWithHistKeys(histKeys) {
+              // Build sequential tasks for summary_history_* (many docs, need pacing)
+              histKeys.forEach(function(k) {
+                var _val = _r[k]; // may be undefined — need to fetch individually
+                _histTasks.push({ key: k });
+              });
+
+              var _totalTasks = _parallelTasks.length + _histTasks.length;
+              if (_totalTasks === 0) {
+                lpLog("info", '[AutoSync] Extra types synced: 0 / 0');
+                outerResolve();
+                return;
+              }
+
+              var _ok = 0;
+
+              // Fix #3: Run all parallel tasks concurrently, then run hist tasks sequentially
+              var _parallelPromises = _parallelTasks.map(function(task) {
+                return task().then(function(res) {
+                  if (res && res.success) _ok++;
+                }).catch(function() {});
+              });
+
+              Promise.all(_parallelPromises).then(function() {
+                // Sequential hist tasks with 1200ms gap (Firestore write stream pacing)
+                if (_histTasks.length === 0) {
+                  lpLog("info", '[AutoSync] Extra types synced:', _ok, '/', _totalTasks);
+                  outerResolve();
+                  return;
+                }
+
+                // Fetch hist values individually (not via get(null))
+                var _hIdx = 0;
+                function _nextHist() {
+                  if (_hIdx >= _histTasks.length) {
+                    lpLog("info", '[AutoSync] Extra types synced:', _ok, '/', _totalTasks);
+                    outerResolve();
+                    return;
+                  }
+                  var _task = _histTasks[_hIdx];
+                  lpStoreGet(_task.key, function(_hData) {
+                    var _val = _hData[_task.key];
+                    if (_val) {
+                      var _docId = _task.key.replace('summary_history_', '') || _task.key;
+                      _core.syncData('summaryHistory', { key: _task.key, value: _val }, _docId)
+                        .then(function(res) { if (res && res.success) _ok++; })
+                        .catch(function() {})
+                        .then(function() {
+                          _hIdx++;
+                          setTimeout(_nextHist, 1200);
+                        });
+                    } else {
+                      _hIdx++;
+                      setTimeout(_nextHist, 0);
+                    }
+                  });
+                }
+                _nextHist();
+              });
+            }
+
+            if (_needsKeyRefresh) {
+              // Refresh cache: enumerate keys only (no values) to avoid pulling the
+              // entire storage blob (incl. article content) into memory.
+              if (typeof lpApi.storage.local.getKeys === 'function') {
+                lpApi.storage.local.getKeys(function(_allKeys) {
+                  var _keys = (_allKeys || []).filter(function(k) { return k.indexOf('summary_history_') === 0; });
+                  _backSummaryHistoryKeys = _keys;
+                  _backSummaryHistoryKeysLoadedAt = Date.now();
+                  _runWithHistKeys(_keys);
+                });
+              } else {
+                lpStoreGet(null, function(_all) {
+                  var _keys = Object.keys(_all).filter(function(k) { return k.indexOf('summary_history_') === 0; });
+                  _backSummaryHistoryKeys = _keys;
+                  _backSummaryHistoryKeysLoadedAt = Date.now();
+                  _runWithHistKeys(_keys);
+                });
+              }
+            } else {
+              _runWithHistKeys(_backSummaryHistoryKeys);
+            }
+          });
+        });
+      }
+
+      var _waitForAuth = _backAuthReady || Promise.resolve(null);
+      _waitForAuth.then(function(user) {
+        if (user) {
+          lpLog("info", '[AutoSync] Auth session restored for uid:', user.uid);
+        } else {
+          lpLog("info", '[AutoSync] Auth session null (proceeding with stored UID)');
+        }
+        _doUpload();
+      });
+    });
+  }
+
+  // Init Supabase sebaik sahaja background siap
+  _backInitSupabase();
+  _backInitCloudSync();
+  if (typeof LocalPocketSupabaseSyncCore !== 'undefined') {
+    LocalPocketSupabaseSyncCore.initializeSync();
+    lpLog("info", '[AutoSync] SupabaseSyncCore initialized');
+  }
+
+  // Auto-pull JARVIS memory prefs from cloud on auth-ready and on every login,
+  // so JARVIS memory reaches a fresh device without opening the dashboard.
+  (function _backRegisterJarvisPrefsAutoPull() {
+    var authMod = (typeof LocalPocketSupabaseAuthCore !== 'undefined') ? LocalPocketSupabaseAuthCore
+      : (typeof LocalPocketFirebaseAuthCore !== 'undefined' ? LocalPocketFirebaseAuthCore : null);
+    if (authMod && typeof authMod.onAuthStateChanged === 'function') {
+      authMod.onAuthStateChanged(function (user) {
+        if (user) _backPullJarvisPrefs();
+      });
+    }
+    if (_backAuthReady && typeof _backAuthReady.then === 'function') {
+      _backAuthReady.then(function (user) { if (user) _backPullJarvisPrefs(); });
+    }
+  })();
+
+  // Listener storage changes — auto-sync langsung
+  lpApi.storage.onChanged.addListener(function(changes, area) {
+    if (area !== 'local') return;
+
+    var changedKeys = Object.keys(changes);
+
+    // Check for summary_history_* keys separately (dynamic prefix)
+    var hasSummaryHistory = changedKeys.some(function(k) { return k.indexOf('summary_history_') === 0; });
+
+    // Fix #4: Invalidate summary_history_* key cache when any such key changes
+    if (hasSummaryHistory) _backSummaryHistoryKeys = null;
+
+    var hasDataChange = hasSummaryHistory || changedKeys.some(function(k) {
+      return _BACK_AUTO_SYNC_DATA_KEYS.hasOwnProperty(k);
+    });
+    if (!hasDataChange) {
+      return;
+    }
+
+    // Check if any changed key should force a full backup even when incremental
+    // sync reports zero writes (e.g. selectedCategory, pomodoroState, UI prefs)
+    var needsForceBackup = hasSummaryHistory || changedKeys.some(function(k) {
+      return _BACK_FORCE_BACKUP_KEYS.hasOwnProperty(k);
+    });
+    if (needsForceBackup) _backForceBackup = true;
+
+    lpLog("info", '[AutoSync] Data change detected:', changedKeys);
+
+    lpStoreGet('cloud_auto_sync', function(r) {
+      if (r.cloud_auto_sync === false) {
+        lpLog("info", '[AutoSync] Skipped: cloud_auto_sync not enabled');
+        return;
+      }
+
+      if (!_backSupabaseReady) {
+        lpLog("info", '[AutoSync] Supabase not ready, attempting init...');
+        if (_backInitSupabase()) _backInitCloudSync();
+        else {
+          lpLog("info", '[AutoSync] Supabase init failed, skipping sync');
+          return;
+        }
+      }
+
+      if (_backSyncRunning) { _backSyncNeeded = true; lpLog("info", '[AutoSync] Sync already running, queued'); return; }
+
+      var delay = _backSyncTimer ? _BACK_AUTO_SYNC_DEBOUNCE_MS : Math.min(200, _BACK_AUTO_SYNC_DEBOUNCE_MS);
+      if (_backSyncTimer) clearTimeout(_backSyncTimer);
+      _backSyncTimer = setTimeout(_backRunSync, delay);
+      lpLog("info", '[AutoSync] Sync scheduled in', delay, 'ms');
+    });
+  });
+
+  // Auto-retry pending_sync_queue when online status is restored.
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('online', function() {
+      var syncMod = typeof LocalPocketSupabaseSyncCore !== 'undefined' ? LocalPocketSupabaseSyncCore
+        : (typeof LocalPocketFirestoreSyncCore !== 'undefined' ? LocalPocketFirestoreSyncCore : null);
+      if (!syncMod) return;
+      lpStoreGet(['cloud_auto_sync', 'firebase_user_uid', 'pending_sync_queue'], function(r) {
+        if (r.cloud_auto_sync === false || !r.firebase_user_uid) return;
+        if (!Array.isArray(r.pending_sync_queue) || !r.pending_sync_queue.length) return;
+        lpLog("info", '[AutoSync] Online restored — retrying', r.pending_sync_queue.length, 'pending operations');
+        setTimeout(function() {
+          syncMod.retryPendingSync().catch(function() {});
+        }, 3000);
+      });
+    });
+  }
+
+  setTimeout(function() {
+    var syncMod = typeof LocalPocketSupabaseSyncCore !== 'undefined' ? LocalPocketSupabaseSyncCore
+      : (typeof LocalPocketFirestoreSyncCore !== 'undefined' ? LocalPocketFirestoreSyncCore : null);
+    if (!syncMod) return;
+    lpStoreGet(['cloud_auto_sync', 'firebase_user_uid', 'pending_sync_queue'], function(r) {
+      if (r.cloud_auto_sync === false || !r.firebase_user_uid) return;
+      if (!Array.isArray(r.pending_sync_queue) || !r.pending_sync_queue.length) return;
+      lpLog("info", '[AutoSync] Startup retry — retrying', r.pending_sync_queue.length, 'pending operations');
+      syncMod.retryPendingSync().catch(function() {});
+    });
+  }, 60000);
+})();
+
+lpApi.alarms.onAlarm.addListener(function(alarm) {
+  if (alarm.name === _POMO_ALARM_NAME) {
+    _pomoEnsureState().then(function() {
+      if (_pomoState && _pomoState.running) {
+        if (_pomoInterval) {
+          _pomoBroadcast();
+          return;
+        }
+        _pomoGetStorage().then(function(stored) {
+          if (stored) {
+            _pomoState = stored;
+            var decrementAmount = Math.min(60, _pomoState.timeLeft);
+            _pomoState.timeLeft -= decrementAmount;
+            if (_pomoState.mode === "focus") {
+              _pomoState.totalFocusTime++;
+            }
+            _pomoState.lastTickTime = Date.now();
+            _pomoSaveStorage();
+
+            if (_pomoState.timeLeft <= 0) {
+              _pomoComplete();
+            } else {
+              _pomoBroadcast();
+            }
+
+            if (!_pomoInterval) {
+              _pomoInterval = setInterval(_pomoTick, 1000);
+            }
+          }
+        });
+      } else {
+        // Not running: stop the per-second timer. In MV3 service workers the
+        // 1s interval is unreliable and would otherwise run forever.
+        if (_pomoInterval) {
+          clearInterval(_pomoInterval);
+          _pomoInterval = null;
+        }
+        _pomoBroadcast();
+      }
+    });
+  }
+});
+
+// #4 Cross-tab Context Awareness: daftarkan listener tab (onActivated /
+// onRemoved / onUpdated) dan seed konteks tab sedia ada.
+if (typeof LocalPocketTabContextStore !== "undefined" &&
+    typeof LocalPocketTabContextStore.init === "function") {
+  try { LocalPocketTabContextStore.init(); } catch (e) {}
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #5 Automation Studio — scheduler (background), tab trigger & pemajuan
+// tindakan JARVIS ke tab sasaran (jarvisOverlay kendalikan).
+// ─────────────────────────────────────────────────────────────────────────
+(function () {
+  if (typeof LocalPocketMacroScheduler === "undefined" ||
+      typeof LocalPocketMacroEngine === "undefined") return;
+  var Sched = LocalPocketMacroScheduler;
+  var Engine = LocalPocketMacroEngine;
+
+  function hostOf(u) { try { return u ? new URL(u).hostname : ""; } catch (e) { return ""; } }
+
+  function getActiveTab() {
+    return new Promise(function (resolve) {
+      try {
+        lpApi.tabs.query({ active: true, currentWindow: true }, function (tabs) {
+          resolve(tabs && tabs[0] ? tabs[0] : null);
+        });
+      } catch (e) { resolve(null); }
+    });
+  }
+
+  // Hantar tindakan JARVIS ke tab sasaran (jarvisOverlay ada handler).
+  function forwardToTab(tabId, action, params) {
+    if (!tabId) return;
+    try { lpApi.tabs.sendMessage(tabId, { type: "jarvis-automation-action", action: action, params: params || {} }); }
+    catch (e) {}
+  }
+
+  // Cache makro untuk resolusi "call" (sinkron).
+  var macroCache = [];
+  Sched.storeGet(function (arr) { macroCache = arr || []; });
+  function resolveMacro(name) {
+    for (var i = 0; i < macroCache.length; i++) if (macroCache[i].name === name) return macroCache[i];
+    return null;
+  }
+
+  // Jalankan makro dari background (jadual / tab trigger). Tab sasaran menerima
+  // tindakan JARVIS melalui mesej; tindakan navigasi dilakukan terus di sini.
+  function runAutomationMacro(macro, targetTabId) {
+    if (!macro) return;
+    var tabId = targetTabId;
+    var tabInfo = null;
+    if (tabId) { try { lpApi.tabs.get(tabId, function (t) { tabInfo = t; }); } catch (e) {} }
+
+    function ctx() {
+      if (tabInfo) return { url: tabInfo.url || "", title: tabInfo.title || "", host: hostOf(tabInfo.url), text: "" };
+      return { url: "", title: "", host: "", text: "" };
+    }
+
+    var handlers = {
+      open_url: function (p) { try { lpApi.tabs.create({ url: p.target }); } catch (e) {} },
+      navigate: function (p) { if (tabId) try { lpApi.tabs.update(tabId, { url: p.target }); } catch (e) {} },
+      new_tab: function () { try { lpApi.tabs.create({}); } catch (e) {} },
+      close_tab: function () { if (tabId) try { lpApi.tabs.remove(tabId); } catch (e) {} },
+      close_all_tabs: function () {
+        if (!tabId) return;
+        try {
+          lpApi.tabs.query({ currentWindow: true }, function (tabs) {
+            (tabs || []).forEach(function (t) { if (t.id !== tabId) try { lpApi.tabs.remove(t.id); } catch (e2) {} });
+          });
+        } catch (e) {}
+      },
+      reload: function () { if (tabId) try { lpApi.tabs.reload(tabId); } catch (e) {} },
+      back: function () { if (tabId) try { if (lpApi.tabs.goBack) lpApi.tabs.goBack(tabId); else forwardToTab(tabId, "back", {}); } catch (e) {} },
+      forward: function () { if (tabId) try { if (lpApi.tabs.goForward) lpApi.tabs.goForward(tabId); else forwardToTab(tabId, "forward", {}); } catch (e) {} },
+      duplicate_tab: function () { if (tabId) try { lpApi.tabs.duplicate(tabId); } catch (e) {} },
+      bookmark: function () {
+        try {
+          var url = tabInfo ? tabInfo.url : "";
+          var title = tabInfo ? tabInfo.title : "";
+          if (url && lpApi.bookmarks && lpApi.bookmarks.create) lpApi.bookmarks.create({ url: url, title: title || "" });
+        } catch (e) {}
+      },
+      print_page: function () { forwardToTab(tabId, "print_page", {}); },
+      zoom: function (p) {
+        if (!tabId || !lpApi.tabs.getZoom || !lpApi.tabs.setZoom) return;
+        try {
+          lpApi.tabs.getZoom(tabId, function (z) {
+            var nz = (p.direction === "out") ? Math.max(0.3, z - 0.1) : Math.min(3, z + 0.1);
+            try { lpApi.tabs.setZoom(tabId, nz); } catch (e2) {}
+          });
+        } catch (e) {}
+      },
+      save: function () { forwardToTab(tabId, "save", {}); },
+      summarize: function () { forwardToTab(tabId, "summarize", {}); },
+      ask: function (p) { forwardToTab(tabId, "ask", p); },
+      summarize_selection: function (p) { forwardToTab(tabId, "summarize_selection", p); },
+      translate_selection: function (p) { forwardToTab(tabId, "translate_selection", p); },
+      copy_url: function () { forwardToTab(tabId, "copy_url", {}); },
+      copy_answer: function () { forwardToTab(tabId, "copy_answer", {}); },
+      click: function (p) { forwardToTab(tabId, "click", p); },
+      click_first_link: function () { forwardToTab(tabId, "click_first_link", {}); },
+      fill: function (p) { forwardToTab(tabId, "fill", p); },
+      scroll: function (p) { forwardToTab(tabId, "scroll", p); }
+    };
+
+    Engine.runMacro(macro, {
+      handlers: handlers,
+      getContext: ctx,
+      resolveMacro: resolveMacro,
+      log: function (s) { lpLog("info", "[Automation]", s); }
+    });
+  }
+
+  // Daftar scheduler: pasang pendengar alarm & jadual semula makro sedia ada.
+  Sched.registerBackground({
+    runMacro: function (macro) {
+      getActiveTab().then(function (tab) { runAutomationMacro(macro, tab ? tab.id : null); });
+    }
+  });
+
+  // Tab trigger: bila halaman sepadan selesai dimuat, jalankan makro ber-trigger "tab".
+  var tabTriggerCache = {};
+  function maybeRunTabTriggers(tabId, url) {
+    if (!url || typeof url !== "string") return;
+    Sched.storeGet(function (arr) {
+      (arr || []).forEach(function (m) {
+        var tr = m.trigger || {};
+        if (tr.type !== "tab" || !m.enabled) return;
+        var pat = tr.urlMatch || "";
+        if (!pat) return;
+        var lower = url.toLowerCase();
+        var matched = pat.toLowerCase().split("|").some(function (p) { return p && lower.indexOf(p.trim()) !== -1; });
+        if (!matched) return;
+        var key = tabId + ":" + m.id;
+        var now = Date.now();
+        if (tabTriggerCache[key] && now - tabTriggerCache[key] < 60000) return;
+        tabTriggerCache[key] = now;
+        runAutomationMacro(m, tabId);
+      });
+    });
+  }
+
+  if (lpApi.tabs && lpApi.tabs.onUpdated && lpApi.tabs.onUpdated.addListener) {
+    lpApi.tabs.onUpdated.addListener(function (tid, changeInfo, tab) {
+      if (changeInfo && changeInfo.status === "complete" && tab && tab.url) {
+        maybeRunTabTriggers(tid, tab.url);
+      }
+    });
+  }
+})();
+
