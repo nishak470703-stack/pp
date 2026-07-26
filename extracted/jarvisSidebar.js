@@ -4047,7 +4047,7 @@ function lpStorageGet(keys, cb) {
        if (imageFile) {
          var reader = new FileReader();
          reader.onload = function (ev) {
-           try { if (ev && ev.target && ev.target.result) { pendingImage = ev.target.result; showPendingImageThumb(true); } } catch (e2) {}
+           try { if (ev && ev.target && ev.target.result) { pendingImage = ev.target.result; pendingUserImage = ev.target.result; showPendingImageThumb(true); } } catch (e2) {}
          };
          reader.onerror = function () { handleDroppedUrl(); };
          reader.readAsDataURL(imageFile);
@@ -4078,7 +4078,7 @@ function lpStorageGet(keys, cb) {
          if (url && url.indexOf("http") === 0) {
            try {
              api.runtime.sendMessage({ type: "jarvis-fetch-image", url: url }, function (res) {
-               if (res && res.ok && res.dataUrl) { pendingImage = res.dataUrl; showPendingImageThumb(true); }
+               if (res && res.ok && res.dataUrl) { pendingImage = res.dataUrl; pendingUserImage = res.dataUrl; showPendingImageThumb(true); }
                else { captureDroppedWebImage(url); }
              });
            } catch (e3) {}
