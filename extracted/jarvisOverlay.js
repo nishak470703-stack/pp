@@ -3089,10 +3089,12 @@ function lpStorageGet(keys, cb) {
         // Resolve relative src (from text/html <img>) against the page base URL.
         try { if (url && !/^[a-z][a-z0-9+.\-]*:/i.test(url)) { var _a = document.createElement("a"); _a.href = url; if (_a.href && /^https?:/i.test(_a.href)) url = _a.href; } } catch (e) {}
         if (url && url.indexOf("http") === 0) {
-          fetchImageUrlAsDataUrl(url, function (dataUrl) {
-            if (dataUrl) { pendingImage = dataUrl; showPendingImageThumb(); }
-            else { captureDroppedWebImage(url); }
-          });
+          try {
+            api.runtime.sendMessage({ type: "jarvis-fetch-image", url: url }, function (res) {
+              if (res && res.ok && res.dataUrl) { pendingImage = res.dataUrl; showPendingImageThumb(); }
+              else { captureDroppedWebImage(url); }
+            });
+          } catch (e3) {}
         }
      });
    }
